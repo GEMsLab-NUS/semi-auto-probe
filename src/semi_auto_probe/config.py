@@ -10,10 +10,30 @@ from typing import Any
 DEFAULT_CONFIG_FILENAME = "probe_config.local.json"
 OBJECTIVE_OPTIONS = (20, 10, 5)
 EYEPIECE_OPTIONS = (1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0)
+CALIBRATION_REFERENCE_OBJECTIVE = 20
+CALIBRATION_REFERENCE_EYEPIECE = 1.5
 
 
 def calibration_key(objective: int, eyepiece: float) -> str:
     return f"objective_{objective:g}__eyepiece_{eyepiece:g}"
+
+
+def derive_missing_calibrations(config: "ProbeConfig") -> int:
+    base_key = calibration_key(CALIBRATION_REFERENCE_OBJECTIVE, CALIBRATION_REFERENCE_EYEPIECE)
+    base_um_per_px = config.calibrations.get(base_key)
+    if base_um_per_px is None:
+        return 0
+
+    added = 0
+    reference_magnification = CALIBRATION_REFERENCE_OBJECTIVE * CALIBRATION_REFERENCE_EYEPIECE
+    for objective in OBJECTIVE_OPTIONS:
+        for eyepiece in EYEPIECE_OPTIONS:
+            key = calibration_key(objective, eyepiece)
+            if key in config.calibrations:
+                continue
+            config.calibrations[key] = float(base_um_per_px) * reference_magnification / (objective * eyepiece)
+            added += 1
+    return added
 
 
 def calibration_distance_px(p1: tuple[float, float], p2: tuple[float, float], p3: tuple[float, float]) -> float:
@@ -41,13 +61,20 @@ def pulses_from_um(distance_um: float, config: "ProbeConfig", axis: str) -> int:
 @dataclass
 class ProbeConfig:
     objective: int = 20
-    eyepiece: float = 1.5
+    eyepiece: float = 2.0
     microstep: int = 2
     lead_xy_mm: float = 1.0
     lead_z_mm: float = 0.5
     base_angle_deg: float = 0.72
     cc_speed_percent: int = 100
     cc_accel_time_s: float = 0.1
+    autofocus_settle_ms: int = 100
+    autofocus_sample_count: int = 5
+    imgstitch_settle_ms: int = 100
+    imgstitch_seam_response_yellow: float = 0.10
+    imgstitch_seam_response_green: float = 0.25
+    focus_threshold_yellow: dict[str, float] = field(default_factory=lambda: {"Laplacian": 1000.0, "Tenengrad": 20000.0, "Brenner": 1000.0})
+    focus_threshold_green: dict[str, float] = field(default_factory=lambda: {"Laplacian": 2000.0, "Tenengrad": 40000.0, "Brenner": 2000.0})
     calibrations: dict[str, float] = field(default_factory=dict)
 
     def validate(self) -> None:
@@ -65,6 +92,23 @@ class ProbeConfig:
             raise ValueError("CC speed percent must be in range 0..100.")
         if self.cc_accel_time_s < 0 or self.cc_accel_time_s > 2.55:
             raise ValueError("CC acceleration time must be in range 0..2.55 seconds.")
+        if self.autofocus_settle_ms < 0 or self.autofocus_settle_ms > 10000:
+            raise ValueError("AutoFocus settle time must be in range 0..10000 ms.")
+        if self.autofocus_sample_count <= 0 or self.autofocus_sample_count > 1000:
+            raise ValueError("AutoFocus sample count must be in range 1..1000.")
+        if self.imgstitch_settle_ms < 0 or self.imgstitch_settle_ms > 10000:
+            raise ValueError("ImgStitch settle time must be in range 0..10000 ms.")
+        if self.imgstitch_seam_response_yellow < 0 or self.imgstitch_seam_response_green < 0:
+            raise ValueError("ImgStitch seam response thresholds must be non-negative.")
+        if self.imgstitch_seam_response_green < self.imgstitch_seam_response_yellow:
+            raise ValueError("ImgStitch green seam response threshold must be greater than or equal to yellow threshold.")
+        for metric in ("Laplacian", "Tenengrad", "Brenner"):
+            yellow = float(self.focus_threshold_yellow.get(metric, 0.0))
+            green = float(self.focus_threshold_green.get(metric, 0.0))
+            if yellow < 0 or green < 0:
+                raise ValueError("Focus thresholds must be non-negative.")
+            if green < yellow:
+                raise ValueError("Green focus threshold must be greater than or equal to yellow threshold.")
         for value in self.calibrations.values():
             if value <= 0:
                 raise ValueError("Calibration values must be positive.")
@@ -105,6 +149,7 @@ class ProbeConfig:
         self.calibrations[calibration_key(objective, eyepiece)] = float(um_per_px)
 
     def to_dict(self) -> dict[str, Any]:
+        derive_missing_calibrations(self)
         self.validate()
         return {
             "objective": self.objective,
@@ -115,6 +160,13 @@ class ProbeConfig:
             "base_angle_deg": self.base_angle_deg,
             "cc_speed_percent": self.cc_speed_percent,
             "cc_accel_time_s": self.cc_accel_time_s,
+            "autofocus_settle_ms": self.autofocus_settle_ms,
+            "autofocus_sample_count": self.autofocus_sample_count,
+            "imgstitch_settle_ms": self.imgstitch_settle_ms,
+            "imgstitch_seam_response_yellow": self.imgstitch_seam_response_yellow,
+            "imgstitch_seam_response_green": self.imgstitch_seam_response_green,
+            "focus_threshold_yellow": dict(sorted(self.focus_threshold_yellow.items())),
+            "focus_threshold_green": dict(sorted(self.focus_threshold_green.items())),
             "calibrations": dict(sorted(self.calibrations.items())),
         }
 
@@ -129,8 +181,22 @@ class ProbeConfig:
             base_angle_deg=float(data.get("base_angle_deg", cls.base_angle_deg)),
             cc_speed_percent=int(data.get("cc_speed_percent", cls.cc_speed_percent)),
             cc_accel_time_s=float(data.get("cc_accel_time_s", cls.cc_accel_time_s)),
+            autofocus_settle_ms=int(data.get("autofocus_settle_ms", cls.autofocus_settle_ms)),
+            autofocus_sample_count=int(data.get("autofocus_sample_count", cls.autofocus_sample_count)),
+            imgstitch_settle_ms=int(data.get("imgstitch_settle_ms", cls.imgstitch_settle_ms)),
+            imgstitch_seam_response_yellow=float(data.get("imgstitch_seam_response_yellow", cls.imgstitch_seam_response_yellow)),
+            imgstitch_seam_response_green=float(data.get("imgstitch_seam_response_green", cls.imgstitch_seam_response_green)),
+            focus_threshold_yellow={
+                **cls().focus_threshold_yellow,
+                **{str(key): float(value) for key, value in data.get("focus_threshold_yellow", {}).items()},
+            },
+            focus_threshold_green={
+                **cls().focus_threshold_green,
+                **{str(key): float(value) for key, value in data.get("focus_threshold_green", {}).items()},
+            },
             calibrations={str(key): float(value) for key, value in data.get("calibrations", {}).items()},
         )
+        derive_missing_calibrations(config)
         config.validate()
         return config
 
@@ -138,7 +204,9 @@ class ProbeConfig:
 def load_probe_config(path: Path | None = None) -> ProbeConfig:
     config_path = path or Path.cwd() / DEFAULT_CONFIG_FILENAME
     if not config_path.exists():
-        return ProbeConfig()
+        config = ProbeConfig()
+        derive_missing_calibrations(config)
+        return config
     with config_path.open("r", encoding="utf-8") as file:
         data = json.load(file)
     return ProbeConfig.from_dict(data)
@@ -146,4 +214,5 @@ def load_probe_config(path: Path | None = None) -> ProbeConfig:
 
 def save_probe_config(config: ProbeConfig, path: Path | None = None) -> None:
     config_path = path or Path.cwd() / DEFAULT_CONFIG_FILENAME
+    derive_missing_calibrations(config)
     config_path.write_text(json.dumps(config.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
