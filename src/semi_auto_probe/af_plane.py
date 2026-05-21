@@ -146,6 +146,43 @@ def get_focus_z_at_xy(x: float, y: float) -> float | None:
     return sample_plane_state.get_focus_z_at_xy(x, y)
 
 
+def parse_focusmap_result_payload(
+    payload: dict[str, object],
+) -> tuple[list[AFMeshPoint], list[dict[str, object]], SamplePlaneModel | None, dict[str, object]]:
+    model_payload = payload.get("sample_plane_model")
+    if not isinstance(model_payload, dict) and {"a", "b", "c"}.issubset(payload):
+        model_payload = payload
+    model = SamplePlaneModel.from_dict(model_payload) if isinstance(model_payload, dict) else None
+
+    mesh_point_payloads = payload.get("mesh_points")
+    if not mesh_point_payloads and model is not None:
+        mesh_point_payloads = model.mesh_points
+    record_payloads = payload.get("measured_points")
+    if not record_payloads and model is not None:
+        record_payloads = model.measured_points
+
+    records = [dict(item) for item in _dict_items(record_payloads, "measured_points")]
+    if not mesh_point_payloads:
+        mesh_point_payloads = records
+    mesh_points = [AFMeshPoint.from_dict(item) for item in _dict_items(mesh_point_payloads, "mesh_points")]
+    for record in records:
+        record.setdefault("fit_enabled", True)
+
+    mesh_settings_payload = payload.get("mesh_settings", {})
+    mesh_settings = dict(mesh_settings_payload) if isinstance(mesh_settings_payload, dict) else {}
+    return mesh_points, records, model, mesh_settings
+
+
+def _dict_items(value: object, field_name: str) -> list[dict[str, object]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be a list.")
+    if not all(isinstance(item, dict) for item in value):
+        raise ValueError(f"{field_name} entries must be objects.")
+    return value
+
+
 def generate_af_mesh(
     mesh_type: str,
     center_x: int,

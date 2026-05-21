@@ -967,6 +967,7 @@ class GDSCanvasViewer:
                     coords.extend((x, y))
                     canvas_points.append((x, y))
                 outline, fill, dash = self._matrix_overlay_style(state)
+                is_autotest = state.lower().strip().startswith("autotest_")
                 polygon_options = {
                     "fill": fill,
                     "outline": outline,
@@ -974,15 +975,34 @@ class GDSCanvasViewer:
                     "stipple": "gray25",
                     "tags": "gds_matrix_overlay",
                 }
+                if is_autotest:
+                    polygon_options["fill"] = ""
+                    polygon_options["width"] = 1
                 if dash is not None:
                     polygon_options["dash"] = dash
                 self.canvas.create_polygon(coords, **polygon_options)
                 if label:
                     cx = sum(point[0] for point in canvas_points) / len(canvas_points)
                     cy = sum(point[1] for point in canvas_points) / len(canvas_points)
+                    if is_autotest:
+                        radius = 7
+                        self.canvas.create_polygon(
+                            cx,
+                            cy - radius,
+                            cx + radius,
+                            cy,
+                            cx,
+                            cy + radius,
+                            cx - radius,
+                            cy,
+                            fill=fill,
+                            outline=outline,
+                            width=2,
+                            tags="gds_matrix_overlay",
+                        )
                     self.canvas.create_text(
                         cx,
-                        cy,
+                        cy + (13 if is_autotest else 0),
                         text=label,
                         fill=outline,
                         font=("Segoe UI Semibold", 8),
@@ -1021,6 +1041,12 @@ class GDSCanvasViewer:
     @staticmethod
     def _matrix_overlay_style(state: str) -> tuple[str, str, tuple[int, int] | None]:
         normalized = state.lower().strip()
+        if normalized == "autotest_done":
+            return "#34d399", "#064e3b", None
+        if normalized == "autotest_running":
+            return "#60a5fa", "#0f2f57", None
+        if normalized.startswith("autotest_"):
+            return "#9ca3af", "#111827", (4, 4)
         if normalized == "done":
             return "#34d399", "#064e3b", None
         if normalized == "running":
@@ -1207,6 +1233,7 @@ class GDSStageMapperPanel:
         self.mapping_matrix_var = tk.StringVar(value="No affine transform.")
         self.residuals_var = tk.StringVar(value="Residuals: -")
         self.overlay_enabled_var = tk.BooleanVar(value=True)
+        self.calibration_expanded_var = tk.BooleanVar(value=True)
         self.fov_width_var = fov_width_var or tk.StringVar(value="200")
         self.fov_height_var = fov_height_var or tk.StringVar(value="150")
         self.residual_threshold_var = tk.StringVar(value="5")
@@ -1229,6 +1256,8 @@ class GDSStageMapperPanel:
         self.use_focus_z_var = use_focus_z_var or tk.BooleanVar(value=False)
         self.stage_nav_status_var = tk.StringVar(value="Stage XY: -")
         self.microscope_status_var = tk.StringVar(value="Microscope: waiting for camera frame.")
+        self.calibration_toggle_indicator: tk.Label | None = None
+        self.calibration_content_frame: ttk.Frame | None = None
         self.layer_vars: dict[tuple[int, int], tk.BooleanVar] = {}
         self.gds_point_buttons: dict[str, tk.Button] = {}
         self.point_vars: dict[str, dict[str, tk.StringVar]] = {
@@ -1309,6 +1338,73 @@ class GDSStageMapperPanel:
         section.grid(row=row, column=0, sticky="ew", pady=(0, 10))
         section.columnconfigure(0, weight=1)
         return section
+
+    def _collapsible_section(self, parent: ttk.Frame, title: str, row: int, summary: str) -> ttk.Frame:
+        outer = ttk.Frame(parent, style="Panel.TFrame")
+        outer.grid(row=row, column=0, sticky="ew", pady=(0, 10))
+        outer.columnconfigure(0, weight=1)
+
+        header = tk.Frame(
+            outer,
+            bg=self.colors["surface_2"],
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
+            cursor="hand2",
+        )
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(1, weight=1)
+        indicator = tk.Label(
+            header,
+            text="v" if self.calibration_expanded_var.get() else ">",
+            bg=self.colors["surface_2"],
+            fg=self.colors["accent"],
+            width=2,
+            font=("Segoe UI", 10, "bold"),
+        )
+        indicator.grid(row=0, column=0, sticky="w", padx=(8, 4), pady=8)
+        title_label = tk.Label(
+            header,
+            text=title.upper(),
+            bg=self.colors["surface_2"],
+            fg=self.colors["text"],
+            font=("Segoe UI", 9, "bold"),
+            anchor="w",
+        )
+        title_label.grid(row=0, column=1, sticky="ew", pady=8)
+        summary_label = tk.Label(
+            header,
+            text=summary,
+            bg=self.colors["surface_2"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 9),
+            anchor="e",
+        )
+        summary_label.grid(row=0, column=2, sticky="e", padx=(8, 10), pady=8)
+
+        content = ttk.Frame(outer, style="Panel.TFrame", padding=(10, 8, 10, 10))
+        content.grid(row=1, column=0, sticky="ew")
+        content.columnconfigure(0, weight=1)
+
+        self.calibration_toggle_indicator = indicator
+        self.calibration_content_frame = content
+        for widget in (header, indicator, title_label, summary_label):
+            widget.bind("<Button-1>", lambda _event: self._toggle_calibration_section())
+        self._update_calibration_section_visibility()
+        return content
+
+    def _toggle_calibration_section(self) -> None:
+        self.calibration_expanded_var.set(not bool(self.calibration_expanded_var.get()))
+        self._update_calibration_section_visibility()
+
+    def _update_calibration_section_visibility(self) -> None:
+        if self.calibration_toggle_indicator is None or self.calibration_content_frame is None:
+            return
+        if self.calibration_expanded_var.get():
+            self.calibration_content_frame.grid()
+            self.calibration_toggle_indicator.configure(text="v")
+        else:
+            self.calibration_content_frame.grid_remove()
+            self.calibration_toggle_indicator.configure(text=">")
 
     def _responsive_label(self, parent: tk.Widget, *, textvariable: tk.StringVar, style: str, fraction: float = 1.0, min_width: int = 120, padding=6) -> ttk.Label:
         label = ttk.Label(parent, textvariable=textvariable, style=style, padding=padding)
@@ -1520,7 +1616,7 @@ class GDSStageMapperPanel:
         return row + 1
 
     def _build_calibration_section(self, parent: ttk.Frame, row: int) -> int:
-        section = self._section(parent, "Calibration Points", row)
+        section = self._collapsible_section(parent, "Calibration Points", row, f"{len(self.POINT_NAMES)} point affine fit")
         headings = ("Pt", "GDSu", "GDSv", "Set GDS", "x um", "y um", "Set Stage")
         for col, heading in enumerate(headings):
             ttk.Label(section, text=heading, style="Muted.TLabel").grid(row=0, column=col, sticky="w", padx=(0, 5))
@@ -1960,11 +2056,12 @@ class GDSStageMapperPanel:
             if self.mapper is None:
                 raise ValueError("Bind GDS mapping before moving by U/V.")
             current_u, current_v = self.mapper.stage_to_gds(current_x, current_y)
-            target_u = self._coordinate_axis_target("U", current_u)
-            target_v = self._coordinate_axis_target("V", current_v)
+            target_u = self._coordinate_axis_target("U", current_u) if "U" in self.modified_coord_axes else current_u
+            target_v = self._coordinate_axis_target("V", current_v) if "V" in self.modified_coord_axes else current_v
             target_x, target_y = self.mapper.gds_to_stage(target_u, target_v)
-        if self.modified_coord_axes & {"X", "Y"}:
+        if "X" in self.modified_coord_axes:
             target_x = self._coordinate_axis_target("X", current_x)
+        if "Y" in self.modified_coord_axes:
             target_y = self._coordinate_axis_target("Y", current_y)
         if self.use_focus_z_var.get():
             if self.get_focus_z_um is None:

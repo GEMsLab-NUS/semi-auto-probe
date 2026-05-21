@@ -90,7 +90,7 @@ class AgentPanel:
         left.grid_propagate(False)
         left.columnconfigure(0, weight=1)
         left.rowconfigure(0, weight=3)
-        left.rowconfigure(1, weight=2)
+        left.rowconfigure(1, weight=3)
         left.rowconfigure(2, weight=2)
 
         microscope_card = self._section(left, "Microscope")
@@ -111,7 +111,7 @@ class AgentPanel:
 
         coordinate_card = self._section(left, "Stage XYZ / Layout UV")
         coordinate_card.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
-        coordinate_card.rowconfigure(1, weight=1)
+        coordinate_card.rowconfigure(1, weight=1, minsize=132)
         self.coord_value_labels = self._build_coordinate_grid(coordinate_card, row=1)
 
         status_card = self._section(left, "Agent Status")
@@ -244,6 +244,9 @@ class AgentPanel:
     def _build_coordinate_grid(self, parent: tk.Widget, *, row: int) -> dict[str, tk.Label]:
         frame = ttk.Frame(parent, style="Panel.TFrame")
         frame.grid(row=row, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
         labels: dict[str, tk.Label] = {}
 
         rows = (
@@ -252,7 +255,8 @@ class AgentPanel:
         )
         for row_index, fields in enumerate(rows):
             row_frame = ttk.Frame(frame, style="Panel.TFrame")
-            row_frame.grid(row=row_index, column=0, sticky="ew", pady=(0, 6 if row_index == 0 else 0))
+            row_frame.grid(row=row_index, column=0, sticky="nsew", pady=(0, 6 if row_index == 0 else 0))
+            row_frame.rowconfigure(0, weight=1)
             for column in range(len(fields)):
                 row_frame.columnconfigure(column, weight=1, uniform=f"coord_row_{row_index}")
             for column_index, (key, label_text) in enumerate(fields):
@@ -265,12 +269,13 @@ class AgentPanel:
                 )
                 tile.grid(row=0, column=column_index, sticky="nsew", padx=(0, 6 if column_index < len(fields) - 1 else 0))
                 tile.columnconfigure(0, weight=1)
+                tile.rowconfigure(1, weight=1)
                 tk.Label(
                     tile,
                     text=label_text,
                     anchor="w",
-                    padx=8,
-                    pady=2,
+                    padx=10,
+                    pady=1,
                     bg=self.colors["surface_2"],
                     fg=self.colors["muted"],
                     font=("Segoe UI", 8),
@@ -278,14 +283,14 @@ class AgentPanel:
                 value = tk.Label(
                     tile,
                     text="-",
-                    anchor="w",
-                    padx=8,
-                    pady=2,
+                    anchor="e",
+                    padx=10,
+                    pady=1,
                     bg=self.colors["surface_2"],
                     fg=self.colors["accent"],
-                    font=("Cascadia Mono", 9, "bold"),
+                    font=("Cascadia Mono", 10, "bold"),
                 )
-                value.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+                value.grid(row=1, column=0, sticky="nsew", pady=(0, 3))
                 labels[key] = value
         return labels
 

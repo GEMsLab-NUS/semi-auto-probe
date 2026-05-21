@@ -435,6 +435,16 @@ class GDSMapperMotionBridgeTests(unittest.TestCase):
 
         self.assertEqual(GDSStageMapperPanel._coordinate_target_from_edits(panel), (11.5, 18.0, None))
 
+    def test_single_axis_relative_stage_edit_keeps_other_axis_current(self) -> None:
+        panel = self.panel_for_coordinate_tests()
+        panel.coord_vars["X"].set("1.5")
+        panel.coord_vars["Y"].set("20")
+        panel.coord_edit_modes["X"] = "Relative"
+        panel.modified_coord_axes = {"X"}
+        panel.current_coord_edit_mode = "Relative"
+
+        self.assertEqual(GDSStageMapperPanel._coordinate_target_from_edits(panel), (11.5, 20.0, None))
+
     def test_uv_target_uses_affine_mapping_when_bound(self) -> None:
         panel = self.panel_for_coordinate_tests()
         panel.mapper = AffineCoordinateMapper.fit(
@@ -454,6 +464,28 @@ class GDSMapperMotionBridgeTests(unittest.TestCase):
         target = GDSStageMapperPanel._coordinate_target_from_edits(panel)
         self.assertAlmostEqual(target[0], 13.0)
         self.assertAlmostEqual(target[1], 24.0)
+        self.assertIsNone(target[2])
+
+    def test_single_uv_relative_edit_keeps_other_layout_axis_current(self) -> None:
+        panel = self.panel_for_coordinate_tests()
+        panel.mapper = AffineCoordinateMapper.fit(
+            [
+                CalibrationPoint("P1", 0.0, 0.0, 10.0, 20.0),
+                CalibrationPoint("P2", 10.0, 0.0, 20.0, 20.0),
+                CalibrationPoint("P3", 0.0, 10.0, 10.0, 30.0),
+                CalibrationPoint("P4", 10.0, 10.0, 20.0, 30.0),
+            ]
+        )
+        panel.coord_vars["U"].set("2")
+        panel.coord_vars["V"].set("0")
+        panel.coord_edit_modes["U"] = "Relative"
+        panel.current_coord_edit_mode = "Relative"
+        panel.modified_coord_axes = {"U"}
+
+        target = GDSStageMapperPanel._coordinate_target_from_edits(panel)
+
+        self.assertAlmostEqual(target[0], 12.0)
+        self.assertAlmostEqual(target[1], 20.0)
         self.assertIsNone(target[2])
 
     def test_focus_z_overrides_z_target_from_focus_callback(self) -> None:

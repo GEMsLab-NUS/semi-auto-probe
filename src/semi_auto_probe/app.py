@@ -22,6 +22,7 @@ from .af_plane import (
     generate_af_mesh,
     get_sample_plane_model,
     get_focus_z_at_xy,
+    parse_focusmap_result_payload,
     set_sample_plane_model,
 )
 from .agent import (
@@ -39,6 +40,7 @@ from .agent import (
     stage_move_axes,
     stage_move_parameter_blockers,
 )
+from .auto_test import AutoTestPanel, AutoTestPoint, AutoTestSettings, generate_autotest_points
 from .camera import CameraSettings, UsbCamera
 from .config import (
     AUTOFOCUS_PEAK_MODEL_GAUSSIAN,
@@ -195,6 +197,7 @@ class ProbeApp(tk.Tk):
         self.vision_panel: VisionPanel | None = None
         self.gds_stage_mapper_panel: GDSStageMapperPanel | None = None
         self.imgmatrix_panel: ImgMatrixPanel | None = None
+        self.autotest_panel: AutoTestPanel | None = None
         self.agent_panel: AgentPanel | None = None
         self.agent_function_spec_path = Path.cwd() / "docs" / "agent-function-spec.md"
         self.agent_planner = None
@@ -225,12 +228,19 @@ class ProbeApp(tk.Tk):
         self.imgmatrix_running = False
         self.imgmatrix_restore_realtime = False
         self.imgmatrix_restore_home_signal = False
+        self.autotest_stop_event = threading.Event()
+        self.autotest_thread: threading.Thread | None = None
+        self.autotest_running = False
+        self.autotest_restore_realtime = False
+        self.autotest_restore_home_signal = False
         self.latest_stitch_frame = None
         self.latest_stitch_frame_captured_at = 0.0
         self.imgstitch_progress_current = 0
         self.imgstitch_progress_total = 0
         self.imgmatrix_progress_current = 0
         self.imgmatrix_progress_total = 0
+        self.autotest_progress_current = 0
+        self.autotest_progress_total = 0
         self.current_page = "Main"
         self.active_page_name: str | None = None
         self.config_path = Path.cwd() / DEFAULT_CONFIG_FILENAME
@@ -305,6 +315,7 @@ class ProbeApp(tk.Tk):
         self.imgstitch_point2: tuple[int, int] | None = None
         self.imgstitch_session_dir = Path.cwd() / "imgstitch_session"
         self.imgmatrix_session_root = Path.cwd() / "imgmatrix_session"
+        self.autotest_session_root = Path.cwd() / "autotest_session"
         self.position_vars = {
             "X": tk.StringVar(value="0"),
             "Y": tk.StringVar(value="0"),
@@ -384,6 +395,7 @@ class ProbeApp(tk.Tk):
         self.af_plane_retry_count_var = tk.StringVar(value="0")
         self.af_plane_return_to_start_var = tk.BooleanVar(value=True)
         self.af_plane_dry_run_var = tk.BooleanVar(value=False)
+        self.af_plane_af_params_expanded_var = tk.BooleanVar(value=False)
         self.af_plane_status_var = tk.StringVar(value="Idle")
         self.af_plane_equation_var = tk.StringVar(value="No fitted plane")
         self.af_plane_metrics_var = tk.StringVar(value="Valid 0 | Failed 0")
@@ -810,10 +822,11 @@ class ProbeApp(tk.Tk):
             "Config": "⚙ Settings",
         }
         module_tab_labels["ImgMatrix"] = "🔳 ImgMatrix"
+        module_tab_labels["AutoTest"] = "🧪 AutoTest"
         tab_bar = ttk.Frame(content, style="App.TFrame")
         tab_bar.grid(row=0, column=0, sticky="w")
-        for col, name in enumerate(("Main", "AutoFocus", "FocusMap", "ImgStitch", "LayoutBond", "ImgMatrix", "AI Agent", "Communication", "Config")):
-            tab_bar.columnconfigure(col, minsize=124, uniform="top_tabs")
+        for col, name in enumerate(("Main", "AutoFocus", "FocusMap", "ImgStitch", "LayoutBond", "ImgMatrix", "AutoTest", "AI Agent", "Communication", "Config")):
+            tab_bar.columnconfigure(col, minsize=116, uniform="top_tabs")
             label = tk.Label(
                 tab_bar,
                 text=module_tab_labels[name],
@@ -847,6 +860,7 @@ class ProbeApp(tk.Tk):
         imgstitch_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         gds_stage_mapper_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         imgmatrix_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
+        autotest_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         agent_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         config_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         self.pages = {
@@ -857,6 +871,7 @@ class ProbeApp(tk.Tk):
             "ImgStitch": imgstitch_page,
             "LayoutBond": gds_stage_mapper_page,
             "ImgMatrix": imgmatrix_page,
+            "AutoTest": autotest_page,
             "AI Agent": agent_page,
             "Config": config_page,
         }
@@ -870,6 +885,7 @@ class ProbeApp(tk.Tk):
         self._build_imgstitch_page(imgstitch_page)
         self._build_gds_stage_mapper_page(gds_stage_mapper_page)
         self._build_imgmatrix_page(imgmatrix_page)
+        self._build_autotest_page(autotest_page)
         self._build_agent_page(agent_page)
         self._build_config_page(config_page)
         self._update_config_display()
@@ -933,6 +949,9 @@ class ProbeApp(tk.Tk):
         elif name == "ImgMatrix" and self.imgmatrix_panel is not None:
             self._sync_imgmatrix_from_layoutbond()
             self.imgmatrix_panel.viewer.redraw()
+        elif name == "AutoTest" and self.autotest_panel is not None:
+            self._sync_autotest_from_layoutbond()
+            self.autotest_panel.viewer.redraw()
         elif name == "AI Agent" and self.agent_panel is not None:
             self.agent_panel.refresh_context()
 
@@ -997,7 +1016,7 @@ class ProbeApp(tk.Tk):
             fov_height_var=self.layoutbond_fov_height_var,
             use_focus_z_var=self.main_focusmap_plane_var,
             on_focus_z_toggle=self._on_main_focusmap_plane_toggle,
-            on_layout_changed=self._sync_imgmatrix_from_layoutbond,
+            on_layout_changed=self._sync_layout_dependent_panels,
             set_status=self.status_var.set,
         )
 
@@ -1028,10 +1047,40 @@ class ProbeApp(tk.Tk):
         )
         self._sync_imgmatrix_from_layoutbond()
 
+    def _build_autotest_page(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        self.autotest_panel = AutoTestPanel(
+            parent,
+            self.colors,
+            get_stage_position_um=self._gds_mapper_current_stage_um,
+            get_mapper=self._imgmatrix_mapper,
+            get_focusmap_ready=self._autotest_focusmap_ready,
+            get_layoutmap_ready=self._autotest_layoutmap_ready,
+            get_microscope_preview=self.agent_microscope_preview,
+            fov_width_var=self.layoutbond_fov_width_var,
+            fov_height_var=self.layoutbond_fov_height_var,
+            start_run=self.start_autotest,
+            stop_run=self.stop_autotest,
+            set_status=self.status_var.set,
+            on_overlay_changed=self._set_layoutbond_matrix_overlay,
+        )
+        self._sync_autotest_from_layoutbond()
+
     def _imgmatrix_mapper(self):
         if self.gds_stage_mapper_panel is None:
             return None
         return self.gds_stage_mapper_panel.mapper
+
+    def _autotest_focusmap_ready(self) -> bool:
+        return get_sample_plane_model() is not None
+
+    def _autotest_layoutmap_ready(self) -> bool:
+        return self.gds_stage_mapper_panel is not None and self.gds_stage_mapper_panel.mapper is not None
+
+    def _sync_layout_dependent_panels(self) -> None:
+        self._sync_imgmatrix_from_layoutbond()
+        self._sync_autotest_from_layoutbond()
 
     def _sync_imgmatrix_from_layoutbond(self) -> None:
         if self.imgmatrix_panel is None or self.gds_stage_mapper_panel is None:
@@ -1039,6 +1088,13 @@ class ProbeApp(tk.Tk):
         model = self.gds_stage_mapper_panel.model
         layer_visibility = dict(self.gds_stage_mapper_panel.viewer.layer_visibility)
         self.imgmatrix_panel.set_layout_context(model, layer_visibility)
+
+    def _sync_autotest_from_layoutbond(self) -> None:
+        if self.autotest_panel is None or self.gds_stage_mapper_panel is None:
+            return
+        model = self.gds_stage_mapper_panel.model
+        layer_visibility = dict(self.gds_stage_mapper_panel.viewer.layer_visibility)
+        self.autotest_panel.set_layout_context(model, layer_visibility)
 
     def _set_layoutbond_matrix_overlay(self, overlays) -> None:
         if self.gds_stage_mapper_panel is None:
@@ -1200,6 +1256,9 @@ class ProbeApp(tk.Tk):
         if self.af_plane_running:
             self.stop_af_plane_mapping()
             stopped.append("FocusMap")
+        if self.autotest_running:
+            self.stop_autotest()
+            stopped.append("AutoTest")
         if stopped:
             message = f"Agent stop requested for {', '.join(stopped)}."
         else:
@@ -1576,6 +1635,8 @@ class ProbeApp(tk.Tk):
             return "ImgStitch is running; LayoutBond move skipped."
         if self.imgmatrix_running:
             return "ImgMatrix is running; LayoutBond move skipped."
+        if self.autotest_running:
+            return "AutoTest is running; LayoutBond move skipped."
         if self.position_read_pending:
             return "Position read is pending; LayoutBond move skipped."
         return None
@@ -2126,23 +2187,43 @@ class ProbeApp(tk.Tk):
         ttk.Button(control_panel, text="Generate Mesh", command=self.generate_af_plane_mesh).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
         row += 1
-        ttk.Label(control_panel, text="AUTOFOCUS PARAMETERS", style="Section.TLabel").grid(row=row, column=0, columnspan=2, sticky="w", pady=(14, 0))
+        self.af_plane_af_params_button = ttk.Button(control_panel, text="AUTOFOCUS PARAMETERS >", command=self._toggle_af_plane_af_params)
+        self.af_plane_af_params_button.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(14, 0))
         row += 1
-        ttk.Label(control_panel, text="Metric", style="Muted.TLabel").grid(row=row, column=0, sticky="w", pady=(7, 2), padx=(0, 5))
-        ttk.Label(control_panel, text="Retry count", style="Muted.TLabel").grid(row=row, column=1, sticky="w", pady=(7, 2), padx=(5, 0))
+        self.af_plane_af_params_frame = ttk.Frame(control_panel, style="Panel.TFrame")
+        self.af_plane_af_params_frame.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.af_plane_af_params_frame.columnconfigure((0, 1), weight=1, uniform="af_plane_af_params")
+
+        def add_af_spinbox(
+            row_index: int,
+            label: str,
+            variable: tk.StringVar,
+            column: int,
+            from_value: float = -1_000_000,
+            to_value: float = 1_000_000,
+            increment: float = 1,
+        ) -> None:
+            ttk.Label(self.af_plane_af_params_frame, text=label, style="Muted.TLabel").grid(row=row_index, column=column, sticky="w", pady=(7, 2), padx=(0, 5) if column == 0 else (5, 0))
+            self._numeric_spinbox(self.af_plane_af_params_frame, variable, from_value=from_value, to_value=to_value, increment=increment, width=9).grid(row=row_index + 1, column=column, sticky="ew", padx=(0, 5) if column == 0 else (5, 0))
+
+        ttk.Label(self.af_plane_af_params_frame, text="Metric", style="Muted.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 2), padx=(0, 5))
+        ttk.Label(self.af_plane_af_params_frame, text="Retry count", style="Muted.TLabel").grid(row=0, column=1, sticky="w", pady=(0, 2), padx=(5, 0))
+        metric_combo = ttk.Combobox(self.af_plane_af_params_frame, textvariable=self.focus_metric_var, values=("Laplacian", "Tenengrad", "Brenner"), state="readonly", width=12)
+        metric_combo.grid(row=1, column=0, sticky="ew", padx=(0, 5))
+        self._numeric_spinbox(self.af_plane_af_params_frame, self.af_plane_retry_count_var, from_value=0, to_value=10, width=9).grid(row=1, column=1, sticky="ew", padx=(5, 0))
+        add_af_spinbox(2, "Initial Step", self.autofocus_step_var, 0, from_value=1, to_value=1_000_000)
+        add_af_spinbox(2, "Min Step", self.autofocus_min_step_var, 1, from_value=1, to_value=1_000_000)
+        add_af_spinbox(4, "Z Range +/-", self.autofocus_max_moves_var, 0, from_value=1, to_value=1_000_000)
+        self._update_af_plane_af_params_visibility()
         row += 1
-        metric_combo = ttk.Combobox(control_panel, textvariable=self.focus_metric_var, values=("Laplacian", "Tenengrad", "Brenner"), state="readonly", width=12)
-        metric_combo.grid(row=row, column=0, sticky="ew", padx=(0, 5))
-        self._numeric_spinbox(control_panel, self.af_plane_retry_count_var, from_value=0, to_value=10, width=9).grid(row=row, column=1, sticky="ew", padx=(5, 0))
-        row += 1
-        add_spinbox(row, "Initial Step", self.autofocus_step_var, 0, from_value=1, to_value=1_000_000)
-        add_spinbox(row, "Min Step", self.autofocus_min_step_var, 1, from_value=1, to_value=1_000_000)
-        row += 2
-        add_spinbox(row, "Z Range +/-", self.autofocus_max_moves_var, 0, from_value=1, to_value=1_000_000)
-        row += 2
-        ttk.Checkbutton(control_panel, text="Return to start position", variable=self.af_plane_return_to_start_var).grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        row += 1
-        ttk.Checkbutton(control_panel, text="Dry run without hardware", variable=self.af_plane_dry_run_var).grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        options = ttk.Frame(control_panel, style="Panel.TFrame")
+        options.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        options.columnconfigure(0, weight=1)
+        ttk.Label(options, text="Return to start position", style="Panel.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        ToggleSwitch(options, self.af_plane_return_to_start_var, self.colors).grid(row=0, column=1, sticky="e", pady=(0, 6))
+        ttk.Label(options, text="Dry run without hardware", style="Panel.TLabel").grid(row=1, column=0, sticky="w")
+        ToggleSwitch(options, self.af_plane_dry_run_var, self.colors).grid(row=1, column=1, sticky="e")
 
         row += 1
         ttk.Label(control_panel, text="EXECUTION", style="Section.TLabel").grid(row=row, column=0, columnspan=2, sticky="w", pady=(14, 0))
@@ -2158,8 +2239,25 @@ class ProbeApp(tk.Tk):
         ttk.Button(control_panel, text="Clear Results", command=self.clear_af_plane_results).grid(row=row, column=0, sticky="ew", pady=(8, 0), padx=(0, 5))
         ttk.Button(control_panel, text="Save Results", command=self.save_af_plane_results).grid(row=row, column=1, sticky="ew", pady=(8, 0), padx=(5, 0))
         row += 1
-        ttk.Button(control_panel, text="Load Results", command=self.load_af_plane_results).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(control_panel, text="Import FM JSON", command=self.load_af_plane_results).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self._update_af_plane_region_controls()
+
+    def _toggle_af_plane_af_params(self) -> None:
+        self.af_plane_af_params_expanded_var.set(not self.af_plane_af_params_expanded_var.get())
+        self._update_af_plane_af_params_visibility()
+
+    def _update_af_plane_af_params_visibility(self) -> None:
+        frame = getattr(self, "af_plane_af_params_frame", None)
+        button = getattr(self, "af_plane_af_params_button", None)
+        expanded = bool(self.af_plane_af_params_expanded_var.get())
+        if button is not None:
+            button.configure(text="AUTOFOCUS PARAMETERS v" if expanded else "AUTOFOCUS PARAMETERS >")
+        if frame is None:
+            return
+        if expanded:
+            frame.grid()
+        else:
+            frame.grid_remove()
 
     def _update_af_plane_region_controls(self) -> None:
         center_visible = self.af_plane_region_mode_var.get() == "Center / Range"
@@ -2293,6 +2391,28 @@ class ProbeApp(tk.Tk):
                 registry[mode].extend([label_widget, spinbox])
             return row_index + 2
 
+        def add_toggle_row(
+            row_index: int,
+            label: str,
+            variable: tk.BooleanVar,
+            *,
+            mode: str | None = None,
+            registry: dict[str, list[tk.Widget]] | None = None,
+            tile_mode: str | None = None,
+            tile_registry: dict[str, list[tk.Widget]] | None = None,
+            command: Callable[[], None] | None = None,
+        ) -> ttk.Frame:
+            row_frame = ttk.Frame(control_panel, style="Panel.TFrame")
+            row_frame.grid(row=row_index, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+            row_frame.columnconfigure(0, weight=1)
+            ttk.Label(row_frame, text=label, style="Panel.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+            ToggleSwitch(row_frame, variable, self.colors, command=command).grid(row=0, column=1, sticky="e")
+            if mode is not None and registry is not None:
+                registry[mode].append(row_frame)
+            if tile_mode is not None and tile_registry is not None:
+                tile_registry[tile_mode].append(row_frame)
+            return row_frame
+
         self.imgstitch_mode_widgets["XY Stitch"].extend([range_label, mode_combo])
 
         row = 4
@@ -2338,8 +2458,7 @@ class ProbeApp(tk.Tk):
         t_fusion_label.grid(row=row, column=1, sticky="w", pady=(7, 2), padx=(5, 0))
         t_fusion_combo = ttk.Combobox(control_panel, textvariable=self.t_stack_fusion_var, values=("average", "registered_average", "sharpness_fusion"), state="readonly", width=16)
         t_fusion_combo.grid(row=row + 1, column=1, sticky="ew", padx=(5, 0))
-        t_raw = ttk.Checkbutton(control_panel, text="Save raw T-stack", variable=self.t_stack_save_raw_var)
-        t_raw.grid(row=row + 2, column=0, columnspan=2, sticky="w", pady=(5, 0))
+        t_raw = add_toggle_row(row + 2, "Save raw T-stack", self.t_stack_save_raw_var)
         for widget in (t_fusion_label, t_fusion_combo, t_raw):
             self.imgstack_mode_widgets["T-Stack"].append(widget)
             self.imgstitch_tile_mode_widgets["T-Stack"].append(widget)
@@ -2358,14 +2477,12 @@ class ProbeApp(tk.Tk):
         z_fusion_label.grid(row=row, column=0, columnspan=2, sticky="w", pady=(7, 2))
         z_fusion_combo = ttk.Combobox(control_panel, textvariable=self.z_stack_fusion_var, values=("laplacian", "tenengrad"), state="readonly", width=16)
         z_fusion_combo.grid(row=row + 1, column=0, columnspan=2, sticky="ew")
-        z_return = ttk.Checkbutton(control_panel, text="Return to Z0", variable=self.z_stack_return_var)
-        z_return.grid(row=row + 2, column=0, sticky="w", pady=(10, 0))
-        z_raw = ttk.Checkbutton(control_panel, text="Save raw Z-stack", variable=self.z_stack_save_raw_var)
-        z_raw.grid(row=row + 2, column=1, sticky="w", pady=(10, 0), padx=(6, 0))
+        z_return = add_toggle_row(row + 2, "Return to Z0", self.z_stack_return_var)
+        z_raw = add_toggle_row(row + 3, "Save raw Z-stack", self.z_stack_save_raw_var)
         for widget in (z_fusion_label, z_fusion_combo, z_return, z_raw):
             self.imgstack_mode_widgets["Z-Stack"].append(widget)
             self.imgstitch_tile_mode_widgets["Z-Stack"].append(widget)
-        row += 3
+        row += 4
 
         recompose_label = ttk.Label(control_panel, text="RECOMPOSE", style="Section.TLabel")
         recompose_label.grid(row=row, column=0, columnspan=2, sticky="w", pady=(10, 2))
@@ -2373,21 +2490,14 @@ class ProbeApp(tk.Tk):
         row += 1
         _ = add_spinbox(row, "Max correction (um)", self.imgstitch_max_correction_um_var, "XY Stitch", self.imgstitch_mode_widgets, column=0, from_value=0, increment=0.5, kind="float")
         row = add_spinbox(row, "Reg weight (0-1)", self.imgstitch_registration_weight_var, "XY Stitch", self.imgstitch_mode_widgets, column=1, from_value=0, to_value=1, increment=0.05, kind="float")
-        white_balance_check = ttk.Checkbutton(control_panel, text="White balance correction", variable=self.imgstitch_white_balance_var)
-        white_balance_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        self.imgstitch_mode_widgets["XY Stitch"].append(white_balance_check)
+        add_toggle_row(row, "White balance correction", self.imgstitch_white_balance_var, mode="XY Stitch", registry=self.imgstitch_mode_widgets)
         row += 1
-        correction_check = ttk.Checkbutton(control_panel, text="Use green-edge displacement correction", variable=self.imgstitch_green_edge_correction_var)
-        correction_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        self.imgstitch_mode_widgets["XY Stitch"].append(correction_check)
+        add_toggle_row(row, "Use green-edge displacement correction", self.imgstitch_green_edge_correction_var, mode="XY Stitch", registry=self.imgstitch_mode_widgets)
         row += 1
-        seam_check = ttk.Checkbutton(control_panel, text="Show seam quality", variable=self.imgstitch_show_seams_var)
-        seam_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        self.imgstitch_mode_widgets["XY Stitch"].append(seam_check)
+        add_toggle_row(row, "Show seam quality", self.imgstitch_show_seams_var, mode="XY Stitch", registry=self.imgstitch_mode_widgets)
         row += 1
 
-        plane_check = ttk.Checkbutton(control_panel, text="Four-corner plane AF", variable=self.imgstitch_plane_af_var)
-        plane_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        plane_check = add_toggle_row(row, "Four-corner plane AF", self.imgstitch_plane_af_var)
         focusmap_plane_check = ttk.Frame(control_panel, style="Panel.TFrame")
         focusmap_plane_check.grid(row=row + 1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         focusmap_plane_check.columnconfigure(0, weight=1)
@@ -5180,25 +5290,21 @@ class ProbeApp(tk.Tk):
             self.af_plane_status_var.set("Stop mapping before loading results.")
             return
         path = filedialog.askopenfilename(
-            title="Load FocusMap",
+            title="Import FocusMap JSON",
+            initialfile=FOCUSMAP_AUTOSAVE_FILENAME,
             filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
         )
         if not path:
             return
         try:
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
-            mesh_points = [AFMeshPoint.from_dict(item) for item in payload.get("mesh_points", [])]
-            records = [dict(item) for item in payload.get("measured_points", [])]
-            for record in records:
-                record.setdefault("fit_enabled", True)
-            model_payload = payload.get("sample_plane_model")
-            model = SamplePlaneModel.from_dict(model_payload) if isinstance(model_payload, dict) else None
-            mesh_settings = payload.get("mesh_settings", {})
+            if not isinstance(payload, dict):
+                raise ValueError("FocusMap JSON root must be an object.")
+            mesh_points, records, model, mesh_settings = parse_focusmap_result_payload(payload)
         except Exception as exc:
-            self.af_plane_status_var.set(f"Load failed: {exc}")
+            self.af_plane_status_var.set(f"Import failed: {exc}")
             return
-        if isinstance(mesh_settings, dict):
-            self._apply_af_plane_mesh_settings(mesh_settings)
+        self._apply_af_plane_mesh_settings(mesh_settings)
         self.af_plane_mesh_points = mesh_points
         self.af_plane_results = records or [self._new_af_plane_record(point) for point in mesh_points]
         self.sample_plane_model = model
@@ -5216,7 +5322,7 @@ class ProbeApp(tk.Tk):
         self._update_af_plane_metrics()
         self._refresh_af_plane_table()
         self._draw_focusmap_all()
-        self.af_plane_status_var.set(f"Loaded {Path(path).name}.")
+        self.af_plane_status_var.set(f"Imported {Path(path).name}.")
 
     def _apply_af_plane_mesh_settings(self, settings: dict[str, object]) -> None:
         self.af_plane_mesh_type_var.set(str(settings.get("mesh_type", self.af_plane_mesh_type_var.get())))
@@ -6116,6 +6222,207 @@ class ProbeApp(tk.Tk):
             "images": records,
         }
         session_manifest_path(session_dir).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    def start_autotest(self, settings: AutoTestSettings) -> None:
+        if self.autotest_running or self.motion_busy:
+            if self.autotest_panel is not None:
+                self.autotest_panel.set_status("Motion is busy; AutoTest skipped.")
+            return
+        if self.gds_stage_mapper_panel is None or self.gds_stage_mapper_panel.mapper is None:
+            if self.autotest_panel is not None:
+                self.autotest_panel.set_status("Bind LayoutMap mapping before running AutoTest.")
+            return
+        if get_sample_plane_model() is None:
+            if self.autotest_panel is not None:
+                self.autotest_panel.set_status("Run or load FocusMap before running AutoTest.")
+            return
+        if not self.serial_client:
+            self.connect_serial()
+        if not self.serial_client:
+            if self.autotest_panel is not None:
+                self.autotest_panel.set_status("Serial is not connected; AutoTest skipped.")
+            return
+        try:
+            normalized_settings = settings.normalized()
+            points = generate_autotest_points(normalized_settings, self.gds_stage_mapper_panel.mapper)
+        except Exception as exc:
+            if self.autotest_panel is not None:
+                self.autotest_panel.set_status(f"Invalid AutoTest settings: {exc}")
+            return
+        if "photo" in normalized_settings.measurement_steps:
+            with self.camera_lock:
+                frame_available = self.latest_stitch_frame is not None
+            if not frame_available:
+                if self.autotest_panel is not None:
+                    self.autotest_panel.set_status("No camera frame available for AutoTest photo.")
+                return
+        try:
+            session_dir = self._prepare_autotest_session_dir() if "photo" in normalized_settings.measurement_steps else None
+        except Exception as exc:
+            if self.autotest_panel is not None:
+                self.autotest_panel.set_status(f"AutoTest session setup failed: {exc}")
+            return
+
+        self.autotest_restore_realtime = self.realtime_enabled
+        if self.realtime_enabled:
+            self.disable_realtime_position()
+        self.autotest_restore_home_signal = self.home_signal_enabled
+        if self.home_signal_enabled:
+            self.disable_home_signal_polling()
+        self.autotest_running = True
+        self.motion_busy = True
+        self.autotest_progress_current = 0
+        self.autotest_progress_total = len(points)
+        self.autotest_stop_event.clear()
+        if self.autotest_panel is not None:
+            self.autotest_panel.set_running(True)
+            self.autotest_panel.set_status(f"AutoTest running: {len(points)} point(s).")
+        self.status_var.set(f"AutoTest running: {len(points)} point(s).")
+        self.autotest_thread = threading.Thread(
+            target=self._autotest_worker,
+            args=(settings, points, session_dir),
+            daemon=True,
+        )
+        self.autotest_thread.start()
+
+    def stop_autotest(self) -> None:
+        self.autotest_stop_event.set()
+        if self.autotest_panel is not None:
+            self.autotest_panel.set_status("Stopping AutoTest.")
+
+    def _prepare_autotest_session_dir(self) -> Path:
+        root = self.autotest_session_root.resolve()
+        workspace = Path.cwd().resolve()
+        if workspace not in (root, *root.parents):
+            raise RuntimeError(f"Refusing to use AutoTest session directory outside workspace: {root}")
+        session_dir = self.autotest_session_root / time.strftime("%Y%m%d_%H%M%S")
+        suffix = 1
+        while session_dir.exists():
+            session_dir = self.autotest_session_root / f"{time.strftime('%Y%m%d_%H%M%S')}_{suffix:02d}"
+            suffix += 1
+        (session_dir / "images").mkdir(parents=True, exist_ok=False)
+        return session_dir
+
+    def _autotest_worker(self, settings: AutoTestSettings, points: tuple[AutoTestPoint, ...], session_dir: Path | None) -> None:
+        assert self.serial_client is not None
+        try:
+            import cv2
+
+            entries = self.serial_client.read_stable_xyz_positions()
+            current_x = self._axis_from_position_entries(entries, Axis.X)
+            current_y = self._axis_from_position_entries(entries, Axis.Y)
+            current_z = self._axis_from_position_entries(entries, Axis.Z)
+            normalized_settings = settings.normalized()
+            z_margin_pulses = int(round(normalized_settings.z_down_margin_um / self.probe_config.um_per_pulse("Z")))
+            total = len(points)
+            for index, point in enumerate(points, start=1):
+                if self.autotest_stop_event.is_set():
+                    self.result_queue.put(("autotest_status", f"Stopped after {index - 1}/{total} point(s)."))
+                    break
+                target_x = int(round(point.stage_x_um / self.probe_config.um_per_pulse("X")))
+                target_y = int(round(point.stage_y_um / self.probe_config.um_per_pulse("Y")))
+                probe_z = self._focusmap_z_target_at_xy(target_x, target_y)
+                if probe_z is None:
+                    raise RuntimeError("FocusMap plane is unavailable for an AutoTest point.")
+                move_z = probe_z - z_margin_pulses
+
+                self.result_queue.put(("autotest_progress", index, total, f"Z down before {point.name}", point.row, point.col, "running"))
+                entries = self._move_absolute_stage(current_x, current_y, move_z, source="autotest")
+                current_x = self._axis_from_position_entries(entries, Axis.X)
+                current_y = self._axis_from_position_entries(entries, Axis.Y)
+                current_z = self._axis_from_position_entries(entries, Axis.Z)
+                if self.autotest_stop_event.is_set():
+                    break
+
+                self.result_queue.put(("autotest_progress", index, total, f"Moving XY to {point.name}", point.row, point.col, "running"))
+                entries = self._move_absolute_stage(target_x, target_y, current_z, source="autotest")
+                current_x = self._axis_from_position_entries(entries, Axis.X)
+                current_y = self._axis_from_position_entries(entries, Axis.Y)
+                current_z = self._axis_from_position_entries(entries, Axis.Z)
+                if self.autotest_stop_event.is_set():
+                    break
+
+                self.result_queue.put(("autotest_progress", index, total, f"Z up to probe {point.name}", point.row, point.col, "running"))
+                entries = self._autotest_raise_z_split(
+                    current_z,
+                    probe_z,
+                    normalized_settings.z_up_fast_percent,
+                    normalized_settings.z_fast_speed_percent,
+                    normalized_settings.z_slow_speed_percent,
+                )
+                current_x = self._axis_from_position_entries(entries, Axis.X)
+                current_y = self._axis_from_position_entries(entries, Axis.Y)
+                current_z = self._axis_from_position_entries(entries, Axis.Z)
+                if self.autotest_stop_event.is_set():
+                    break
+
+                self._execute_autotest_measurement_steps(point, normalized_settings.measurement_steps, session_dir, cv2)
+                measure_text = self._autotest_measurement_summary(normalized_settings.measurement_steps)
+                self.result_queue.put(("autotest_progress", index, total, f"{measure_text} at {point.name}", point.row, point.col, "done"))
+            if not self.autotest_stop_event.is_set():
+                self.result_queue.put(("autotest_done", len(points)))
+        except Exception as exc:
+            self.result_queue.put(("autotest_error", exc))
+        finally:
+            self.result_queue.put(("autotest_finished",))
+
+    def _autotest_raise_z_split(
+        self,
+        current_z: int,
+        target_z: int,
+        fast_percent: float,
+        fast_speed_percent: int,
+        slow_speed_percent: int,
+    ):
+        assert self.serial_client is not None
+        delta = int(target_z) - int(current_z)
+        total_pulses = abs(delta)
+        if total_pulses <= 0:
+            entries = self.serial_client.read_stable_xyz_positions()
+            self.result_queue.put(("read_positions", entries, "autotest"))
+            return entries
+
+        fast_ratio = max(0.0, min(100.0, float(fast_percent))) / 100.0
+        fast_pulses = int(round(total_pulses * fast_ratio))
+        slow_pulses = total_pulses - fast_pulses
+        reverse = delta < 0
+        for pulses, speed_percent in (
+            (fast_pulses, max(0, min(100, int(fast_speed_percent)))),
+            (slow_pulses, max(0, min(100, int(slow_speed_percent)))),
+        ):
+            if pulses <= 0 or self.autotest_stop_event.is_set():
+                continue
+            self.serial_client.move_relative(axis=Axis.Z, reverse=reverse, pulses=pulses, speed_percent=speed_percent)
+            self.serial_client.wait_axis_reached(Axis.Z, timeout=self._axis_move_timeout(pulses, speed_percent))
+        entries = self.serial_client.read_stable_xyz_positions()
+        self.result_queue.put(("read_positions", entries, "autotest"))
+        return entries
+
+    @staticmethod
+    def _autotest_measurement_summary(steps: tuple[str, ...]) -> str:
+        if not steps:
+            return "Measurement placeholder"
+        labels = {"pause": "Pause", "photo": "Photo"}
+        return "Measure " + " -> ".join(labels.get(step, step) for step in steps)
+
+    def _execute_autotest_measurement_steps(self, point: AutoTestPoint, steps: tuple[str, ...], session_dir: Path | None, cv2_module) -> None:
+        for step in steps:
+            if self.autotest_stop_event.is_set():
+                return
+            if step == "pause":
+                self.result_queue.put(("autotest_status", f"Pause step placeholder at {point.name}."))
+            elif step == "photo":
+                if session_dir is None:
+                    raise RuntimeError("AutoTest photo session directory is unavailable.")
+                image = self._capture_stitch_frame(stop_event=self.autotest_stop_event)
+                output_path = session_dir / "images" / f"{self._safe_autotest_name(point.name)}.png"
+                cv2_module.imwrite(str(output_path), image)
+                self.result_queue.put(("autotest_status", f"Photo saved for {point.name}: {output_path.name}"))
+
+    @staticmethod
+    def _safe_autotest_name(value: str) -> str:
+        text = str(value).strip() or "point"
+        return re.sub(r"[^0-9A-Za-z_.-]+", "_", text)
 
     def _imgstitch_quality_summary(self, edges: list[StitchEdgeQuality]) -> str:
         if not edges:
@@ -7191,6 +7498,8 @@ class ProbeApp(tk.Tk):
         self.realtime_stop_event.set()
         self.af_plane_stop_event.set()
         self.autofocus_stop_event.set()
+        self.imgmatrix_stop_event.set()
+        self.autotest_stop_event.set()
         self.realtime_enabled = False
         self.realtime_button_var.set("Continue")
         if not self.serial_client:
@@ -8049,6 +8358,61 @@ class ProbeApp(tk.Tk):
                 self.toggle_home_signal_polling()
             return
 
+        if event_type == "autotest_status":
+            _, message = event
+            if self.autotest_panel is not None:
+                self.autotest_panel.set_status(str(message))
+            self.status_var.set(str(message))
+            logger.info("AutoTest: %s", message)
+            return
+
+        if event_type == "autotest_progress":
+            _, current, total, message, *state_payload = event
+            self.autotest_progress_current = int(current)
+            self.autotest_progress_total = int(total)
+            row = col = None
+            state = None
+            if len(state_payload) >= 3:
+                row = int(state_payload[0])
+                col = int(state_payload[1])
+                state = str(state_payload[2])
+            if self.autotest_panel is not None:
+                self.autotest_panel.set_progress(int(current), int(total), str(message), row=row, col=col, state=state)
+            self.status_var.set(str(message))
+            logger.info("AutoTest: %s (%s/%s)", message, current, total)
+            return
+
+        if event_type == "autotest_done":
+            _, count = event
+            message = f"AutoTest completed {count} point(s)."
+            if self.autotest_panel is not None:
+                self.autotest_panel.set_status(message)
+            self.status_var.set(message)
+            logger.info(message)
+            return
+
+        if event_type == "autotest_error":
+            _, exc = event
+            message = f"AutoTest failed: {exc}"
+            if self.autotest_panel is not None:
+                self.autotest_panel.set_status(message)
+            self.status_var.set(message)
+            logger.error("AutoTest failed: %s", exc)
+            return
+
+        if event_type == "autotest_finished":
+            self.autotest_running = False
+            self.motion_busy = False
+            if self.autotest_panel is not None:
+                self.autotest_panel.set_running(False)
+            if self.autotest_restore_realtime and not self.realtime_enabled and self.serial_client:
+                self.autotest_restore_realtime = False
+                self.toggle_realtime_position()
+            if self.autotest_restore_home_signal and not self.home_signal_enabled and self.serial_client:
+                self.autotest_restore_home_signal = False
+                self.toggle_home_signal_polling()
+            return
+
         if event_type == "motor_command":
             _, axis, action, command, source = event
             command_hex = hex_bytes(command)
@@ -8232,6 +8596,7 @@ class ProbeApp(tk.Tk):
         self.af_plane_stop_event.set()
         self.imgstitch_stop_event.set()
         self.imgmatrix_stop_event.set()
+        self.autotest_stop_event.set()
         self.realtime_stop_event.set()
         self.home_signal_stop_event.set()
         if self.realtime_enabled and self.serial_client:

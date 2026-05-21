@@ -8,6 +8,7 @@ from semi_auto_probe.af_plane import (
     fit_sample_plane,
     generate_af_mesh,
     get_focus_z_at_xy,
+    parse_focusmap_result_payload,
     set_sample_plane_model,
 )
 
@@ -94,6 +95,63 @@ class AFPlaneTests(unittest.TestCase):
         set_sample_plane_model(model)
 
         self.assertAlmostEqual(get_focus_z_at_xy(10.0, 5.0), 11.5)
+
+    def test_parse_focusmap_payload_uses_root_points(self) -> None:
+        payload = {
+            "mesh_settings": {"mesh_type": "Rectangular"},
+            "mesh_points": [{"index": 1, "row": 0, "col": 0, "x": 10, "y": 20}],
+            "measured_points": [{"index": 1, "row": 0, "col": 0, "x": 10, "y": 20, "measured_z": 30}],
+            "sample_plane_model": {
+                "enabled": True,
+                "type": "plane",
+                "a": 1.0,
+                "b": 2.0,
+                "c": 3.0,
+            },
+        }
+
+        mesh_points, records, model, mesh_settings = parse_focusmap_result_payload(payload)
+
+        self.assertEqual([(point.index, point.x, point.y) for point in mesh_points], [(1, 10, 20)])
+        self.assertTrue(records[0]["fit_enabled"])
+        self.assertEqual(model.c if model is not None else None, 3.0)
+        self.assertEqual(mesh_settings["mesh_type"], "Rectangular")
+
+    def test_parse_focusmap_payload_falls_back_to_model_points(self) -> None:
+        payload = {
+            "sample_plane_model": {
+                "enabled": True,
+                "type": "plane",
+                "a": 0.1,
+                "b": -0.2,
+                "c": 3.0,
+                "mesh_points": [{"index": 1, "row": 0, "col": 0, "x": 10, "y": 20}],
+                "measured_points": [{"index": 1, "row": 0, "col": 0, "x": 10, "y": 20, "measured_z": 30}],
+            }
+        }
+
+        mesh_points, records, model, mesh_settings = parse_focusmap_result_payload(payload)
+
+        self.assertEqual([(point.index, point.x, point.y) for point in mesh_points], [(1, 10, 20)])
+        self.assertTrue(records[0]["fit_enabled"])
+        self.assertEqual(model.a if model is not None else None, 0.1)
+        self.assertEqual(mesh_settings, {})
+
+    def test_parse_focusmap_payload_accepts_model_as_root(self) -> None:
+        payload = {
+            "enabled": True,
+            "type": "plane",
+            "a": 0.1,
+            "b": -0.2,
+            "c": 3.0,
+            "measured_points": [{"index": 1, "row": 0, "col": 0, "x": 10, "y": 20, "measured_z": 30}],
+        }
+
+        mesh_points, records, model, _mesh_settings = parse_focusmap_result_payload(payload)
+
+        self.assertEqual([(point.index, point.x, point.y) for point in mesh_points], [(1, 10, 20)])
+        self.assertTrue(records[0]["fit_enabled"])
+        self.assertEqual(model.c if model is not None else None, 3.0)
 
 
 if __name__ == "__main__":
