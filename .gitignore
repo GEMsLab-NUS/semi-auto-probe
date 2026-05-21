@@ -34,6 +34,7 @@ last_focusmap_mapping.json
 last_layoutbond_mapping.json
 last_imgstitch*.png
 assets/EBL-Mark-Array.gds
+assets/run.ps1
 imgstitch_session/
 imgmatrix_session/
 last_autofocus_history*.csv
