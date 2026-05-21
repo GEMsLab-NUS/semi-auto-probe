@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import unittest
 
-from semi_auto_probe.auto_test import AutoTestSettings, compile_autotest_point_name, generate_autotest_points, index_to_letters
+from semi_auto_probe.auto_test import (
+    AutoTestSettings,
+    compile_autotest_point_name,
+    create_autotest_flow_card,
+    generate_autotest_points,
+    index_to_letters,
+    legacy_measurement_steps_from_flow,
+    summarize_autotest_flow,
+)
 from semi_auto_probe.gds_stage_mapper import AffineCoordinateMapper, CalibrationPoint
 
 
@@ -62,6 +70,19 @@ class AutoTestTests(unittest.TestCase):
         self.assertEqual(index_to_letters(25), "Z")
         self.assertEqual(index_to_letters(26), "AA")
         self.assertEqual(compile_autotest_point_name("Dev{i}{j}", i_index=27, j_index=2), "DevAB3")
+
+    def test_flow_summary_and_legacy_steps(self) -> None:
+        cards = [
+            create_autotest_flow_card("wait", "card_1"),
+            create_autotest_flow_card("iv", "card_2"),
+            create_autotest_flow_card("photo", "card_3"),
+        ]
+
+        self.assertEqual(
+            summarize_autotest_flow(cards),
+            "Measurement flow: Entity Pause -> IV Test -> Capture Photo",
+        )
+        self.assertEqual(legacy_measurement_steps_from_flow(cards), ("pause", "photo"))
 
 
 if __name__ == "__main__":
