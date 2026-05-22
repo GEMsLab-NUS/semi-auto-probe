@@ -77,6 +77,15 @@ class SerialClientTest(unittest.TestCase):
 
         self.assertEqual(client._read_multi_axis_completed_response(timeout=0.05), b"\xA5")
 
+    def test_multi_axis_reader_ignores_a5_ack_when_axes_are_expected(self) -> None:
+        client = ControllerSerialClient("COM_TEST", timeout=0.05)
+        expected = reached_response(Axis.X)
+        client._serial = FakeSerial(b"\xA5" + expected)
+
+        completed = client._read_multi_axis_completed_response(timeout=0.05, moving_axes={Axis.X})
+
+        self.assertEqual(completed, expected)
+
     def test_multi_axis_reader_accepts_b5_for_all_moving_axes(self) -> None:
         client = ControllerSerialClient("COM_TEST", timeout=0.05)
         expected = reached_response(Axis.X) + reached_response(Axis.Y)

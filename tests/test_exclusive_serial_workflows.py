@@ -7,6 +7,7 @@ from unittest.mock import patch
 from types import MethodType
 
 from semi_auto_probe.app import ProbeApp
+from semi_auto_probe.config import ProbeConfig
 
 
 class DummyVar:
@@ -18,6 +19,15 @@ class DummyVar:
 
     def get(self) -> str:
         return self.value
+
+
+class DummyEntry:
+    def __init__(self) -> None:
+        self.state = "normal"
+
+    def configure(self, **kwargs) -> None:
+        if "state" in kwargs:
+            self.state = kwargs["state"]
 
 
 class ExclusiveSerialWorkflowTests(unittest.TestCase):
@@ -123,6 +133,48 @@ class ExclusiveSerialWorkflowTests(unittest.TestCase):
 
         self.assertTrue(app.admin_mode_enabled)
         self.assertEqual(app.admin_token_var.get(), "")
+
+    def test_admin_mode_locks_cc_accel_entry(self) -> None:
+        app = ProbeApp.__new__(ProbeApp)
+        app.admin_mode_enabled = False
+        app.admin_mode_status_var = DummyVar("Admin mode locked")
+        app.serial_client = None
+        app.set_xyz_zero_button = None
+        app.set_autofocus_z_zero_button = None
+        app.cc_accel_time_entry = DummyEntry()
+
+        ProbeApp._update_admin_mode_controls(app)
+
+        self.assertEqual(app.cc_accel_time_entry.state, "disabled")
+        self.assertIn("CC accel/decel", app.admin_mode_status_var.get())
+
+        app.admin_mode_enabled = True
+        ProbeApp._update_admin_mode_controls(app)
+
+        self.assertEqual(app.cc_accel_time_entry.state, "normal")
+
+    def test_apply_config_rejects_cc_accel_change_without_admin(self) -> None:
+        app = ProbeApp.__new__(ProbeApp)
+        app.admin_mode_enabled = False
+        app.probe_config = ProbeConfig(cc_accel_time_s=0.3)
+        app.cc_accel_time_var = DummyVar("0.4")
+        app.status_var = DummyVar()
+        app.config_status_var = DummyVar()
+        app.admin_mode_status_var = DummyVar("Admin mode locked")
+        app.serial_client = None
+        app.set_xyz_zero_button = None
+        app.set_autofocus_z_zero_button = None
+        app.synced = False
+
+        def sync(self) -> None:
+            self.synced = True
+
+        app._sync_config_vars_from_config = MethodType(sync, app)
+
+        self.assertFalse(ProbeApp.apply_config(app))
+        self.assertTrue(app.synced)
+        self.assertIn("requires Config admin mode", app.status_var.get())
+        self.assertAlmostEqual(app.probe_config.cc_accel_time_s, 0.3)
 
 
 if __name__ == "__main__":

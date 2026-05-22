@@ -61,8 +61,10 @@ from .config import (
     KEYBOARD_MOTION_SCHEME_LABELS,
     KEYBOARD_MOTION_SCHEME_WASD_QE,
     MOTOR_SPEED_PROFILE_FAST,
+    MOTOR_SPEED_PROFILE_FINE,
     MOTOR_SPEED_PROFILE_LABELS,
     MOTOR_SPEED_PROFILES,
+    MOTOR_SPEED_PROFILE_SAFE,
     OBJECTIVE_OPTIONS,
     ProbeConfig,
     derive_missing_calibrations,
@@ -74,6 +76,16 @@ from .config import (
     pulses_from_um,
     save_probe_config,
 )
+from .edge_trace_panel import (
+    EDGE_TRACE_ACTION_AUTO,
+    EDGE_TRACE_ACTION_CONTACT,
+    EDGE_TRACE_ACTION_SAFE,
+    EDGE_TRACE_ACTION_SEGMENT,
+    EDGE_TRACE_ACTION_START,
+    EDGE_TRACE_ACTIONS,
+    EdgeTracePanel,
+)
+from .gds_edge_trace import EdgeTracePlan, EdgeTracePathPoint
 from .focusmap_3d import create_focusmap_3d_view
 from .gds_stage_mapper import GDSStageMapperPanel, stage_move_plan_from_um, stage_xyz_move_plan_from_um
 from .img_matrix import ImgMatrixPanel, ImgMatrixPoint, ImgMatrixSettings, generate_imgmatrix_points, session_manifest_path
@@ -198,6 +210,7 @@ class ProbeApp(tk.Tk):
         self.gds_stage_mapper_panel: GDSStageMapperPanel | None = None
         self.imgmatrix_panel: ImgMatrixPanel | None = None
         self.autotest_panel: AutoTestPanel | None = None
+        self.edge_trace_panel: EdgeTracePanel | None = None
         self.agent_panel: AgentPanel | None = None
         self.agent_function_spec_path = Path.cwd() / "docs" / "agent-function-spec.md"
         self.agent_planner = None
@@ -233,6 +246,11 @@ class ProbeApp(tk.Tk):
         self.autotest_running = False
         self.autotest_restore_realtime = False
         self.autotest_restore_home_signal = False
+        self.edge_trace_thread: threading.Thread | None = None
+        self.edge_trace_running = False
+        self.edge_trace_restore_realtime = False
+        self.edge_trace_restore_home_signal = False
+        self.edge_trace_stop_event = threading.Event()
         self.latest_stitch_frame = None
         self.latest_stitch_frame_captured_at = 0.0
         self.imgstitch_progress_current = 0
@@ -823,9 +841,10 @@ class ProbeApp(tk.Tk):
         }
         module_tab_labels["ImgMatrix"] = "🔳 ImgMatrix"
         module_tab_labels["AutoTest"] = "🧪 AutoTest"
+        module_tab_labels["EdgeTrace"] = "EdgeTrace"
         tab_bar = ttk.Frame(content, style="App.TFrame")
         tab_bar.grid(row=0, column=0, sticky="w")
-        for col, name in enumerate(("Main", "AutoFocus", "FocusMap", "ImgStitch", "LayoutBond", "ImgMatrix", "AutoTest", "AI Agent", "Communication", "Config")):
+        for col, name in enumerate(("Main", "AutoFocus", "FocusMap", "ImgStitch", "LayoutBond", "ImgMatrix", "AutoTest", "EdgeTrace", "AI Agent", "Communication", "Config")):
             tab_bar.columnconfigure(col, minsize=116, uniform="top_tabs")
             label = tk.Label(
                 tab_bar,
@@ -861,6 +880,7 @@ class ProbeApp(tk.Tk):
         gds_stage_mapper_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         imgmatrix_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         autotest_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
+        edge_trace_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         agent_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         config_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         self.pages = {
@@ -872,6 +892,7 @@ class ProbeApp(tk.Tk):
             "LayoutBond": gds_stage_mapper_page,
             "ImgMatrix": imgmatrix_page,
             "AutoTest": autotest_page,
+            "EdgeTrace": edge_trace_page,
             "AI Agent": agent_page,
             "Config": config_page,
         }
@@ -886,6 +907,7 @@ class ProbeApp(tk.Tk):
         self._build_gds_stage_mapper_page(gds_stage_mapper_page)
         self._build_imgmatrix_page(imgmatrix_page)
         self._build_autotest_page(autotest_page)
+        self._build_edge_trace_page(edge_trace_page)
         self._build_agent_page(agent_page)
         self._build_config_page(config_page)
         self._update_config_display()
@@ -952,6 +974,9 @@ class ProbeApp(tk.Tk):
         elif name == "AutoTest" and self.autotest_panel is not None:
             self._sync_autotest_from_layoutbond()
             self.autotest_panel.viewer.redraw()
+        elif name == "EdgeTrace" and self.edge_trace_panel is not None:
+            self._sync_edge_trace_from_layoutbond()
+            self.edge_trace_panel.viewer.redraw()
         elif name == "AI Agent" and self.agent_panel is not None:
             self.agent_panel.refresh_context()
 
@@ -1067,6 +1092,27 @@ class ProbeApp(tk.Tk):
         )
         self._sync_autotest_from_layoutbond()
 
+    def _build_edge_trace_page(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        self.edge_trace_panel = EdgeTracePanel(
+            parent,
+            self.colors,
+            get_stage_position_um=self._gds_mapper_current_stage_um,
+            get_mapper=self._imgmatrix_mapper,
+            get_focus_z_um=self._gds_mapper_focus_z_um,
+            get_focusmap_ready=self._autotest_focusmap_ready,
+            get_layoutmap_ready=self._autotest_layoutmap_ready,
+            get_layout_context=self._edge_trace_layout_context,
+            get_microscope_preview=self.agent_microscope_preview,
+            fov_width_var=self.layoutbond_fov_width_var,
+            fov_height_var=self.layoutbond_fov_height_var,
+            start_run=self.start_edge_trace,
+            stop_run=self.stop_edge_trace,
+            set_status=self.status_var.set,
+        )
+        self._sync_edge_trace_from_layoutbond()
+
     def _imgmatrix_mapper(self):
         if self.gds_stage_mapper_panel is None:
             return None
@@ -1081,6 +1127,12 @@ class ProbeApp(tk.Tk):
     def _sync_layout_dependent_panels(self) -> None:
         self._sync_imgmatrix_from_layoutbond()
         self._sync_autotest_from_layoutbond()
+        self._sync_edge_trace_from_layoutbond()
+
+    def _edge_trace_layout_context(self) -> tuple[object | None, dict[tuple[int, int], bool]]:
+        if self.gds_stage_mapper_panel is None:
+            return None, {}
+        return self.gds_stage_mapper_panel.model, dict(self.gds_stage_mapper_panel.viewer.layer_visibility)
 
     def _sync_imgmatrix_from_layoutbond(self) -> None:
         if self.imgmatrix_panel is None or self.gds_stage_mapper_panel is None:
@@ -1095,6 +1147,14 @@ class ProbeApp(tk.Tk):
         model = self.gds_stage_mapper_panel.model
         layer_visibility = dict(self.gds_stage_mapper_panel.viewer.layer_visibility)
         self.autotest_panel.set_layout_context(model, layer_visibility)
+
+    def _sync_edge_trace_from_layoutbond(self) -> None:
+        if self.edge_trace_panel is None or self.gds_stage_mapper_panel is None:
+            return
+        model = self.gds_stage_mapper_panel.model
+        layer_visibility = dict(self.gds_stage_mapper_panel.viewer.layer_visibility)
+        if model is not None and self.edge_trace_panel.model is None:
+            self.edge_trace_panel.set_layout_context(model, layer_visibility)
 
     def _set_layoutbond_matrix_overlay(self, overlays) -> None:
         if self.gds_stage_mapper_panel is None:
@@ -1259,6 +1319,9 @@ class ProbeApp(tk.Tk):
         if self.autotest_running:
             self.stop_autotest()
             stopped.append("AutoTest")
+        if self.edge_trace_running:
+            self.stop_edge_trace()
+            stopped.append("EdgeTrace")
         if stopped:
             message = f"Agent stop requested for {', '.join(stopped)}."
         else:
@@ -1539,8 +1602,8 @@ class ProbeApp(tk.Tk):
         pulses = int(round(abs(stage_um) * pulses_per_um))
         return stage_um, pulses, stage_um < 0
 
-    def _cc_axis_param(self, reverse: bool, pulses: int) -> tuple[bool, int, int, int]:
-        speed = self._motion_speed_percent() if pulses else 0
+    def _cc_axis_param(self, reverse: bool, pulses: int, speed_profile: str | None = None) -> tuple[bool, int, int, int]:
+        speed = self._motion_speed_percent(speed_profile) if pulses else 0
         return reverse, pulses, speed, self.probe_config.cc_acceleration_units()
 
     def _image_centering_cc_plan(
@@ -1637,6 +1700,8 @@ class ProbeApp(tk.Tk):
             return "ImgMatrix is running; LayoutBond move skipped."
         if self.autotest_running:
             return "AutoTest is running; LayoutBond move skipped."
+        if self.edge_trace_running:
+            return "EdgeTrace is running; LayoutBond move skipped."
         if self.position_read_pending:
             return "Position read is pending; LayoutBond move skipped."
         return None
@@ -2633,7 +2698,7 @@ class ProbeApp(tk.Tk):
             ("Base angle (deg)", self.base_angle_var, "float", 0.000001, 360),
             ("X/Y lead (mm)", self.lead_xy_var, "float", 0.000001, 1_000_000),
             ("Z lead (mm)", self.lead_z_var, "float", 0.000001, 1_000_000),
-            ("CC accel/decel (s)", self.cc_accel_time_var, "float", 0, 2.55),
+            ("CC accel/decel (s)", self.cc_accel_time_var, "float", 0.05, 2.55),
         )
         for index, (label, variable, kind, minimum, maximum) in enumerate(fields, start=1):
             col = (index - 1) % 2
@@ -2641,6 +2706,8 @@ class ProbeApp(tk.Tk):
             ttk.Label(motion_panel, text=label, style="Muted.TLabel").grid(row=row, column=col, sticky="w", pady=(16, 4), padx=(0 if col == 0 else 8, 8 if col == 0 else 0))
             entry = self._numeric_entry(motion_panel, variable, kind=kind, minimum=minimum, maximum=maximum)
             entry.grid(row=row + 1, column=col, sticky="ew", padx=(0 if col == 0 else 8, 8 if col == 0 else 0), ipady=6)
+            if variable is self.cc_accel_time_var:
+                self.cc_accel_time_entry = entry
 
         speed_panel = ttk.Frame(motion_panel, style="Panel.TFrame")
         speed_panel.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(22, 0))
@@ -2946,7 +3013,7 @@ class ProbeApp(tk.Tk):
 
         self.admin_mode_enabled = True
         self.admin_token_var.set("")
-        self.admin_mode_status_var.set("Admin mode enabled for this session. Set-zero commands are unlocked.")
+        self.admin_mode_status_var.set("Admin mode enabled for this session. Set-zero commands and CC accel/decel edits are unlocked.")
         self.status_var.set("Admin mode enabled.")
         self._update_admin_mode_controls()
 
@@ -2956,10 +3023,13 @@ class ProbeApp(tk.Tk):
             button = getattr(self, button_name, None)
             if button is not None:
                 button.configure(state=state)
+        cc_accel_entry = self.__dict__.get("cc_accel_time_entry")
+        if cc_accel_entry is not None:
+            cc_accel_entry.configure(state=state)
         if self.serial_client is not None:
             self.serial_client.set_admin_mode_enabled(self.admin_mode_enabled)
         if not self.admin_mode_enabled and self.admin_mode_status_var.get() == "Admin mode locked":
-            self.admin_mode_status_var.set("Admin mode locked. Set-zero commands are disabled.")
+            self.admin_mode_status_var.set("Admin mode locked. Set-zero commands and CC accel/decel edits are disabled.")
 
     def _require_admin_mode(self, action: str) -> bool:
         if self.admin_mode_enabled:
@@ -2969,6 +3039,13 @@ class ProbeApp(tk.Tk):
         logger.warning(message)
         self._update_admin_mode_controls()
         return False
+
+    def _cc_accel_time_change_pending(self) -> bool:
+        try:
+            candidate = float(self.cc_accel_time_var.get())
+        except (TypeError, ValueError):
+            return False
+        return abs(candidate - float(self.probe_config.cc_accel_time_s)) > 1e-9
 
     @staticmethod
     def _motor_speed_profile_label(profile: str) -> str:
@@ -3302,6 +3379,10 @@ class ProbeApp(tk.Tk):
         return header + rgb.tobytes()
 
     def apply_config(self, save: bool = True) -> bool:
+        if self._cc_accel_time_change_pending() and not self._require_admin_mode("Change CC accel/decel"):
+            self._sync_config_vars_from_config()
+            self.config_status_var.set("Config not saved: CC accel/decel requires Admin mode.")
+            return False
         try:
             updated = ProbeConfig(
                 objective=int(self.objective_var.get()),
@@ -3560,6 +3641,7 @@ class ProbeApp(tk.Tk):
             "autofocus",
             "autofocus manual",
             "button",
+            "edge_trace",
             "focusmap",
             "gds_mapper",
             "go_zero",
@@ -6223,6 +6305,360 @@ class ProbeApp(tk.Tk):
         }
         session_manifest_path(session_dir).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+    def start_edge_trace(self, plan: EdgeTracePlan, action: str = EDGE_TRACE_ACTION_SAFE, polyline_offset: int = 0) -> None:
+        action = action if action in EDGE_TRACE_ACTIONS else EDGE_TRACE_ACTION_SAFE
+        polyline_offset = max(0, int(polyline_offset))
+        if not plan.polylines:
+            self._edge_trace_reject_action(action, "EdgeTrace path is empty.")
+            return
+        if polyline_offset >= len(plan.polylines):
+            self._edge_trace_reject_action(action, "All EdgeTrace paths are complete.")
+            return
+
+        blocker = self._edge_trace_motion_blocker()
+        if blocker:
+            self._edge_trace_reject_action(action, blocker)
+            return
+        if self.gds_stage_mapper_panel is None or self.gds_stage_mapper_panel.mapper is None:
+            self._edge_trace_reject_action(action, "Bind LayoutMap mapping before running EdgeTrace.")
+            return
+        if get_sample_plane_model() is None:
+            self._edge_trace_reject_action(action, "Run or load FocusMap before running EdgeTrace.")
+            return
+        try:
+            self._validate_edge_trace_plan_for_motion(plan)
+        except ValueError as exc:
+            self._edge_trace_reject_action(action, f"EdgeTrace plan is not executable: {exc}")
+            return
+        if not self.serial_client:
+            self.connect_serial()
+        if not self.serial_client:
+            self._edge_trace_reject_action(action, "Serial is not connected; EdgeTrace skipped.")
+            return
+
+        self.edge_trace_restore_realtime = self.realtime_enabled
+        if self.realtime_enabled:
+            self.disable_realtime_position()
+        self.edge_trace_restore_home_signal = self.home_signal_enabled
+        if self.home_signal_enabled:
+            self.disable_home_signal_polling()
+        self.edge_trace_running = True
+        self.motion_busy = True
+        self.edge_trace_stop_event.clear()
+        if self.edge_trace_panel is not None:
+            self.edge_trace_panel.set_running(True)
+            self.edge_trace_panel.set_status(f"EdgeTrace {self._edge_trace_action_label(action)} started for path {polyline_offset + 1}/{len(plan.polylines)}.")
+        self.status_var.set(f"EdgeTrace {self._edge_trace_action_label(action)} running.")
+        self.edge_trace_thread = threading.Thread(target=self._edge_trace_action_worker, args=(plan, action, polyline_offset), daemon=True)
+        self.edge_trace_thread.start()
+
+    def stop_edge_trace(self) -> None:
+        self.edge_trace_stop_event.set()
+        if self.edge_trace_panel is not None:
+            self.edge_trace_panel.set_status("Stopping EdgeTrace.")
+
+    def _edge_trace_reject_action(self, action: str, message: str) -> None:
+        if self.edge_trace_panel is not None:
+            self.edge_trace_panel.set_action_failed(action)
+            self.edge_trace_panel.set_status(message)
+        self.status_var.set(message)
+
+    @staticmethod
+    def _edge_trace_action_label(action: str) -> str:
+        labels = {
+            EDGE_TRACE_ACTION_SAFE: "Move Safe Z",
+            EDGE_TRACE_ACTION_START: "Move Start",
+            EDGE_TRACE_ACTION_CONTACT: "Contact",
+            EDGE_TRACE_ACTION_SEGMENT: "Run Segment",
+            EDGE_TRACE_ACTION_AUTO: "Auto Run",
+        }
+        return labels.get(action, action)
+
+    def _edge_trace_motion_blocker(self) -> str | None:
+        if self.edge_trace_running or self.motion_busy or self.keyboard_motion_busy:
+            return "Motion is busy; EdgeTrace skipped."
+        if self.autofocus_running:
+            return "AutoFocus is running; EdgeTrace skipped."
+        if self.af_plane_running:
+            return "FocusMap is running; EdgeTrace skipped."
+        if self.imgstitch_running:
+            return "ImgStitch is running; EdgeTrace skipped."
+        if self.imgmatrix_running:
+            return "ImgMatrix is running; EdgeTrace skipped."
+        if self.autotest_running:
+            return "AutoTest is running; EdgeTrace skipped."
+        if self.position_read_pending:
+            return "Position read is pending; EdgeTrace skipped."
+        return None
+
+    @staticmethod
+    def _validate_edge_trace_plan_for_motion(plan: EdgeTracePlan) -> None:
+        for polyline in plan.polylines:
+            for point in polyline.points:
+                if point.stage_x_um is None or point.stage_y_um is None:
+                    raise ValueError("missing mapped XY coordinates")
+                if point.scratch_z_um is None or point.travel_z_um is None:
+                    raise ValueError("missing FocusMap Z values")
+
+    def _edge_trace_action_worker(self, plan: EdgeTracePlan, action: str, polyline_offset: int) -> None:
+        assert self.serial_client is not None
+        total = len(plan.polylines)
+        polyline_offset = max(0, min(int(polyline_offset), total - 1))
+        done_offset = polyline_offset
+        try:
+            entries = self.serial_client.read_stable_xyz_positions()
+            polyline = plan.polylines[polyline_offset]
+            polyline_number = polyline_offset + 1
+
+            if action == EDGE_TRACE_ACTION_SAFE:
+                self.result_queue.put(("edge_trace_progress", polyline_number, total, f"Move safe Z for path {polyline_number}", polyline.index, polyline_offset, None))
+                entries = self._edge_trace_lower_current_to_safe_z(entries, plan)
+            elif action == EDGE_TRACE_ACTION_START:
+                self.result_queue.put(("edge_trace_progress", polyline_number, total, f"Move to start path {polyline_number}", polyline.index, polyline_offset, polyline.start.gds))
+                entries = self._edge_trace_move_to_point(
+                    entries,
+                    polyline.start,
+                    "travel",
+                    MOTOR_SPEED_PROFILE_FAST,
+                    move_label=f"Move to start path {polyline_number}",
+                )
+            elif action == EDGE_TRACE_ACTION_CONTACT:
+                self.result_queue.put(("edge_trace_progress", polyline_number, total, f"Raise to contact path {polyline_number}", polyline.index, polyline_offset, polyline.start.gds))
+                entries = self._edge_trace_contact_point(entries, polyline.start, f"Contact path {polyline_number}")
+            elif action == EDGE_TRACE_ACTION_SEGMENT:
+                entries = self._edge_trace_run_scratch_segment(entries, polyline, polyline_offset, total)
+            elif action == EDGE_TRACE_ACTION_AUTO:
+                entries = self._edge_trace_run_scratch_segment(entries, polyline, polyline_offset, total)
+                done_offset = polyline_offset
+                for next_offset in range(polyline_offset + 1, total):
+                    if self.edge_trace_stop_event.is_set():
+                        break
+                    entries = self._edge_trace_lower_current_to_safe_z(entries, plan)
+                    next_polyline = plan.polylines[next_offset]
+                    next_number = next_offset + 1
+                    self.result_queue.put(("edge_trace_progress", next_number, total, f"Move to start path {next_number}", next_polyline.index, next_offset, next_polyline.start.gds))
+                    entries = self._edge_trace_move_to_point(
+                        entries,
+                        next_polyline.start,
+                        "travel",
+                        MOTOR_SPEED_PROFILE_FAST,
+                        move_label=f"Move to start path {next_number}",
+                    )
+                    if self.edge_trace_stop_event.is_set():
+                        break
+                    self.result_queue.put(("edge_trace_progress", next_number, total, f"Raise to contact path {next_number}", next_polyline.index, next_offset, next_polyline.start.gds))
+                    entries = self._edge_trace_contact_point(entries, next_polyline.start, f"Contact path {next_number}")
+                    if self.edge_trace_stop_event.is_set():
+                        break
+                    entries = self._edge_trace_run_scratch_segment(entries, next_polyline, next_offset, total)
+                    done_offset = next_offset
+                if not self.edge_trace_stop_event.is_set():
+                    entries = self._edge_trace_lower_current_to_safe_z(entries, plan)
+            else:
+                raise RuntimeError(f"Unknown EdgeTrace action: {action}.")
+
+            final_entries = self.serial_client.read_stable_xyz_positions()
+            self.result_queue.put(("read_positions", final_entries, "edge_trace"))
+            if self.edge_trace_stop_event.is_set():
+                self.result_queue.put(("edge_trace_status", "EdgeTrace stopped."))
+            else:
+                self.result_queue.put(("edge_trace_action_done", action, done_offset))
+        except Exception as exc:
+            self.result_queue.put(("edge_trace_error", action, exc))
+        finally:
+            self.result_queue.put(("edge_trace_finished",))
+
+    def _edge_trace_worker(self, plan: EdgeTracePlan, _mode: str | None = None) -> None:
+        self._edge_trace_action_worker(plan, EDGE_TRACE_ACTION_AUTO, 0)
+
+    def _edge_trace_run_scratch_segment(self, entries: list[tuple[bytes, bytes, AxisPosition]], polyline, polyline_offset: int, total: int):
+        polyline_number = polyline_offset + 1
+        self.result_queue.put(("edge_trace_progress", polyline_number, total, f"Scratch path {polyline_number}: point 1/{len(polyline.points)}", polyline.index, polyline_offset, polyline.start.gds))
+        for point_index, point in enumerate(polyline.points[1:], start=2):
+            if self.edge_trace_stop_event.is_set():
+                break
+            entries = self._edge_trace_move_to_point(
+                entries,
+                point,
+                "scratch",
+                MOTOR_SPEED_PROFILE_FINE,
+                move_label=f"Scratch path {polyline_number} point {point_index}/{len(polyline.points)}",
+            )
+            self.result_queue.put(("edge_trace_progress", polyline_number, total, f"Scratch path {polyline_number}: point {point_index}/{len(polyline.points)}", polyline.index, polyline_offset, point.gds))
+        if not self.edge_trace_stop_event.is_set():
+            self.result_queue.put(("edge_trace_progress", polyline_number, total, f"Finished path {polyline_number}", polyline.index, polyline_offset + 1, polyline.end.gds))
+        return entries
+
+    def _edge_trace_contact_point(self, entries: list[tuple[bytes, bytes, AxisPosition]], point: EdgeTracePathPoint, move_label: str):
+        if point.scratch_z_um is None:
+            raise RuntimeError("EdgeTrace point is missing contact Z coordinate.")
+        current_z = self._axis_from_position_entries(entries, Axis.Z)
+        target_z = int(round(point.scratch_z_um / self.probe_config.um_per_pulse("Z")))
+        return self._edge_trace_raise_z_split(current_z, target_z, move_label=move_label)
+
+    def _edge_trace_raise_z_split(self, current_z: int, target_z: int, *, move_label: str):
+        assert self.serial_client is not None
+        delta = int(target_z) - int(current_z)
+        total_pulses = abs(delta)
+        if total_pulses <= 0:
+            return self._edge_trace_wait_for_target_positions(
+                {"Z": int(target_z)},
+                ("Z",),
+                timeout_seconds=0.25,
+                move_label=move_label,
+            )
+
+        fast_pulses = int(round(total_pulses * 0.8))
+        slow_pulses = total_pulses - fast_pulses
+        reverse = delta < 0
+        current_target = int(current_z)
+        entries: list[tuple[bytes, bytes, AxisPosition]] = []
+        for pulses, profile in (
+            (fast_pulses, MOTOR_SPEED_PROFILE_FAST),
+            (slow_pulses, MOTOR_SPEED_PROFILE_SAFE),
+        ):
+            if pulses <= 0 or self.edge_trace_stop_event.is_set():
+                continue
+            speed_percent = self._motion_speed_percent(profile)
+            command = self.serial_client.move_relative(axis=Axis.Z, reverse=reverse, pulses=pulses, speed_percent=speed_percent)
+            self.result_queue.put(("motor_command", "Z", f"edge_trace {move_label} {profile}", command, "edge_trace"))
+            reached = self.serial_client.wait_axis_reached(Axis.Z, timeout=self._axis_move_timeout(pulses, speed_percent))
+            self.result_queue.put(("axis_done", "Z", reached, "edge_trace"))
+            current_target += -pulses if reverse else pulses
+            entries = self._edge_trace_wait_for_target_positions(
+                {"Z": current_target},
+                ("Z",),
+                timeout_seconds=self._axis_move_timeout(pulses, speed_percent),
+                move_label=f"{move_label} {profile}",
+            )
+        return entries or self.serial_client.read_stable_xyz_positions()
+
+    def _edge_trace_lower_current_to_safe_z(self, entries: list[tuple[bytes, bytes, AxisPosition]], plan: EdgeTracePlan):
+        current_x = self._axis_from_position_entries(entries, Axis.X)
+        current_y = self._axis_from_position_entries(entries, Axis.Y)
+        x_um = current_x * self.probe_config.um_per_pulse("X")
+        y_um = current_y * self.probe_config.um_per_pulse("Y")
+        surface_z = self._gds_mapper_focus_z_um(x_um, y_um)
+        if surface_z is None:
+            return entries
+        target_z = surface_z - plan.lift_height_um
+        return self._edge_trace_move_to_stage_um(
+            entries,
+            x_um,
+            y_um,
+            target_z,
+            MOTOR_SPEED_PROFILE_SAFE,
+            move_label="Move current Z to safe distance",
+        )
+
+    def _edge_trace_move_to_point(
+        self,
+        entries: list[tuple[bytes, bytes, AxisPosition]],
+        point: EdgeTracePathPoint,
+        z_kind: str,
+        speed_profile: str,
+        *,
+        move_label: str | None = None,
+    ):
+        if point.stage_x_um is None or point.stage_y_um is None:
+            raise RuntimeError("EdgeTrace point is missing mapped XY coordinates.")
+        target_z = point.travel_z_um if z_kind == "travel" else point.scratch_z_um
+        if target_z is None:
+            raise RuntimeError("EdgeTrace point is missing mapped Z coordinate.")
+        return self._edge_trace_move_to_stage_um(entries, point.stage_x_um, point.stage_y_um, target_z, speed_profile, move_label=move_label)
+
+    def _edge_trace_move_to_stage_um(
+        self,
+        entries: list[tuple[bytes, bytes, AxisPosition]],
+        target_x_um: float,
+        target_y_um: float,
+        target_z_um: float,
+        speed_profile: str,
+        *,
+        move_label: str | None = None,
+    ):
+        assert self.serial_client is not None
+        current_pulses = {
+            "X": self._axis_from_position_entries(entries, Axis.X),
+            "Y": self._axis_from_position_entries(entries, Axis.Y),
+            "Z": self._axis_from_position_entries(entries, Axis.Z),
+        }
+        plan = stage_xyz_move_plan_from_um(
+            current_pulses,
+            {"X": target_x_um, "Y": target_y_um, "Z": target_z_um},
+            {
+                "X": self.probe_config.um_per_pulse("X"),
+                "Y": self.probe_config.um_per_pulse("Y"),
+                "Z": self.probe_config.um_per_pulse("Z"),
+            },
+        )
+        if not plan.has_motion:
+            if move_label is not None:
+                self.result_queue.put(("edge_trace_status", f"{move_label} skipped: already at target."))
+            return self._edge_trace_wait_for_target_positions(
+                plan.target_pulses,
+                tuple(plan.target_pulses),
+                timeout_seconds=0.25,
+                move_label=move_label or "EdgeTrace move",
+            )
+        if move_label is not None:
+            deltas = ", ".join(f"d{axis}={delta}" for axis, delta in plan.deltas.items() if delta)
+            targets = ", ".join(f"{axis}={plan.target_pulses[axis]}" for axis in sorted(plan.target_pulses))
+            self.result_queue.put(("edge_trace_status", f"{move_label}: {deltas} pulse(s), target {targets}."))
+        axis_params = {}
+        for axis_name, delta in plan.deltas.items():
+            if delta == 0:
+                continue
+            controller_axis = self._controller_axis(axis_name)
+            if controller_axis is not None:
+                axis_params[controller_axis] = self._cc_axis_param(delta < 0, abs(delta), speed_profile)
+        if not axis_params:
+            return entries
+        timeout = self._cc_move_timeout(axis_params)
+        command, completed = self.serial_client.move_multi_axis_relative_and_wait(axis_params, timeout=timeout)
+        self.result_queue.put(("motor_command", "".join(sorted(plan.deltas)), f"edge_trace {speed_profile}", command, "edge_trace"))
+        self.result_queue.put(("cc_done", completed, "edge_trace"))
+        verified_entries = self._edge_trace_wait_for_target_positions(
+            plan.target_pulses,
+            tuple(plan.target_pulses),
+            timeout_seconds=timeout,
+            move_label=move_label or "EdgeTrace move",
+        )
+        if move_label is not None:
+            self.result_queue.put(("edge_trace_status", f"{move_label} verified at target."))
+        return verified_entries
+
+    def _edge_trace_wait_for_target_positions(
+        self,
+        target_pulses: dict[str, int],
+        axes: tuple[str, ...],
+        *,
+        timeout_seconds: float,
+        move_label: str,
+        tolerance_pulses: int = 1,
+    ) -> list[tuple[bytes, bytes, AxisPosition]]:
+        assert self.serial_client is not None
+        deadline = time.monotonic() + max(0.25, float(timeout_seconds))
+        last_entries: list[tuple[bytes, bytes, AxisPosition]] = []
+        last_positions: dict[str, int] = {}
+        last_running: set[str] = set()
+        while time.monotonic() <= deadline:
+            if self.edge_trace_stop_event.is_set():
+                return last_entries or self.serial_client.read_xyz_positions()
+            last_entries = self.serial_client.read_xyz_positions()
+            last_positions = {position.axis_name: position.position for _command, _response, position in last_entries}
+            last_running = {position.axis_name for _command, _response, position in last_entries if position.axis_name in axes and position.is_running}
+            if not last_running and all(abs(last_positions.get(axis, 10**18) - int(target_pulses[axis])) <= tolerance_pulses for axis in axes):
+                return last_entries
+            time.sleep(0.05)
+        details = ", ".join(
+            f"{axis} target {int(target_pulses[axis])} read {last_positions.get(axis, '-')}"
+            for axis in axes
+        )
+        if last_running:
+            details = f"{details}; running axes: {', '.join(sorted(last_running))}"
+        raise RuntimeError(f"{move_label} did not reach target before continuing: {details}")
+
     def start_autotest(self, settings: AutoTestSettings) -> None:
         if self.autotest_running or self.motion_busy:
             if self.autotest_panel is not None:
@@ -7871,6 +8307,9 @@ class ProbeApp(tk.Tk):
             elif source == "imgmatrix":
                 if self.imgmatrix_panel is not None:
                     self.imgmatrix_panel.set_status("ImgMatrix stage moved.")
+            elif source == "edge_trace":
+                if self.edge_trace_panel is not None:
+                    self.edge_trace_panel.set_status("EdgeTrace stage position updated.")
             elif source == "gds_mapper":
                 self._set_gds_mapper_status("LayoutBond move completed.")
                 self._set_agent_status("LayoutBond move completed.")
@@ -8358,6 +8797,72 @@ class ProbeApp(tk.Tk):
                 self.toggle_home_signal_polling()
             return
 
+        if event_type == "edge_trace_status":
+            _, message = event
+            if self.edge_trace_panel is not None:
+                self.edge_trace_panel.set_status(str(message))
+            self.status_var.set(str(message))
+            logger.info("EdgeTrace: %s", message)
+            return
+
+        if event_type == "edge_trace_progress":
+            _, current, total, message, polyline_index, completed_count, needle_gds = event
+            if self.edge_trace_panel is not None:
+                self.edge_trace_panel.set_progress(
+                    int(current),
+                    int(total),
+                    str(message),
+                    polyline_index=int(polyline_index) if polyline_index is not None else None,
+                    completed_polyline_count=int(completed_count),
+                    needle_gds=needle_gds,
+                )
+            self.status_var.set(str(message))
+            logger.info("EdgeTrace: %s (%s/%s)", message, current, total)
+            return
+
+        if event_type == "edge_trace_action_done":
+            _, action, polyline_offset = event
+            if self.edge_trace_panel is not None:
+                self.edge_trace_panel.set_action_done(str(action), int(polyline_offset))
+            label = self._edge_trace_action_label(str(action))
+            message = f"EdgeTrace {label} completed."
+            if action == EDGE_TRACE_ACTION_SEGMENT:
+                message = f"EdgeTrace segment {int(polyline_offset) + 1} completed; run the safe/start/contact steps before the next path."
+            elif action == EDGE_TRACE_ACTION_AUTO:
+                message = "EdgeTrace auto run completed."
+            if self.edge_trace_panel is not None:
+                self.edge_trace_panel.set_status(message)
+            self.status_var.set(message)
+            logger.info(message)
+            return
+
+        if event_type == "edge_trace_error":
+            if len(event) == 3:
+                _, action, exc = event
+                if self.edge_trace_panel is not None:
+                    self.edge_trace_panel.set_action_failed(str(action))
+            else:
+                _, exc = event
+            message = f"EdgeTrace failed: {exc}"
+            if self.edge_trace_panel is not None:
+                self.edge_trace_panel.set_status(message)
+            self.status_var.set(message)
+            logger.error("EdgeTrace failed: %s", exc)
+            return
+
+        if event_type == "edge_trace_finished":
+            self.edge_trace_running = False
+            self.motion_busy = False
+            if self.edge_trace_panel is not None:
+                self.edge_trace_panel.set_running(False)
+            if self.edge_trace_restore_realtime and not self.realtime_enabled and self.serial_client:
+                self.edge_trace_restore_realtime = False
+                self.toggle_realtime_position()
+            if self.edge_trace_restore_home_signal and not self.home_signal_enabled and self.serial_client:
+                self.edge_trace_restore_home_signal = False
+                self.toggle_home_signal_polling()
+            return
+
         if event_type == "autotest_status":
             _, message = event
             if self.autotest_panel is not None:
@@ -8452,7 +8957,8 @@ class ProbeApp(tk.Tk):
             _, response, source = event
             response_hex = hex_bytes(response)
             self.rx_var.set(response_hex)
-            self._append_hex_history("RX", response_hex)
+            if self._record_hex_history_for_source(source):
+                self._append_hex_history("RX", response_hex)
             self.status_var.set("CC multi-axis move completed.")
             logger.info("CC completed feedback from %s: %s", source, colorize_hex_frame(response_hex, "RX"))
             return

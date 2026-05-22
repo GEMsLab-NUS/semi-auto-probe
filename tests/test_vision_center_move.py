@@ -74,7 +74,7 @@ class VisionCenterMoveTests(unittest.TestCase):
             image_height=450,
         )
 
-        self.assertEqual(plan["axis_params"], {1: (False, 15, 100, 10), 2: (True, 10, 100, 10)})
+        self.assertEqual(plan["axis_params"], {1: (False, 15, 100, 30), 2: (True, 10, 100, 30)})
         self.assertEqual(plan["signed_pulses"], {"X": 15, "Y": -10})
         self.assertEqual(plan["target_positions"], {"X": 115, "Y": 190})
         self.assertEqual(preview, plan["preview_text"])

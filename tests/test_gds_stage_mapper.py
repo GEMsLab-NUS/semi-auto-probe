@@ -595,8 +595,8 @@ class GDSMapperMotionBridgeTests(unittest.TestCase):
         self.assertEqual(
             app.serial_client.axis_params,
             {
-                Axis.X: (False, 2, 100, 10),
-                Axis.Y: (True, 2, 100, 10),
+                Axis.X: (False, 2, 100, 30),
+                Axis.Y: (True, 2, 100, 30),
             },
         )
         events = []
@@ -623,9 +623,9 @@ class GDSMapperMotionBridgeTests(unittest.TestCase):
         self.assertEqual(
             app.serial_client.axis_params,
             {
-                Axis.X: (False, 2, 100, 10),
-                Axis.Z: (False, 8, 100, 10),
-                Axis.Y: (True, 2, 100, 10),
+                Axis.X: (False, 2, 100, 30),
+                Axis.Z: (False, 8, 100, 30),
+                Axis.Y: (True, 2, 100, 30),
             },
         )
 

@@ -445,6 +445,8 @@ class ControllerSerialClient:
             last_seen = bytes(buffer[-FRAME_LENGTH:])
 
             if chunk == b"\xA5" and not buffer.startswith(bytes((RESPONSE_HEAD,))):
+                if expected_axes:
+                    continue
                 return chunk
 
             head_index = buffer.find(bytes((RESPONSE_HEAD,)))

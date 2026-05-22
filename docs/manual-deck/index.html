@@ -1,0 +1,2671 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Semi Auto Probe Interactive Manual Deck</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #070b10;
+        --ink: #f7fbff;
+        --muted: #9fb0c7;
+        --faint: #5f7088;
+        --panel: rgba(15, 23, 34, 0.76);
+        --panel-strong: rgba(20, 31, 47, 0.92);
+        --line: rgba(169, 199, 237, 0.18);
+        --blue: #49a7ff;
+        --cyan: #27e0d1;
+        --green: #39d77b;
+        --yellow: #f6c65b;
+        --red: #ff5c77;
+        --violet: #9f7cff;
+        --slide-w: 1280;
+        --slide-h: 720;
+        --scale: 1;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        overflow: hidden;
+        background:
+          linear-gradient(rgba(255,255,255,0.024) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(255,255,255,0.024) 1px, transparent 1px),
+          radial-gradient(circle at 18% 20%, rgba(73, 167, 255, 0.16), transparent 32%),
+          radial-gradient(circle at 76% 70%, rgba(39, 224, 209, 0.1), transparent 31%),
+          var(--bg);
+        background-size: 42px 42px, 42px 42px, auto, auto, auto;
+        color: var(--ink);
+        font-family: "Bahnschrift", "DIN Alternate", "Segoe UI", sans-serif;
+      }
+
+      button,
+      input,
+      select {
+        font: inherit;
+      }
+
+      .stage {
+        width: 1280px;
+        height: 720px;
+        transform: translate(-50%, -50%) scale(var(--scale));
+        transform-origin: center;
+        position: fixed;
+        left: 50%;
+        top: 50%;
+        border: 1px solid rgba(255,255,255,0.12);
+        background:
+          linear-gradient(135deg, rgba(255,255,255,0.04), transparent 34%),
+          linear-gradient(180deg, rgba(6, 10, 15, 0.62), rgba(6, 10, 15, 0.94));
+        overflow: hidden;
+      }
+
+      .deck-shell {
+        width: 100%;
+        height: 100%;
+        display: grid;
+        grid-template-columns: 246px 1fr;
+      }
+
+      .rail {
+        padding: 28px 18px;
+        border-right: 1px solid var(--line);
+        background: rgba(5, 10, 16, 0.74);
+      }
+
+      .brand {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        margin-bottom: 20px;
+      }
+
+      .brand img {
+        width: 42px;
+        height: 42px;
+        object-fit: contain;
+      }
+
+      .brand strong {
+        display: block;
+        font-size: 18px;
+        letter-spacing: 0.02em;
+      }
+
+      .brand span {
+        color: var(--muted);
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.16em;
+      }
+
+      .nav {
+        display: grid;
+        gap: 4px;
+      }
+
+      .nav button {
+        width: 100%;
+        border: 1px solid transparent;
+        color: var(--muted);
+        background: transparent;
+        padding: 8px 10px;
+        text-align: left;
+        border-radius: 8px;
+        cursor: pointer;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        font-size: 14px;
+      }
+
+      .nav button:hover {
+        color: var(--ink);
+        border-color: var(--line);
+        background: rgba(255,255,255,0.04);
+      }
+
+      .nav button.active {
+        color: var(--ink);
+        border-color: rgba(73,167,255,0.45);
+        background: linear-gradient(90deg, rgba(73,167,255,0.2), rgba(73,167,255,0.03));
+      }
+
+      .nav small {
+        color: var(--faint);
+        font-size: 11px;
+      }
+
+      .rail-footer {
+        display: none;
+      }
+
+      .main {
+        position: relative;
+        overflow: hidden;
+      }
+
+      .slide {
+        position: absolute;
+        inset: 0;
+        padding: 66px 56px 44px;
+        opacity: 0;
+        transform: translateX(28px);
+        pointer-events: none;
+        transition: opacity 360ms ease, transform 420ms ease;
+      }
+
+      .slide.active {
+        opacity: 1;
+        transform: translateX(0);
+        pointer-events: auto;
+      }
+
+      .kicker {
+        color: var(--cyan);
+        font-size: 13px;
+        letter-spacing: 0.2em;
+        text-transform: uppercase;
+        margin-bottom: 14px;
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin: 0;
+      }
+
+      h1 {
+        font-size: 74px;
+        line-height: 0.95;
+        letter-spacing: -0.02em;
+        max-width: 790px;
+      }
+
+      h2 {
+        font-size: 46px;
+        line-height: 1;
+        letter-spacing: -0.012em;
+      }
+
+      h3 {
+        font-size: 22px;
+        line-height: 1.18;
+      }
+
+      p {
+        color: var(--muted);
+        font-size: 18px;
+        line-height: 1.58;
+      }
+
+      .lead {
+        max-width: 720px;
+        font-size: 22px;
+        color: #d7e4f4;
+      }
+
+      .split {
+        display: grid;
+        grid-template-columns: 420px 1fr;
+        gap: 34px;
+        height: auto;
+        align-items: start;
+      }
+
+      .slide:not([data-id="cover"]) .split {
+        margin-top: 50px;
+      }
+
+      .slide[data-id="cover"] .split {
+        align-items: center;
+      }
+
+      .split.wide-left {
+        grid-template-columns: 1fr 486px;
+      }
+
+      .slide:not([data-id="cover"]) {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+      }
+
+      .slide-copy {
+        display: grid;
+        gap: 18px;
+        align-content: start;
+      }
+
+      .demo-panel {
+        min-height: 410px;
+        display: grid;
+        align-content: center;
+        gap: 18px;
+      }
+
+      .split > .panel,
+      .split > div > .panel,
+      .split > .slide-copy,
+      .control-stack.demo-panel {
+        min-height: 410px;
+      }
+
+      .slide-copy > .panel {
+        min-height: 0;
+      }
+
+      .split > .slide-copy > .panel {
+        min-height: 0;
+      }
+
+      .slide-copy {
+        min-height: 410px;
+      }
+
+      .panel {
+        border: 1px solid var(--line);
+        background: var(--panel);
+        border-radius: 8px;
+        padding: 22px;
+        position: relative;
+        overflow: hidden;
+      }
+
+      .panel.tight {
+        padding: 18px;
+      }
+
+      .panel::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(110deg, rgba(255,255,255,0.07), transparent 38%);
+        pointer-events: none;
+      }
+
+      .video-launch {
+        display: inline-grid;
+        grid-template-columns: 1fr;
+        gap: 0;
+        align-items: center;
+        justify-items: center;
+        width: 56px;
+        height: 56px;
+        max-width: 56px;
+        border: 1px solid rgba(73,167,255,0.34);
+        border-radius: 8px;
+        background: linear-gradient(90deg, rgba(73,167,255,0.14), rgba(255,255,255,0.035));
+        color: var(--ink);
+        padding: 0;
+        cursor: pointer;
+        text-align: left;
+        position: relative;
+      }
+
+      .video-launch::before {
+        content: "";
+        width: 34px;
+        height: 34px;
+        border-radius: 50%;
+        border: 1px solid rgba(39,224,209,0.58);
+        background: rgba(39,224,209,0.1);
+        box-shadow: 0 0 22px rgba(39,224,209,0.18);
+      }
+
+      .video-launch::after {
+        content: "";
+        position: absolute;
+        left: 25px;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 0;
+        height: 0;
+        border-top: 7px solid transparent;
+        border-bottom: 7px solid transparent;
+        border-left: 11px solid var(--cyan);
+      }
+
+      .video-launch strong {
+        display: none;
+        font-size: 14px;
+      }
+
+      .video-launch span {
+        display: none;
+        margin-top: 3px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      video {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        background: #02050a;
+      }
+
+      .video-overlay {
+        position: absolute;
+        inset: 0;
+        z-index: 20;
+        display: none;
+        padding: 44px 56px 50px;
+        background:
+          radial-gradient(circle at 70% 35%, rgba(73,167,255,0.16), transparent 34%),
+          linear-gradient(180deg, rgba(6, 10, 15, 0.985), rgba(6, 10, 15, 0.995));
+        background-color: #060a0f;
+      }
+
+      .video-overlay.open {
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+        gap: 18px;
+      }
+
+      .video-overlay-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+      }
+
+      .video-overlay-title {
+        min-width: 0;
+      }
+
+      .video-overlay-title strong {
+        display: block;
+        font-size: 28px;
+        line-height: 1.1;
+      }
+
+      .video-overlay-title span {
+        display: block;
+        color: var(--muted);
+        font-size: 13px;
+        margin-top: 6px;
+      }
+
+      .video-close {
+        border: 1px solid rgba(255,255,255,0.18);
+        background: rgba(255,255,255,0.05);
+        color: var(--ink);
+        border-radius: 8px;
+        padding: 10px 14px;
+        cursor: pointer;
+      }
+
+      .video-stage {
+        min-height: 0;
+        border: 1px solid rgba(255,255,255,0.14);
+        border-radius: 8px;
+        overflow: hidden;
+        background: #02050a;
+        position: relative;
+      }
+
+      .video-status {
+        position: absolute;
+        inset: 0;
+        display: none;
+        place-items: center;
+        text-align: center;
+        color: var(--muted);
+        background:
+          linear-gradient(rgba(255,255,255,0.04) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px),
+          #060b12;
+        background-size: 32px 32px;
+      }
+
+      .video-status.show {
+        display: grid;
+      }
+
+      .video-controls {
+        display: grid;
+        grid-template-columns: auto auto auto 1fr auto auto;
+        gap: 10px;
+        align-items: center;
+        padding: 10px 12px;
+        border: 1px solid rgba(255,255,255,0.16);
+        border-radius: 8px;
+        background: rgba(3, 8, 14, 0.72);
+        backdrop-filter: blur(12px);
+        opacity: 0;
+        transform: translateY(8px);
+        transition: opacity 180ms ease, transform 180ms ease;
+      }
+
+      .video-controls { opacity: 1; transform: none; pointer-events: auto; }
+
+      .video-controls button {
+        border: 1px solid rgba(73,167,255,0.34);
+        color: var(--ink);
+        background: rgba(73,167,255,0.12);
+        border-radius: 7px;
+        min-width: 36px;
+        height: 32px;
+        cursor: pointer;
+      }
+
+      .video-controls .time {
+        color: var(--muted);
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .video-controls input[type="range"] {
+        width: 100%;
+        accent-color: var(--cyan);
+        cursor: pointer;
+      }
+
+      .video-overlay:fullscreen {
+        width: 100vw;
+        height: 100vh;
+        background: #02050a;
+      }
+
+      .video-overlay:fullscreen video {
+        object-fit: contain;
+      }
+
+      .chip-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 20px;
+      }
+
+      .chip,
+      .state-chip {
+        border: 1px solid var(--line);
+        background: rgba(255,255,255,0.04);
+        color: #dbeafe;
+        padding: 8px 12px;
+        border-radius: 7px;
+        font-size: 13px;
+      }
+
+      .state-chip {
+        min-height: 42px;
+        cursor: pointer;
+      }
+
+      .state-chip.active,
+      .mode-tab.active,
+      .measurement-step.active,
+      .plan-card.active {
+        border-color: rgba(39,224,209,0.62);
+        background: rgba(39,224,209,0.11);
+        color: var(--ink);
+      }
+
+      .hero-visual {
+        height: 455px;
+        position: relative;
+      }
+
+      .machine {
+        position: absolute;
+        left: 56px;
+        top: 76px;
+        width: 560px;
+        height: 330px;
+      }
+
+      .axis {
+        position: absolute;
+        background: linear-gradient(90deg, transparent, var(--blue), transparent);
+        animation: pulseLine 2s infinite ease-in-out;
+      }
+
+      .axis.x { left: 74px; top: 126px; width: 360px; height: 2px; }
+      .axis.y { left: 252px; top: 32px; width: 2px; height: 212px; background: linear-gradient(180deg, transparent, var(--cyan), transparent); animation-delay: 0.35s; }
+      .axis.z { left: 442px; top: 14px; width: 2px; height: 172px; background: linear-gradient(180deg, transparent, var(--yellow), transparent); animation-delay: 0.7s; }
+
+      .base-plate,
+      .stage-plate,
+      .camera-head {
+        position: absolute;
+        border: 1px solid rgba(255,255,255,0.2);
+        background: rgba(255,255,255,0.05);
+      }
+
+      .base-plate {
+        left: 52px;
+        bottom: 54px;
+        width: 470px;
+        height: 82px;
+        transform: skewX(-12deg);
+        background:
+          linear-gradient(rgba(73,167,255,0.08) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(73,167,255,0.08) 1px, transparent 1px),
+          rgba(255,255,255,0.035);
+        background-size: 26px 26px;
+      }
+
+      .stage-plate {
+        left: 170px;
+        bottom: 158px;
+        width: 230px;
+        height: 80px;
+        transform: skewX(-12deg);
+        animation: stageDrift 4s ease-in-out infinite;
+      }
+
+      .camera-head {
+        left: 430px;
+        top: 8px;
+        width: 74px;
+        height: 150px;
+      }
+
+      .lens {
+        position: absolute;
+        left: 451px;
+        top: 156px;
+        width: 30px;
+        height: 112px;
+        border: 1px solid rgba(246,198,91,0.5);
+        background: rgba(246,198,91,0.08);
+      }
+
+      .fov {
+        position: absolute;
+        left: 186px;
+        top: 246px;
+        width: 152px;
+        height: 88px;
+        border: 2px solid rgba(57,215,123,0.82);
+        box-shadow: 0 0 30px rgba(57,215,123,0.18);
+        animation: fovScan 3s ease-in-out infinite;
+      }
+
+      .layer-stack {
+        display: grid;
+        gap: 13px;
+      }
+
+      .layer {
+        border-left: 2px solid var(--blue);
+        padding: 14px 16px;
+        background: linear-gradient(90deg, rgba(73,167,255,0.13), rgba(255,255,255,0.02));
+        display: grid;
+        grid-template-columns: 170px 1fr;
+        gap: 18px;
+        align-items: center;
+      }
+
+      .layer strong {
+        font-size: 18px;
+      }
+
+      .layer span {
+        color: var(--muted);
+        font-size: 15px;
+      }
+
+      .camera-ui {
+        height: 400px;
+        border: 1px solid var(--line);
+        background:
+          linear-gradient(180deg, rgba(3,8,14,0.4), rgba(3,8,14,0.82)),
+          linear-gradient(rgba(255,255,255,0.045) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(255,255,255,0.045) 1px, transparent 1px),
+          #090f17;
+        background-size: auto, 32px 32px, 32px 32px, auto;
+        border-radius: 8px;
+        position: relative;
+        overflow: hidden;
+      }
+
+      .crosshair::before,
+      .crosshair::after {
+        content: "";
+        position: absolute;
+        background: rgba(39,224,209,0.8);
+      }
+
+      .crosshair::before { left: 50%; top: 0; width: 1px; height: 100%; }
+      .crosshair::after { top: 50%; left: 0; height: 1px; width: 100%; }
+
+      .sample-chip {
+        position: absolute;
+        left: 170px;
+        top: 150px;
+        width: 190px;
+        height: 108px;
+        border: 1px solid rgba(255,255,255,0.22);
+        background:
+          linear-gradient(rgba(39,224,209,0.16) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(39,224,209,0.16) 1px, transparent 1px),
+          rgba(73,167,255,0.07);
+        background-size: 24px 24px;
+        transform: rotate(-2deg);
+      }
+
+      .target-dot {
+        position: absolute;
+        left: 102px;
+        top: 260px;
+        width: 10px;
+        height: 10px;
+        background: var(--yellow);
+        border-radius: 50%;
+        box-shadow: 0 0 0 7px rgba(246,198,91,0.11);
+        animation: targetMove 4s ease-in-out infinite;
+      }
+
+      .measure-line {
+        position: absolute;
+        left: 300px;
+        top: 96px;
+        width: 180px;
+        height: 2px;
+        background: var(--green);
+        transform: rotate(25deg);
+      }
+
+      .measure-line::after {
+        content: "Point to point 128.4 um";
+        position: absolute;
+        left: 30px;
+        top: -30px;
+        font-size: 12px;
+        color: var(--green);
+        white-space: nowrap;
+      }
+
+      .control-stack {
+        display: grid;
+        gap: 12px;
+      }
+
+      .xyz-readout {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+      }
+
+      .axis-card {
+        border: 1px solid var(--line);
+        background: rgba(255,255,255,0.035);
+        border-radius: 8px;
+        padding: 12px;
+      }
+
+      .axis-card span {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .axis-card strong {
+        display: block;
+        margin-top: 8px;
+        font-size: 25px;
+        color: var(--ink);
+        font-variant-numeric: tabular-nums;
+      }
+
+      .input-demo {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+      }
+
+      .field {
+        border: 1px solid var(--line);
+        padding: 14px;
+        border-radius: 8px;
+        color: var(--ink);
+        cursor: pointer;
+      }
+
+      .field.relative {
+        border-color: rgba(246,198,91,0.45);
+        color: var(--yellow);
+        animation: glowYellow 2s infinite;
+      }
+
+      .field.absolute {
+        border-color: rgba(73,167,255,0.55);
+        color: var(--blue);
+        animation: glowBlue 2s infinite;
+      }
+
+      .jog-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+      }
+
+      .jog {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 12px;
+        background: rgba(255,255,255,0.035);
+      }
+
+      .jog strong {
+        display: block;
+        margin-bottom: 12px;
+      }
+
+      .jog div {
+        display: flex;
+        gap: 8px;
+      }
+
+      .jog button,
+      .deck-button {
+        border: 1px solid rgba(73,167,255,0.34);
+        color: var(--ink);
+        background: rgba(73,167,255,0.12);
+        border-radius: 7px;
+        padding: 9px 12px;
+        cursor: pointer;
+        min-width: 44px;
+        min-height: 38px;
+        transition: background 180ms ease, border-color 180ms ease, transform 180ms ease;
+      }
+
+      .jog button:active,
+      .deck-button:active,
+      .video-launch:active,
+      .state-chip:active {
+        transform: scale(0.97);
+      }
+
+      .demo-readout {
+        border: 1px solid var(--line);
+        background: rgba(255,255,255,0.035);
+        border-radius: 8px;
+        padding: 14px 16px;
+        color: var(--muted);
+        font-size: 14px;
+        min-height: 54px;
+      }
+
+      .demo-readout strong {
+        color: var(--ink);
+      }
+
+      .curve-wrap,
+      .plane-wrap,
+      .stitch-wrap,
+      .gds-wrap,
+      .ai-wrap,
+      .measurement-wrap {
+        min-height: 410px;
+        position: relative;
+      }
+
+      .curve-wrap {
+        height: 410px;
+      }
+
+      .plane-wrap,
+      .gds-wrap,
+      .stitch-wrap,
+      .measurement-wrap {
+        height: 410px;
+      }
+
+      .video-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 18px;
+        position: absolute;
+        right: 20px;
+        bottom: 20px;
+        z-index: 4;
+      }
+
+      .compact-stack {
+        gap: 8px;
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .compact-stack .layer {
+        padding: 10px 14px;
+        grid-template-columns: 1fr;
+        gap: 6px;
+      }
+
+      .compact-stack .layer strong {
+        font-size: 16px;
+      }
+
+      .compact-stack .layer span {
+        font-size: 13px;
+      }
+
+      svg {
+        display: block;
+      }
+
+      .focus-point {
+        animation: pointPop 3.2s ease infinite;
+      }
+
+      .scan-head {
+        animation: scanZ 3.5s ease-in-out infinite;
+      }
+
+      .coarse-window {
+        animation: coarseSweep 4.2s ease-in-out infinite;
+      }
+
+      .fine-point {
+        animation: finePop 4.2s ease-in-out infinite;
+      }
+
+      .fine-point:nth-of-type(1) { animation-delay: 1.4s; }
+      .fine-point:nth-of-type(2) { animation-delay: 1.55s; }
+      .fine-point:nth-of-type(3) { animation-delay: 1.7s; }
+      .fine-point:nth-of-type(4) { animation-delay: 1.85s; }
+      .fine-point:nth-of-type(5) { animation-delay: 2s; }
+
+      .plane {
+        position: absolute;
+        width: 360px;
+        height: 156px;
+        left: 58px;
+        top: 128px;
+        transform: perspective(620px) rotateX(58deg) rotateZ(-12deg);
+        background: linear-gradient(135deg, rgba(57,215,123,0.28), rgba(73,167,255,0.08));
+        border: 1px solid rgba(57,215,123,0.42);
+      }
+
+      .plane-grid {
+        position: absolute;
+        inset: 0;
+        background:
+          linear-gradient(rgba(255,255,255,0.12) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(255,255,255,0.12) 1px, transparent 1px);
+        background-size: 42px 42px;
+      }
+
+      .map-point {
+        position: absolute;
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        background: var(--yellow);
+        box-shadow: 0 0 0 10px rgba(246,198,91,0.13);
+        cursor: pointer;
+      }
+
+      .map-point.active {
+        background: var(--green);
+        box-shadow: 0 0 0 12px rgba(57,215,123,0.16);
+      }
+
+      .plane-wrap[data-step="AutoFocus each point"] .map-point {
+        background: var(--yellow);
+      }
+
+      .plane-wrap[data-step="Fit plane"] .plane {
+        border-color: rgba(57,215,123,0.82);
+        background: linear-gradient(135deg, rgba(57,215,123,0.34), rgba(39,224,209,0.14));
+      }
+
+      .plane-wrap[data-step="Residual model"] .map-point {
+        box-shadow: 0 0 0 9px rgba(246,198,91,0.12), 0 0 26px rgba(246,198,91,0.28);
+      }
+
+      .plane-wrap[data-step="Residual model"] .plane {
+        border-color: rgba(246,198,91,0.72);
+      }
+
+      .plane-wrap[data-step="Enable Auto Z"] .plane {
+        box-shadow: 0 0 34px rgba(57,215,123,0.22);
+      }
+
+      .plane-wrap[data-step="Enable Auto Z"]::after {
+        content: "Auto Z compensation enabled";
+        position: absolute;
+        right: 22px;
+        bottom: 20px;
+        color: var(--green);
+        font-size: 13px;
+        border: 1px solid rgba(57,215,123,0.35);
+        background: rgba(57,215,123,0.08);
+        padding: 9px 11px;
+        border-radius: 7px;
+      }
+
+      .gds-shape.active {
+        border-color: var(--yellow);
+        background: rgba(246,198,91,0.11);
+      }
+
+      .map-point.p1 { left: 112px; top: 196px; animation: pointPop 4s infinite; }
+      .map-point.p2 { left: 348px; top: 116px; animation: pointPop 4s 0.6s infinite; }
+      .map-point.p3 { left: 188px; top: 298px; animation: pointPop 4s 1.2s infinite; }
+      .map-point.p4 { left: 386px; top: 254px; animation: pointPop 4s 1.8s infinite; }
+
+      .slide[data-id="focus-map"] .chip-row {
+        flex-wrap: nowrap;
+        gap: 8px;
+      }
+
+      .slide[data-id="focus-map"] .state-chip {
+        padding: 8px 9px;
+        min-height: 40px;
+        font-size: 11px;
+        white-space: nowrap;
+      }
+
+      .tile-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 92px);
+        grid-template-rows: repeat(3, 72px);
+        gap: 7px;
+        margin: 42px auto 0;
+        width: max-content;
+      }
+
+      .tile {
+        border: 1px solid rgba(255,255,255,0.14);
+        background: rgba(73,167,255,0.08);
+        position: relative;
+        overflow: hidden;
+        animation: tileFill 4.8s infinite;
+        cursor: pointer;
+      }
+
+      .tile.active {
+        outline: 2px solid var(--cyan);
+        outline-offset: 2px;
+      }
+
+      .tile:nth-child(2) { animation-delay: .25s; }
+      .tile:nth-child(3) { animation-delay: .5s; }
+      .tile:nth-child(4) { animation-delay: .75s; }
+      .tile:nth-child(8) { animation-delay: 1s; }
+      .tile:nth-child(7) { animation-delay: 1.25s; }
+      .tile:nth-child(6) { animation-delay: 1.5s; }
+      .tile:nth-child(5) { animation-delay: 1.75s; }
+      .tile:nth-child(9) { animation-delay: 2s; }
+      .tile:nth-child(10) { animation-delay: 2.25s; }
+      .tile:nth-child(11) { animation-delay: 2.5s; }
+      .tile:nth-child(12) { animation-delay: 2.75s; }
+
+      .tile::after {
+        content: "";
+        position: absolute;
+        right: -1px;
+        top: 0;
+        width: 3px;
+        height: 100%;
+        background: var(--green);
+      }
+
+      .tile.warn::after { background: var(--yellow); }
+      .tile.bad::after { background: var(--red); }
+
+      .stitch-diagram {
+        display: none;
+      }
+
+      .stitch-wrap[data-mode="Time Stack"] .tile-grid,
+      .stitch-wrap[data-mode="Z Stack"] .tile-grid {
+        display: none;
+      }
+
+      .stitch-wrap[data-mode="Time Stack"] .time-stack-diagram,
+      .stitch-wrap[data-mode="Z Stack"] .z-stack-diagram {
+        display: block;
+      }
+
+      .time-stack-diagram,
+      .z-stack-diagram {
+        height: 300px;
+        position: relative;
+        margin-top: 28px;
+      }
+
+      .time-axis {
+        position: absolute;
+        left: 64px;
+        right: 62px;
+        bottom: 44px;
+        height: 2px;
+        background: linear-gradient(90deg, var(--cyan), rgba(39,224,209,0.12));
+      }
+
+      .time-axis::after {
+        content: "time";
+        position: absolute;
+        right: -6px;
+        top: 12px;
+        color: var(--cyan);
+        font-size: 13px;
+      }
+
+      .time-frame {
+        position: absolute;
+        width: 116px;
+        height: 76px;
+        transform: skewX(-16deg);
+        border: 1px solid rgba(73,167,255,0.48);
+        background:
+          linear-gradient(rgba(255,255,255,0.08) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(255,255,255,0.08) 1px, transparent 1px),
+          rgba(73,167,255,0.1);
+        background-size: 18px 18px;
+        box-shadow: 0 14px 30px rgba(0,0,0,0.22);
+        animation: frameStack 4.8s infinite ease-in-out;
+      }
+
+      .time-frame.t1 { left: 76px; top: 152px; }
+      .time-frame.t2 { left: 156px; top: 128px; animation-delay: .25s; }
+      .time-frame.t3 { left: 236px; top: 104px; animation-delay: .5s; }
+      .time-frame.t4 { left: 316px; top: 80px; animation-delay: .75s; }
+
+      .time-result,
+      .z-result {
+        position: absolute;
+        right: 34px;
+        top: 42px;
+        width: 116px;
+        height: 96px;
+        border: 1px solid rgba(57,215,123,0.58);
+        background:
+          radial-gradient(circle at 48% 48%, rgba(57,215,123,0.22), transparent 34%),
+          rgba(57,215,123,0.07);
+        box-shadow: 0 0 30px rgba(57,215,123,0.12);
+      }
+
+      .time-result::after,
+      .z-result::after {
+        content: "merged image";
+        position: absolute;
+        left: 10px;
+        bottom: -26px;
+        color: var(--green);
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .z-axis {
+        position: absolute;
+        left: 92px;
+        top: 28px;
+        bottom: 42px;
+        width: 2px;
+        background: linear-gradient(180deg, var(--yellow), rgba(246,198,91,0.12));
+      }
+
+      .z-axis::before {
+        content: "Z";
+        position: absolute;
+        left: -8px;
+        top: -20px;
+        color: var(--yellow);
+        font-size: 14px;
+      }
+
+      .xy-axis {
+        position: absolute;
+        left: 70px;
+        right: 70px;
+        bottom: 42px;
+        height: 2px;
+        background: linear-gradient(90deg, rgba(73,167,255,0.18), var(--blue));
+      }
+
+      .z-slice {
+        position: absolute;
+        left: 148px;
+        width: 170px;
+        height: 48px;
+        transform: skewX(-13deg);
+        border: 1px solid rgba(73,167,255,0.46);
+        background: rgba(73,167,255,0.08);
+        animation: sliceLift 4.6s infinite ease-in-out;
+      }
+
+      .z-slice.z1 { bottom: 58px; }
+      .z-slice.z2 { bottom: 104px; animation-delay: .25s; }
+      .z-slice.z3 { bottom: 150px; animation-delay: .5s; }
+      .z-slice.z4 { bottom: 196px; animation-delay: .75s; }
+
+      .gds-canvas {
+        height: 100%;
+        border: 1px solid var(--line);
+        background:
+          linear-gradient(rgba(73,167,255,0.12) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(73,167,255,0.12) 1px, transparent 1px),
+          #07101a;
+        background-size: 34px 34px;
+        position: relative;
+        overflow: hidden;
+      }
+
+      .gds-shape {
+        position: absolute;
+        border: 1px solid rgba(39,224,209,0.6);
+        background: rgba(39,224,209,0.07);
+      }
+
+      .g1 { left: 58px; top: 58px; width: 218px; height: 54px; }
+      .g2 { left: 248px; top: 78px; width: 84px; height: 146px; }
+      .g3 { left: 112px; top: 238px; width: 220px; height: 42px; }
+      .g4 { left: 262px; top: 286px; width: 72px; height: 68px; }
+
+      .gds-mark {
+        position: absolute;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        border: 2px solid var(--yellow);
+        box-shadow: 0 0 0 8px rgba(246,198,91,0.08);
+      }
+
+      .gds-mark.m1 { left: 82px; top: 76px; }
+      .gds-mark.m2 { left: 304px; top: 98px; }
+      .gds-mark.m3 { left: 134px; top: 252px; }
+      .gds-mark.m4 { left: 306px; top: 322px; }
+
+      .fov-box {
+        position: absolute;
+        width: 132px;
+        height: 86px;
+        border: 2px solid var(--green);
+        left: 178px;
+        top: 176px;
+        box-shadow: 0 0 28px rgba(57,215,123,0.22);
+        animation: gdsMove 4.5s ease-in-out infinite;
+      }
+
+      .basis {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+      }
+
+      .matrix-node {
+        position: absolute;
+        width: 15px;
+        height: 15px;
+        border-radius: 50%;
+        background: rgba(73,167,255,0.28);
+        border: 1px solid rgba(73,167,255,0.8);
+        animation: nodeRun 5s infinite;
+        cursor: pointer;
+      }
+
+      .matrix-node.active {
+        background: var(--green);
+        box-shadow: 0 0 0 9px rgba(57,215,123,0.14);
+      }
+
+      .measurement-steps {
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 10px;
+        margin-top: 40px;
+      }
+
+      .slide[data-id="measurement"] .measurement-steps {
+        grid-template-columns: 1fr;
+        gap: 8px;
+        margin-top: 22px;
+      }
+
+      .measurement-step {
+        min-height: 132px;
+        border: 1px solid var(--line);
+        padding: 14px;
+        border-radius: 8px;
+        background: rgba(255,255,255,0.035);
+        cursor: pointer;
+      }
+
+      .slide[data-id="measurement"] .measurement-step {
+        min-height: 0;
+        padding: 10px 12px;
+      }
+
+      .measurement-step strong {
+        display: block;
+        margin-bottom: 10px;
+        color: var(--ink);
+      }
+
+      .measurement-step span {
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.45;
+      }
+
+      .slide[data-id="measurement"] .measurement-step span {
+        display: inline;
+      }
+
+      .slide[data-id="measurement"] .measurement-wrap {
+        height: 545px;
+      }
+
+      .slide[data-id="config"] .panel {
+        align-self: center;
+      }
+
+      .slide[data-id="config"] .video-launch {
+        max-width: 100%;
+      }
+
+      .config-board {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+        margin-top: 10px;
+      }
+
+      .config-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 14px;
+        min-height: 96px;
+        background: rgba(255,255,255,0.035);
+      }
+
+      .config-card strong {
+        display: block;
+        color: var(--ink);
+        font-size: 15px;
+      }
+
+      .config-card span {
+        display: block;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.4;
+        margin-top: 8px;
+      }
+
+      .slide[data-id="stitching"] .callout {
+        display: none;
+      }
+
+      .slide[data-id="main-panel"] .demo-panel {
+        min-height: 400px;
+        gap: 12px;
+      }
+
+      .slide[data-id="main-panel"] p {
+        font-size: 16px;
+        line-height: 1.48;
+      }
+
+      .slide[data-id="stitching"] .demo-panel {
+        min-height: 400px;
+      }
+
+      .curve-wrap[data-metric="Tenengrad"] path:first-of-type {
+        stroke: var(--cyan);
+      }
+
+      .curve-wrap[data-metric="Brenner"] path:first-of-type {
+        stroke: var(--yellow);
+      }
+
+      .stitch-wrap[data-mode="Time Stack"] .tile-grid {
+        grid-template-columns: repeat(6, 58px);
+        grid-template-rows: repeat(2, 82px);
+      }
+
+      .stitch-wrap[data-mode="Z Stack"] .tile-grid {
+        grid-template-columns: repeat(3, 86px);
+        grid-template-rows: repeat(4, 52px);
+      }
+
+      .measurement-wrap[data-step="Translate"] .moving-stage {
+        transform: translate(-122px, 42px);
+      }
+
+      .measurement-wrap[data-step] .moving-stage {
+        animation: none;
+      }
+
+      .measurement-wrap[data-step="Fast approach"] .moving-stage {
+        transform: translate(0, 18px);
+      }
+
+      .measurement-wrap[data-step="Slow contact"] .moving-stage {
+        transform: translate(0, 0);
+      }
+
+      .measurement-wrap[data-step="Measure"] .device-pad {
+        box-shadow: 0 0 24px rgba(57,215,123,0.45);
+        background: var(--green);
+      }
+
+      .z-motion {
+        height: 210px;
+        position: relative;
+        margin-top: 18px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background:
+          linear-gradient(rgba(255,255,255,0.04) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px),
+          rgba(255,255,255,0.025);
+        background-size: 26px 26px;
+        overflow: hidden;
+      }
+
+      .probe-pair {
+        position: absolute;
+        left: 50%;
+        top: 16px;
+        width: 126px;
+        height: 98px;
+        transform: translateX(-50%);
+      }
+
+      .probe-pair span {
+        position: absolute;
+        top: 0;
+        width: 0;
+        height: 0;
+        border-left: 17px solid transparent;
+        border-right: 17px solid transparent;
+        border-top: 92px solid rgba(246,198,91,0.86);
+        filter: drop-shadow(0 0 12px rgba(246,198,91,0.18));
+      }
+
+      .probe-pair span:first-child { left: 16px; }
+      .probe-pair span:last-child { right: 16px; }
+
+      .moving-stage {
+        position: absolute;
+        left: 178px;
+        bottom: 20px;
+        width: 330px;
+        height: 82px;
+        border: 1px solid rgba(73,167,255,0.42);
+        background:
+          linear-gradient(90deg, rgba(73,167,255,0.18), rgba(39,224,209,0.08)),
+          rgba(73,167,255,0.06);
+        transform: translate(0, 42px);
+        transition: transform 360ms ease;
+        animation: stageContactCycle 5.4s infinite ease-in-out;
+      }
+
+      .moving-stage::before {
+        content: "";
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: 38px;
+        height: 2px;
+        background: rgba(73,167,255,0.32);
+      }
+
+      .device-pad {
+        position: absolute;
+        top: 24px;
+        width: 42px;
+        height: 18px;
+        border-radius: 4px;
+        background: var(--blue);
+      }
+
+      .device-pad.left { left: 82px; }
+      .device-pad.right { left: 148px; }
+      .device-pad.next-left { left: 222px; opacity: .62; }
+      .device-pad.next-right { left: 288px; opacity: .62; }
+
+      .chat-panel {
+        height: 405px;
+        display: grid;
+        grid-template-columns: 1.1fr 1fr;
+        gap: 16px;
+      }
+
+      .slide[data-id="agent"] .split {
+        grid-template-columns: 460px 1fr;
+      }
+
+      .slide[data-id="agent"] .chat-panel {
+        grid-template-columns: 1fr;
+        height: 405px;
+      }
+
+      .slide[data-id="agent"] .typed {
+        width: auto;
+        white-space: normal;
+        overflow: visible;
+        animation: none;
+      }
+
+      .slide[data-id="agent"] .plan-cards {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .slide[data-id="agent"] .plan-card {
+        animation: none;
+        opacity: 1;
+        transform: none;
+      }
+
+      .agent-flow {
+        display: grid;
+        grid-template-columns: 1fr 48px 1fr;
+        gap: 10px;
+        align-items: center;
+        margin-top: 6px;
+      }
+
+      .flow-node {
+        border: 1px solid var(--line);
+        background: rgba(255,255,255,0.035);
+        border-radius: 8px;
+        padding: 12px;
+        min-height: 64px;
+      }
+
+      .flow-node strong {
+        display: block;
+        color: var(--ink);
+        font-size: 14px;
+      }
+
+      .flow-node span {
+        display: block;
+        margin-top: 5px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.35;
+      }
+
+      .flow-arrow {
+        height: 2px;
+        background: linear-gradient(90deg, var(--cyan), transparent);
+        position: relative;
+        animation: pulseLine 2.2s infinite;
+      }
+
+      .flow-arrow::after {
+        content: "";
+        position: absolute;
+        right: 0;
+        top: -4px;
+        border-left: 9px solid var(--cyan);
+        border-top: 5px solid transparent;
+        border-bottom: 5px solid transparent;
+      }
+
+      .chat-bubble {
+        border: 1px solid var(--line);
+        background: rgba(255,255,255,0.035);
+        border-radius: 8px;
+        padding: 18px;
+      }
+
+      .typed {
+        color: var(--ink);
+        border-right: 2px solid var(--cyan);
+        width: 0;
+        white-space: nowrap;
+        overflow: hidden;
+        animation: typing 5s steps(56) infinite;
+      }
+
+      .plan-cards {
+        display: grid;
+        gap: 10px;
+      }
+
+      .plan-card {
+        border: 1px solid rgba(73,167,255,0.28);
+        background: rgba(73,167,255,0.08);
+        border-radius: 8px;
+        padding: 12px;
+        animation: planRise 5s infinite;
+        cursor: pointer;
+      }
+
+      .plan-card:nth-child(2) { animation-delay: .2s; }
+      .plan-card:nth-child(3) { animation-delay: .4s; }
+      .plan-card:nth-child(4) { animation-delay: .6s; }
+
+      .mode-tabs {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 20px;
+      }
+
+      .mode-tab {
+        border: 1px solid var(--line);
+        padding: 10px 12px;
+        border-radius: 8px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.25;
+        cursor: pointer;
+      }
+
+      .mode-tab.hot {
+        color: var(--ink);
+        border-color: rgba(57,215,123,0.42);
+        background: rgba(57,215,123,0.09);
+      }
+
+      .mode-tab.active {
+        box-shadow: inset 0 0 0 1px rgba(39,224,209,0.18);
+      }
+
+      .workflow {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        margin-top: 62px;
+      }
+
+      .workflow button {
+        min-height: 120px;
+        flex: 1;
+        border: 1px solid var(--line);
+        background: rgba(255,255,255,0.035);
+        color: var(--ink);
+        border-radius: 8px;
+        padding: 14px;
+        cursor: pointer;
+        text-align: left;
+      }
+
+      .workflow button:hover {
+        border-color: rgba(73,167,255,0.5);
+        background: rgba(73,167,255,0.08);
+      }
+
+      .workflow small {
+        display: block;
+        color: var(--cyan);
+        letter-spacing: .12em;
+        margin-bottom: 8px;
+      }
+
+      .progress {
+        position: absolute;
+        left: 246px;
+        right: 0;
+        bottom: 0;
+        height: 4px;
+        background: rgba(255,255,255,0.08);
+      }
+
+      .progress span {
+        display: block;
+        height: 100%;
+        width: 0;
+        background: linear-gradient(90deg, var(--blue), var(--cyan), var(--green));
+        transition: width 300ms ease;
+      }
+
+      .counter {
+        position: absolute;
+        right: 26px;
+        bottom: 18px;
+        color: var(--faint);
+        font-size: 13px;
+      }
+
+      .hint {
+        position: absolute;
+        right: 56px;
+        top: 28px;
+        color: var(--faint);
+        font-size: 12px;
+      }
+
+      .two-videos {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+      }
+
+      .callout {
+        border-left: 2px solid var(--yellow);
+        padding: 16px 18px;
+        background: rgba(246,198,91,0.07);
+        color: #f7e4b1;
+        margin-top: 18px;
+        line-height: 1.5;
+      }
+
+      @keyframes pulseLine {
+        0%, 100% { opacity: .35; filter: brightness(1); }
+        50% { opacity: 1; filter: brightness(1.8); }
+      }
+
+      @keyframes stageDrift {
+        0%, 100% { transform: translate(0,0) skewX(-12deg); }
+        50% { transform: translate(22px,-8px) skewX(-12deg); }
+      }
+
+      @keyframes fovScan {
+        0%, 100% { transform: translate(0,0); }
+        50% { transform: translate(42px,-16px); }
+      }
+
+      @keyframes targetMove {
+        0%, 100% { left: 102px; top: 260px; }
+        50% { left: calc(50% - 7px); top: calc(50% - 7px); }
+      }
+
+      @keyframes glowYellow {
+        0%, 100% { box-shadow: none; }
+        50% { box-shadow: 0 0 24px rgba(246,198,91,0.16); }
+      }
+
+      @keyframes glowBlue {
+        0%, 100% { box-shadow: none; }
+        50% { box-shadow: 0 0 24px rgba(73,167,255,0.18); }
+      }
+
+      @keyframes scanZ {
+        0%, 100% { transform: translateY(78px); }
+        50% { transform: translateY(-48px); }
+      }
+
+      @keyframes coarseSweep {
+        0%, 100% { transform: translateX(-88px); opacity: .28; }
+        45% { transform: translateX(84px); opacity: .45; }
+        70% { transform: translateX(8px); opacity: .65; }
+      }
+
+      @keyframes finePop {
+        0%, 35% { opacity: 0; transform: scale(.7); }
+        48%, 82% { opacity: 1; transform: scale(1); }
+        100% { opacity: .65; transform: scale(.9); }
+      }
+
+      @keyframes pointPop {
+        0%, 30%, 100% { transform: scale(1); opacity: .75; }
+        15% { transform: scale(1.45); opacity: 1; }
+      }
+
+      @keyframes tileFill {
+        0%, 22% { opacity: .22; transform: translateY(8px); }
+        34%, 100% { opacity: 1; transform: translateY(0); }
+      }
+
+      @keyframes gdsMove {
+        0%, 100% { left: 178px; top: 176px; }
+        50% { left: 214px; top: 118px; }
+      }
+
+      @keyframes nodeRun {
+        0%, 22% { background: rgba(73,167,255,0.25); }
+        32%, 45% { background: var(--green); box-shadow: 0 0 0 9px rgba(57,215,123,0.14); }
+        58%, 100% { background: rgba(57,215,123,0.45); }
+      }
+
+      @keyframes frameStack {
+        0%, 20% { opacity: .45; transform: translateY(10px) skewX(-16deg); }
+        38%, 72% { opacity: 1; transform: translateY(0) skewX(-16deg); }
+        100% { opacity: .66; }
+      }
+
+      @keyframes sliceLift {
+        0%, 24% { opacity: .42; transform: translateX(-18px) skewX(-13deg); }
+        42%, 76% { opacity: 1; transform: translateX(0) skewX(-13deg); }
+        100% { opacity: .68; }
+      }
+
+      @keyframes stageContactCycle {
+        0%, 100% { transform: translate(0, 42px); }
+        20% { transform: translate(0, 8px); }
+        36% { transform: translate(0, 42px); }
+        58% { transform: translate(-122px, 42px); }
+        78% { transform: translate(-122px, 8px); }
+        92% { transform: translate(-122px, 42px); }
+      }
+
+      @keyframes typing {
+        0%, 18% { width: 0; }
+        60%, 82% { width: 100%; }
+        100% { width: 0; }
+      }
+
+      @keyframes planRise {
+        0%, 16% { opacity: 0; transform: translateY(12px); }
+        28%, 88% { opacity: 1; transform: translateY(0); }
+        100% { opacity: 0.6; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        *,
+        *::before,
+        *::after {
+          animation-duration: 1ms !important;
+          transition-duration: 1ms !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="stage">
+      <div class="deck-shell">
+        <aside class="rail">
+          <div class="brand">
+            <img src="assets/logo-system-diagram.svg" alt="" />
+            <div>
+              <strong>Semi Auto Probe</strong>
+              <span>Manual Deck</span>
+            </div>
+          </div>
+          <nav class="nav" id="nav"></nav>
+          <div class="rail-footer">
+            Keyboard: arrow keys, Space, Enter. Click a workflow step to jump between chapters.
+          </div>
+        </aside>
+
+        <main class="main" id="main">
+          <div class="hint">Interactive HTML manual for group presentation</div>
+
+          <section class="slide active" data-title="Cover" data-id="cover">
+            <div class="kicker">AI-assisted laboratory automation</div>
+            <div class="split">
+              <div class="slide-copy">
+                <h1>Semi Auto Probe</h1>
+                <p class="lead" style="margin-top: 24px;">
+                  A layout-aware semi-automatic probe station software deck for motion control,
+                  live microscopy, autofocus, GDS navigation, automated imaging, measurement,
+                  and AI orchestration.
+                </p>
+                <div class="chip-row">
+                  <span class="chip">XYZ motion</span>
+                  <span class="chip">Live vision</span>
+                  <span class="chip">Focus mapping</span>
+                  <span class="chip">GDS binding</span>
+                  <span class="chip">AI Agent</span>
+                </div>
+              </div>
+              <div class="hero-visual panel demo-panel">
+                <div class="machine">
+                  <div class="axis x"></div>
+                  <div class="axis y"></div>
+                  <div class="axis z"></div>
+                  <div class="base-plate"></div>
+                  <div class="stage-plate"></div>
+                  <div class="camera-head"></div>
+                  <div class="lens"></div>
+                  <div class="fov"></div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="System" data-id="system">
+            <div class="kicker">System overview</div>
+            <h2>From instrument control to experiment workflow</h2>
+            <div class="split">
+              <div class="slide-copy">
+                <p style="margin-top: 22px;">
+                  The software connects physical stage movement, microscope vision, focus control,
+                  layout coordinates, automated acquisition, and AI-planned execution into one
+                  reproducible workflow.
+                </p>
+                <div class="callout">
+                  Narrative for the group meeting: this is not only a probe station controller;
+                  it is the operating layer that turns layout information into guided experimental action.
+                </div>
+              </div>
+              <div class="layer-stack">
+                <div class="layer"><strong>Hardware</strong><span>Serial controller, XYZ stage, microscope camera, probe system.</span></div>
+                <div class="layer"><strong>Vision & Focus</strong><span>Live camera, measurement tools, autofocus, focus mapping.</span></div>
+                <div class="layer"><strong>Spatial Mapping</strong><span>GDS binding, stage coordinates, FOV overlay, and target navigation.</span></div>
+                <div class="layer"><strong>Automation</strong><span>Automated imaging, stitching, measurement, and saved outputs.</span></div>
+                <div class="layer"><strong>AI Agent</strong><span>Natural language planning and permission-aware execution.</span></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="Workflow" data-id="workflow">
+            <div class="kicker">Recommended workflow</div>
+            <h2>Teach the system as a single experimental path</h2>
+            <p style="margin-top: 30px; max-width: 760px;">Use this slide as the operating table of contents before diving into each module.</p>
+            <div class="workflow">
+              <button data-jump="main-panel"><small>01</small>Connect device and camera</button>
+              <button data-jump="autofocus"><small>02</small>Run AutoFocus</button>
+              <button data-jump="focus-map"><small>03</small>Fit Focus Map</button>
+              <button data-jump="gds"><small>04</small>Bind GDS layout</button>
+              <button data-jump="stitching"><small>05</small>Image or measure</button>
+              <button data-jump="agent"><small>06</small>Use AI Agent</button>
+            </div>
+          </section>
+
+          <section class="slide" data-title="Main Panel" data-id="main-panel">
+            <div class="kicker">Main Panel</div>
+            <h2>Connection, live vision, and manual control</h2>
+            <div class="split wide-left">
+              <div>
+                <div class="camera-ui crosshair">
+                  <div class="sample-chip"></div>
+                  <div class="target-dot"></div>
+                  <div class="measure-line"></div>
+                </div>
+              </div>
+              <div class="control-stack demo-panel">
+                <div class="xyz-readout">
+                  <div class="axis-card"><span>X position</span><strong id="demoX">+1280.4</strong></div>
+                  <div class="axis-card"><span>Y position</span><strong id="demoY">-420.8</strong></div>
+                  <div class="axis-card"><span>Z position</span><strong id="demoZ">+86.0</strong></div>
+                </div>
+                <div class="input-demo">
+                  <div class="field relative active" data-main-mode="relative">Single click: relative move, yellow input</div>
+                  <div class="field absolute" data-main-mode="absolute">Double click: absolute target, blue input</div>
+                </div>
+                <div class="jog-grid">
+                  <div class="jog"><strong>X jog</strong><div><button data-jog="X" data-delta="-25">-X</button><button data-jog="X" data-delta="25">+X</button></div></div>
+                  <div class="jog"><strong>Y jog</strong><div><button data-jog="Y" data-delta="-25">-Y</button><button data-jog="Y" data-delta="25">+Y</button></div></div>
+                  <div class="jog"><strong>Z jog</strong><div><button data-jog="Z" data-delta="-5">-Z</button><button data-jog="Z" data-delta="5">+Z</button></div></div>
+                </div>
+                <div class="demo-readout" id="mainReadout"><strong>Relative mode</strong> · Step size X/Y 25 um, Z 5 um</div>
+                <p>Start by selecting the serial port and camera interface. Use Shift-click in the image to move a visible point to the center, and Alt + X/Y/Z to change jog step ranges.</p>
+                <div class="video-actions">
+                  <button class="video-launch" type="button" data-video="assets/videos/01_main_panel_camera_tools.mp4" data-video-title="Main Panel: camera tools">
+                    <span><strong>Play operation video</strong><span>Camera view, crosshair, measurement, and movement tools</span></span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="AutoFocus" data-id="autofocus">
+            <div class="kicker">AutoFocus</div>
+            <h2>Z scan, focus score, and best focus return</h2>
+            <div class="split">
+              <div class="panel demo-panel">
+                <p>The optical stack stays fixed. The stage scans Z, scores image sharpness, fits the focus curve, then returns to the best Z.</p>
+                <div class="chip-row" style="margin-top: 0;">
+                  <button class="state-chip active" type="button" data-focus-metric="Laplacian">Laplacian</button>
+                  <button class="state-chip" type="button" data-focus-metric="Tenengrad">Tenengrad</button>
+                  <button class="state-chip" type="button" data-focus-metric="Brenner">Brenner</button>
+                </div>
+                <div class="demo-readout" id="focusReadout"><strong>Laplacian</strong> metric selected · coarse scan then local refinement</div>
+                <div class="video-actions">
+                  <button class="video-launch" type="button" data-video="assets/videos/02_autofocus_workflow.mp4" data-video-title="AutoFocus workflow">
+                    <span><strong>Play autofocus video</strong><span>Z scan, score curve, and best-focus return</span></span>
+                  </button>
+                </div>
+              </div>
+              <div class="panel curve-wrap">
+                <svg width="100%" height="390" viewBox="0 0 520 390" aria-hidden="true">
+                  <line x1="62" y1="315" x2="470" y2="315" stroke="rgba(255,255,255,.22)" />
+                  <line x1="62" y1="60" x2="62" y2="315" stroke="rgba(255,255,255,.22)" />
+                  <text x="64" y="350" fill="#9fb0c7" font-size="14">Z position</text>
+                  <text x="22" y="72" fill="#9fb0c7" font-size="14" transform="rotate(-90 22 72)">Focus score</text>
+                  <rect class="coarse-window" x="170" y="70" width="138" height="245" fill="rgba(73,167,255,.08)" stroke="rgba(73,167,255,.28)" />
+                  <path d="M70 292 C140 280, 162 205, 215 155 S305 60, 365 158 S430 276, 464 294" fill="none" stroke="#49a7ff" stroke-width="4" />
+                  <path d="M70 300 C142 290, 182 226, 242 126 S330 68, 378 172 S438 274, 464 300" fill="none" stroke="#27e0d1" stroke-width="2" stroke-dasharray="8 8" />
+                  <g fill="#49a7ff" opacity=".72">
+                    <circle cx="98" cy="286" r="5" />
+                    <circle cx="154" cy="252" r="5" />
+                    <circle cx="212" cy="160" r="5" />
+                    <circle cx="270" cy="92" r="5" />
+                    <circle cx="328" cy="112" r="5" />
+                    <circle cx="388" cy="214" r="5" />
+                    <circle cx="444" cy="288" r="5" />
+                  </g>
+                  <path d="M240 132 C262 88, 292 74, 322 96 S366 160, 382 206" fill="none" stroke="#f6c65b" stroke-width="2.4" />
+                  <g fill="#f6c65b">
+                    <circle class="fine-point" cx="246" cy="124" r="5" />
+                    <circle class="fine-point" cx="268" cy="93" r="5" />
+                    <circle class="fine-point" cx="300" cy="86" r="5" />
+                    <circle class="fine-point" cx="330" cy="103" r="5" />
+                    <circle class="fine-point" cx="356" cy="148" r="5" />
+                  </g>
+                  <circle class="focus-point" cx="300" cy="86" r="8" fill="#f6c65b" />
+                  <line class="scan-head" x1="300" y1="120" x2="300" y2="310" stroke="#f6c65b" stroke-width="2" />
+                  <text x="104" y="86" fill="#49a7ff" font-size="13">coarse sweep</text>
+                  <text x="340" y="122" fill="#f6c65b" font-size="13">fine fit</text>
+                  <text x="318" y="92" fill="#f6c65b" font-size="15">Best focus</text>
+                </svg>
+              </div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="Focus Map" data-id="focus-map">
+            <div class="kicker">Focus Mapping</div>
+            <h2>Fit the sample plane, then let Z follow XY</h2>
+            <div class="split">
+              <div class="slide-copy">
+                <p>
+                  Focus Mapping solves large-area defocus by sampling multiple points, running
+                  AutoFocus at each location, fitting a plane, and enabling automatic Z compensation.
+                </p>
+                <div class="chip-row">
+                  <button class="state-chip active" type="button" data-map-step="Select points">Select Points</button>
+                  <button class="state-chip" type="button" data-map-step="AutoFocus each point">AutoFocus</button>
+                  <button class="state-chip" type="button" data-map-step="Fit plane">Plane Fit</button>
+                  <button class="state-chip" type="button" data-map-step="Residual model">Residual</button>
+                  <button class="state-chip" type="button" data-map-step="Enable Auto Z">Auto Z</button>
+                </div>
+                <div class="panel" style="margin-top: 20px;">
+                  <h3>Point inspector</h3>
+                  <p id="mapReadout" style="font-size: 15px; margin-top: 10px;">Point P3 · measured Z 84.2 um · fitted Z 83.7 um · residual 0.5 um</p>
+                </div>
+                <div class="video-actions">
+                  <button class="video-launch" type="button" data-video="assets/videos/03_focusmap_workflow.mp4" data-video-title="Focus Mapping workflow">
+                    <span><strong>Play focus mapping video</strong><span>Sampling points, plane fit, and Auto Z behavior</span></span>
+                  </button>
+                </div>
+              </div>
+              <div class="panel plane-wrap">
+                <div class="plane"><div class="plane-grid"></div></div>
+                <div class="map-point p1" data-map-point="P1"></div>
+                <div class="map-point p2" data-map-point="P2"></div>
+                <div class="map-point p3 active" data-map-point="P3"></div>
+                <div class="map-point p4" data-map-point="P4"></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="Stitching" data-id="stitching">
+            <div class="kicker">Image Stitching</div>
+            <h2>Build a large field from local high-resolution images</h2>
+            <div class="split">
+              <div>
+                <div class="panel demo-panel">
+                  <p>Use stitching to scan a local grid, register overlapping fields, and compose a larger microscope image with visible quality feedback.</p>
+                  <div class="demo-readout" id="stitchReadout"><strong>XY Stitching</strong> · serpentine scan · overlap 20% · weight 0.65</div>
+                  <div class="video-actions">
+                    <button class="video-launch" type="button" data-video="assets/videos/04_image_stitching.mp4" data-video-title="Image Stitching workflow">
+                      <span><strong>Play stitching video</strong><span>XY scan, overlap, and mosaic output</span></span>
+                    </button>
+                  </div>
+                </div>
+                <div class="callout">Overlap improves registration stability. Stitching weight controls how much automatic correction is trusted.</div>
+              </div>
+              <div class="panel stitch-wrap" data-mode="XY Stitching">
+                <div class="mode-tabs">
+                <span class="mode-tab hot active" data-stitch-mode="XY Stitching">XY Stitching</span>
+                <span class="mode-tab" data-stitch-mode="Time Stack">Time Stack</span>
+                <span class="mode-tab" data-stitch-mode="Z Stack">Z Stack</span>
+              </div>
+              <div class="tile-grid">
+                  <div class="tile active" data-tile="R1 C1"></div><div class="tile" data-tile="R1 C2"></div><div class="tile" data-tile="R1 C3"></div><div class="tile warn" data-tile="R1 C4"></div>
+                  <div class="tile" data-tile="R2 C1"></div><div class="tile" data-tile="R2 C2"></div><div class="tile" data-tile="R2 C3"></div><div class="tile" data-tile="R2 C4"></div>
+                  <div class="tile bad" data-tile="R3 C1"></div><div class="tile" data-tile="R3 C2"></div><div class="tile" data-tile="R3 C3"></div><div class="tile" data-tile="R3 C4"></div>
+              </div>
+              <div class="stitch-diagram time-stack-diagram" aria-hidden="true">
+                <div class="time-axis"></div>
+                <div class="time-frame t1"></div>
+                <div class="time-frame t2"></div>
+                <div class="time-frame t3"></div>
+                <div class="time-frame t4"></div>
+                <div class="time-result"></div>
+              </div>
+              <div class="stitch-diagram z-stack-diagram" aria-hidden="true">
+                <div class="z-axis"></div>
+                <div class="xy-axis"></div>
+                <div class="z-slice z1"></div>
+                <div class="z-slice z2"></div>
+                <div class="z-slice z3"></div>
+                <div class="z-slice z4"></div>
+                <div class="z-result"></div>
+              </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="GDS Binding" data-id="gds">
+            <div class="kicker">GDS Layout Binding</div>
+            <h2>Bridge design coordinates and physical stage coordinates</h2>
+            <div class="split wide-left">
+              <div class="panel gds-wrap">
+                <div class="gds-canvas">
+                  <div class="gds-shape g1" data-gds="Top alignment mark"></div>
+                  <div class="gds-shape g2" data-gds="Device block"></div>
+                  <div class="gds-shape g3" data-gds="Electrode bus"></div>
+                  <div class="gds-shape g4" data-gds="Array pad"></div>
+                  <div class="gds-mark m1"></div>
+                  <div class="gds-mark m2"></div>
+                  <div class="gds-mark m3"></div>
+                  <div class="gds-mark m4"></div>
+                  <div class="fov-box"></div>
+                </div>
+              </div>
+              <div class="slide-copy">
+                <p>
+                  Load GDS, choose four corresponding feature points, record their real stage
+                  positions, fit the mapping, then navigate the sample through layout targets.
+                </p>
+                <div class="demo-readout" id="gdsReadout"><strong>Mapping idle</strong> · click a layout feature or video to demonstrate binding workflow</div>
+                <div class="video-actions">
+                  <button class="video-launch" type="button" data-video="assets/videos/05_layoutbond_workflow.mp4" data-video-title="GDS LayoutBond workflow">
+                    <span><strong>Play GDS binding video</strong><span>Feature pairing, mapping fit, and FOV overlay</span></span>
+                  </button>
+                </div>
+                <div class="layer-stack compact-stack" style="margin-top: 16px;">
+                  <div class="layer"><strong>1. Load GDS</strong><span>Display layout, layers, grid, and target marks.</span></div>
+                  <div class="layer"><strong>2. Pair points</strong><span>Match GDS mark centers with real microscope features.</span></div>
+                  <div class="layer"><strong>3. Fit mapping</strong><span>Preview current field-of-view as a green overlay.</span></div>
+                  <div class="layer"><strong>4. Navigate</strong><span>Click target positions and move the stage through fitted mapping.</span></div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="Auto Imaging" data-id="auto-imaging">
+            <div class="kicker">Automated Imaging</div>
+            <h2>Generate an acquisition matrix from layout geometry</h2>
+            <div class="split">
+              <div>
+                <div class="panel demo-panel">
+                  <p>Define a start point, basis vectors, and acquisition matrix, then let the stage visit each location and save images automatically.</p>
+                  <div class="demo-readout" id="matrixReadout"><strong>Matrix ready</strong> · click a node to preview its acquisition status</div>
+                  <div class="video-actions">
+                    <button class="video-launch" type="button" data-video="assets/videos/06_automated_imaging_workflow.mp4" data-video-title="Automated Imaging workflow">
+                      <span><strong>Play automated imaging video</strong><span>Matrix generation and sequential acquisition</span></span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div class="panel gds-wrap">
+                <svg class="basis" viewBox="0 0 560 410" aria-hidden="true">
+                  <defs>
+                    <marker id="arrow" markerWidth="10" markerHeight="10" refX="6" refY="3" orient="auto">
+                      <path d="M0,0 L0,6 L7,3 z" fill="#27e0d1" />
+                    </marker>
+                  </defs>
+                  <line x1="112" y1="282" x2="384" y2="242" stroke="#27e0d1" stroke-width="3" marker-end="url(#arrow)" />
+                  <line x1="112" y1="282" x2="178" y2="138" stroke="#f6c65b" stroke-width="3" marker-end="url(#arrow)" />
+                  <circle cx="112" cy="282" r="7" fill="#f6c65b" />
+                </svg>
+                <div id="matrixNodes"></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="Measurement" data-id="measurement">
+            <div class="kicker">Automated Measurement</div>
+            <h2>Device-by-device testing with safe Z motion</h2>
+            <div class="split">
+              <div class="slide-copy">
+                <p>
+                  Automated Measurement uses the same spatial logic as automated imaging, then adds
+                  probe-safe Z retreat, fast approach, slow contact, and a configurable test workflow.
+                </p>
+                <div class="measurement-steps">
+                  <div class="measurement-step active" data-measure-step="Retreat"><strong>Retreat</strong><span>Z moves to a safe height after each device.</span></div>
+                  <div class="measurement-step" data-measure-step="Translate"><strong>Translate</strong><span>XY moves to the next device position.</span></div>
+                  <div class="measurement-step" data-measure-step="Fast approach"><strong>Fast approach</strong><span>Z approaches quickly above the contact region.</span></div>
+                  <div class="measurement-step" data-measure-step="Slow contact"><strong>Slow contact</strong><span>Final approach is slower and controlled.</span></div>
+                  <div class="measurement-step" data-measure-step="Measure"><strong>Measure</strong><span>Run curves and save named datasets.</span></div>
+                </div>
+              </div>
+              <div class="panel measurement-wrap">
+                <div class="demo-readout" id="measureReadout"><strong>Retreat</strong> · Z moves down to safe travel height</div>
+                <div class="video-actions" style="margin-top: 0;">
+                  <button class="video-launch" type="button" data-video="assets/videos/07_automated_testing_workflow.mp4" data-video-title="Automated Measurement workflow">
+                    <span><strong>Play measurement video</strong><span>Safe Z approach and device-by-device workflow</span></span>
+                  </button>
+                </div>
+                <div class="z-motion">
+                  <div class="probe-pair"><span></span><span></span></div>
+                  <div class="moving-stage">
+                    <div class="device-pad left"></div>
+                    <div class="device-pad right"></div>
+                    <div class="device-pad next-left"></div>
+                    <div class="device-pad next-right"></div>
+                  </div>
+                </div>
+                <div class="chip-row">
+                  <span class="chip">Transfer curve</span>
+                  <span class="chip">Output curve</span>
+                  <span class="chip">Photoresponse</span>
+                  <span class="chip">I-T curve</span>
+                  <span class="chip">Pulsed light</span>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="AI Agent" data-id="agent">
+            <div class="kicker">AI Agent</div>
+            <h2>Natural language becomes a reviewable experiment plan</h2>
+            <div class="split">
+              <div class="panel demo-panel">
+                <div class="video-actions" style="margin-top: 0;">
+                  <button class="video-launch" type="button" data-video="assets/videos/08_ai_agent_workflow.mp4" data-video-title="AI Agent workflow">
+                    <span><strong>Play AI Agent video</strong><span>Natural language planning and permission-aware execution</span></span>
+                  </button>
+                </div>
+                <div class="mode-tabs">
+                  <span class="mode-tab hot active" data-agent-mode="Ask only">Ask only</span>
+                  <span class="mode-tab hot" data-agent-mode="Plan + confirm">Plan + confirm</span>
+                  <span class="mode-tab" data-agent-mode="Admin full access">Admin full access</span>
+                </div>
+                <div class="agent-flow">
+                  <div class="flow-node"><strong>Local software</strong><span>Prompt, UI state, and permission mode</span></div>
+                  <div class="flow-arrow"></div>
+                  <div class="flow-node"><strong>Cloud LLM</strong><span>Reasoning, help answer, or draft workflow plan</span></div>
+                  <div class="flow-node"><strong>Rule cleanup</strong><span>Local validation, schema normalization, safety gate</span></div>
+                  <div class="flow-arrow"></div>
+                  <div class="flow-node"><strong>Hardware executor</strong><span>Approved commands reach motion and camera tools</span></div>
+                </div>
+                <div class="demo-readout" id="agentReadout"><strong>Ask only</strong> · tutorial and troubleshooting responses without hardware action</div>
+              </div>
+              <div class="chat-panel">
+                <div class="chat-bubble">
+                  <h3>User request</h3>
+                  <p class="typed" style="margin-top: 18px;">Run autofocus here and capture a 3 by 3 stitched image.</p>
+                </div>
+                <div class="plan-cards">
+                  <div class="plan-card active" data-plan-step="Check state">1. Check camera, serial, and motion state</div>
+                  <div class="plan-card" data-plan-step="Run AutoFocus">2. Run AutoFocus at current position</div>
+                  <div class="plan-card" data-plan-step="Configure stitch">3. Configure 3 x 3 stitching workflow</div>
+                  <div class="plan-card" data-plan-step="Confirm">4. Wait for confirmation before hardware action</div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="Config" data-id="config">
+            <div class="kicker">Configuration</div>
+            <h2>Stable defaults, adjustable hardware profiles</h2>
+            <div class="split">
+              <div class="slide-copy">
+                <p>
+                  The configuration page stores relatively fixed parameters: optical magnification,
+                  input mode, fitting defaults, motion speed, acceleration, and stability settings.
+                  Most daily workflows should work with default settings.
+                </p>
+                <div class="chip-row">
+                  <button class="state-chip active" type="button" data-config="Objective">Objective</button>
+                  <button class="state-chip" type="button" data-config="Eyepiece">Eyepiece</button>
+                  <button class="state-chip" type="button" data-config="Keyboard / handle">Keyboard / handle</button>
+                  <button class="state-chip" type="button" data-config="Arrow / WASD">Arrow / WASD</button>
+                  <button class="state-chip" type="button" data-config="Speed">Speed</button>
+                  <button class="state-chip" type="button" data-config="Fitting defaults">Fitting defaults</button>
+                </div>
+                <div class="demo-readout" id="configReadout"><strong>Objective</strong> · choose magnification profile for pixel-to-distance calibration</div>
+              </div>
+              <div class="panel">
+                <div class="video-actions" style="margin-top: 0;">
+                  <button class="video-launch" type="button" data-video="assets/videos/09_config_page.mp4" data-video-title="Configuration page">
+                    <span><strong>Play configuration video</strong><span>Optics, input mode, fitting, speed, and stability settings</span></span>
+                  </button>
+                </div>
+                <div class="config-board">
+                  <div class="config-card"><strong>Optics profile</strong><span>Objective and eyepiece magnification drive pixel-distance calibration.</span></div>
+                  <div class="config-card"><strong>Input mode</strong><span>Switch handle, arrows, or WASD for the operator's habit.</span></div>
+                  <div class="config-card"><strong>Motion tuning</strong><span>Speed, acceleration, and stability values are kept as advanced defaults.</span></div>
+                  <div class="config-card"><strong>Fit defaults</strong><span>Autofocus and plane-fit parameters stay editable for unusual samples.</span></div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="slide" data-title="Summary" data-id="summary">
+            <div class="kicker">Closing message</div>
+            <h2>From manual operation to AI-assisted characterization</h2>
+            <div class="split">
+              <div>
+                <p class="lead">
+                  Semi Auto Probe integrates motion control, live microscopy, autofocus, layout
+                  navigation, image acquisition, automated measurement, and AI-guided workflows.
+                </p>
+              </div>
+              <div class="layer-stack">
+                <div class="layer"><strong>Reproducible</strong><span>Physical actions become visible, parameterized workflows.</span></div>
+                <div class="layer"><strong>Layout-aware</strong><span>Digital GDS coordinates guide real stage navigation.</span></div>
+                <div class="layer"><strong>Permission-aware</strong><span>AI plans experiments without bypassing local safety checks.</span></div>
+                <div class="layer"><strong>Expandable</strong><span>The current platform can grow toward automated characterization routines.</span></div>
+              </div>
+            </div>
+          </section>
+
+          <div class="video-overlay" id="videoOverlay" aria-hidden="true">
+            <div class="video-overlay-head">
+              <div class="video-overlay-title">
+                <strong id="overlayTitle">Video</strong>
+                <span id="overlayPath"></span>
+              </div>
+              <button class="video-close" type="button" id="videoClose">Close</button>
+            </div>
+            <div class="video-stage" id="videoStage">
+              <video id="overlayVideo" muted playsinline preload="metadata"></video>
+              <div class="video-status" id="videoStatus">Video is loading</div>
+            </div>
+            <div class="video-controls" id="overlayControls">
+              <button type="button" data-action="play" title="Play / pause">Play</button>
+              <button type="button" data-action="back" title="Back 10 seconds">-10s</button>
+              <button type="button" data-action="forward" title="Forward 10 seconds">+10s</button>
+              <input type="range" min="0" max="1000" value="0" step="1" aria-label="Video progress" />
+              <span class="time">00:00 / 00:00</span>
+              <button type="button" data-action="full" title="Fullscreen">Full</button>
+            </div>
+          </div>
+
+          <div class="counter" id="counter"></div>
+        </main>
+      </div>
+      <div class="progress"><span id="progress"></span></div>
+    </div>
+
+    <script>
+      const slides = [...document.querySelectorAll(".slide")];
+      const nav = document.querySelector("#nav");
+      const progress = document.querySelector("#progress");
+      const counter = document.querySelector("#counter");
+      const matrixNodes = document.querySelector("#matrixNodes");
+      const videoOverlay = document.querySelector("#videoOverlay");
+      const overlayVideo = document.querySelector("#overlayVideo");
+      const overlayTitle = document.querySelector("#overlayTitle");
+      const overlayPath = document.querySelector("#overlayPath");
+      const videoStatus = document.querySelector("#videoStatus");
+      const videoClose = document.querySelector("#videoClose");
+      const overlayControls = document.querySelector("#overlayControls");
+      const overlayPlay = overlayControls.querySelector('[data-action="play"]');
+      const overlayBack = overlayControls.querySelector('[data-action="back"]');
+      const overlayForward = overlayControls.querySelector('[data-action="forward"]');
+      const overlayFull = overlayControls.querySelector('[data-action="full"]');
+      const overlayProgress = overlayControls.querySelector('input[type="range"]');
+      const overlayTime = overlayControls.querySelector(".time");
+      let current = 0;
+      let wheelLocked = false;
+      let lastPointerTurnAt = 0;
+
+      function fitStage() {
+        const scale = Math.min(window.innerWidth / 1280, window.innerHeight / 720);
+        document.documentElement.style.setProperty("--scale", String(scale));
+      }
+
+      slides.forEach((slide, index) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.innerHTML = `<span>${slide.dataset.title}</span><small>${String(index + 1).padStart(2, "0")}</small>`;
+        button.addEventListener("click", () => goTo(index));
+        nav.append(button);
+      });
+
+      for (let row = 0; row < 4; row += 1) {
+        for (let col = 0; col < 5; col += 1) {
+          const node = document.createElement("span");
+          node.className = "matrix-node";
+          const origin = { x: 112, y: 282 };
+          const u = { x: 68, y: -10 };
+          const v = { x: 22, y: -48 };
+          node.style.left = `${origin.x + col * u.x + row * v.x}px`;
+          node.style.top = `${origin.y + col * u.y + row * v.y}px`;
+          node.style.animationDelay = `${(row * 5 + col) * 0.12}s`;
+          node.dataset.matrixNode = `R${row + 1} C${col + 1}`;
+          matrixNodes.append(node);
+        }
+      }
+
+      const demoState = {
+        X: 1280.4,
+        Y: -420.8,
+        Z: 86.0,
+      };
+
+      function setActiveInGroup(target, selector) {
+        document.querySelectorAll(selector).forEach((item) => item.classList.remove("active"));
+        target.classList.add("active");
+      }
+
+      function updateAxisReadout() {
+        const format = (value) => `${value >= 0 ? "+" : ""}${value.toFixed(1)}`;
+        document.querySelector("#demoX").textContent = format(demoState.X);
+        document.querySelector("#demoY").textContent = format(demoState.Y);
+        document.querySelector("#demoZ").textContent = format(demoState.Z);
+      }
+
+      document.querySelectorAll("[data-jog]").forEach((button) => {
+        button.addEventListener("click", (event) => {
+          event.stopPropagation();
+          const axis = button.dataset.jog;
+          const delta = Number(button.dataset.delta);
+          demoState[axis] += delta;
+          updateAxisReadout();
+          document.querySelector("#mainReadout").innerHTML = `<strong>${axis} jog</strong> · ${delta > 0 ? "positive" : "negative"} move · new ${axis} ${demoState[axis].toFixed(1)} um`;
+        });
+      });
+
+      document.querySelectorAll("[data-main-mode]").forEach((field) => {
+        field.addEventListener("click", (event) => {
+          event.stopPropagation();
+          setActiveInGroup(field, "[data-main-mode]");
+          const mode = field.dataset.mainMode === "relative" ? "Relative mode" : "Absolute mode";
+          document.querySelector("#mainReadout").innerHTML = `<strong>${mode}</strong> · Enter confirms the highlighted movement command`;
+        });
+      });
+
+      document.querySelectorAll("[data-focus-metric]").forEach((button) => {
+        button.addEventListener("click", (event) => {
+          event.stopPropagation();
+          setActiveInGroup(button, "[data-focus-metric]");
+          const metric = button.dataset.focusMetric;
+          const detail = {
+            Laplacian: "edge sharpness, quick general-purpose focus scoring",
+            Tenengrad: "gradient energy, robust on textured devices",
+            Brenner: "difference-based score, useful for simple contrast checks",
+          }[metric];
+          document.querySelector("#focusReadout").innerHTML = `<strong>${metric}</strong> metric selected · ${detail}`;
+          document.querySelector(".curve-wrap").dataset.metric = metric;
+        });
+      });
+
+      document.querySelectorAll("[data-map-step]").forEach((button) => {
+        button.addEventListener("click", (event) => {
+          event.stopPropagation();
+          setActiveInGroup(button, "[data-map-step]");
+          document.querySelector("#mapReadout").textContent = `${button.dataset.mapStep} · this step is highlighted in the focus-plane workflow.`;
+          document.querySelector(".plane-wrap").dataset.step = button.dataset.mapStep;
+        });
+      });
+
+      const mapValues = {
+        P1: "Point P1 · measured Z 80.8 um · fitted Z 80.6 um · residual 0.2 um",
+        P2: "Point P2 · measured Z 86.1 um · fitted Z 85.8 um · residual 0.3 um",
+        P3: "Point P3 · measured Z 84.2 um · fitted Z 83.7 um · residual 0.5 um",
+        P4: "Point P4 · measured Z 89.5 um · fitted Z 89.2 um · residual 0.3 um",
+      };
+
+      document.querySelectorAll("[data-map-point]").forEach((point) => {
+        point.addEventListener("click", (event) => {
+          event.stopPropagation();
+          setActiveInGroup(point, "[data-map-point]");
+          document.querySelector("#mapReadout").textContent = mapValues[point.dataset.mapPoint];
+        });
+      });
+
+      document.querySelectorAll("[data-stitch-mode]").forEach((tabButton) => {
+        tabButton.addEventListener("click", (event) => {
+          event.stopPropagation();
+          setActiveInGroup(tabButton, "[data-stitch-mode]");
+          const mode = tabButton.dataset.stitchMode;
+          const detail = {
+            "XY Stitching": "serpentine scan · overlap 20% · weight 0.65",
+            "Time Stack": "same XY position · repeated frames · temporal drift check",
+            "Z Stack": "fixed XY · stepped Z capture · depth-of-field review",
+          }[mode];
+          document.querySelector("#stitchReadout").innerHTML = `<strong>${mode}</strong> · ${detail}`;
+          document.querySelector(".stitch-wrap").dataset.mode = mode;
+        });
+      });
+
+      document.querySelectorAll("[data-tile]").forEach((tile) => {
+        tile.addEventListener("click", (event) => {
+          event.stopPropagation();
+          setActiveInGroup(tile, "[data-tile]");
+          const quality = tile.classList.contains("bad") ? "low feature confidence" : tile.classList.contains("warn") ? "medium seam confidence" : "good seam confidence";
+          document.querySelector("#stitchReadout").innerHTML = `<strong>${tile.dataset.tile}</strong> · ${quality}`;
+        });
+      });
+
+      document.querySelectorAll("[data-gds]").forEach((shape) => {
+        shape.addEventListener("click", (event) => {
+          event.stopPropagation();
+          setActiveInGroup(shape, "[data-gds]");
+          document.querySelector("#gdsReadout").innerHTML = `<strong>${shape.dataset.gds}</strong> · selected layout feature ready for coordinate pairing`;
+        });
+      });
+
+      document.querySelectorAll("[data-matrix-node]").forEach((node) => {
+        node.addEventListener("click", (event) => {
+          event.stopPropagation();
+          setActiveInGroup(node, "[data-matrix-node]");
+          document.querySelector("#matrixReadout").innerHTML = `<strong>${node.dataset.matrixNode}</strong> · queued acquisition point · local image mode ready`;
+        });
+      });
+
+      document.querySelectorAll("[data-measure-step]").forEach((step) => {
+        step.addEventListener("click", (event) => {
+          event.stopPropagation();
+          setActiveInGroup(step, "[data-measure-step]");
+          const notes = {
+            Retreat: "Z moves down to safe travel height",
+            Translate: "XY moves while probe clearance is protected",
+            "Fast approach": "high-speed approach above contact zone",
+            "Slow contact": "final low-speed contact approach",
+            Measure: "execute workflow cards and save device data",
+          };
+          document.querySelector("#measureReadout").innerHTML = `<strong>${step.dataset.measureStep}</strong> · ${notes[step.dataset.measureStep]}`;
+          document.querySelector(".measurement-wrap").dataset.step = step.dataset.measureStep;
+        });
+      });
+
+      document.querySelectorAll("[data-agent-mode]").forEach((modeButton) => {
+        modeButton.addEventListener("click", (event) => {
+          event.stopPropagation();
+          setActiveInGroup(modeButton, "[data-agent-mode]");
+          const mode = modeButton.dataset.agentMode;
+          const detail = {
+            "Ask only": "tutorial and troubleshooting responses without hardware action",
+            "Plan + confirm": "AI prepares executable steps; user confirms hardware actions",
+            "Admin full access": "admin code required before automatic execution",
+          }[mode];
+          document.querySelector("#agentReadout").innerHTML = `<strong>${mode}</strong> · ${detail}`;
+        });
+      });
+
+      document.querySelectorAll("[data-plan-step]").forEach((card) => {
+        card.addEventListener("click", (event) => {
+          event.stopPropagation();
+          setActiveInGroup(card, "[data-plan-step]");
+          document.querySelector("#agentReadout").innerHTML = `<strong>${card.dataset.planStep}</strong> · selected plan card for review`;
+        });
+      });
+
+      document.querySelectorAll("[data-config]").forEach((button) => {
+        button.addEventListener("click", (event) => {
+          event.stopPropagation();
+          setActiveInGroup(button, "[data-config]");
+          const value = button.dataset.config;
+          const detail = {
+            Objective: "choose magnification profile for pixel-to-distance calibration",
+            Eyepiece: "match active optical configuration to stored calibration",
+            "Keyboard / handle": "switch between input devices for stage control",
+            "Arrow / WASD": "choose keyboard navigation layout",
+            Speed: "adjust motion speed and acceleration limits",
+            "Fitting defaults": "set default parameters for plane and focus fitting",
+          }[value];
+          document.querySelector("#configReadout").innerHTML = `<strong>${value}</strong> · ${detail}`;
+        });
+      });
+
+      const formatTime = (seconds) => {
+        if (!Number.isFinite(seconds)) return "00:00";
+        const minutes = Math.floor(seconds / 60);
+        const secs = Math.floor(seconds % 60);
+        return `${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+      };
+
+      function syncOverlayVideo() {
+        const duration = overlayVideo.duration || 0;
+        overlayProgress.value = duration ? String((overlayVideo.currentTime / duration) * 1000) : "0";
+        overlayTime.textContent = `${formatTime(overlayVideo.currentTime)} / ${formatTime(duration)}`;
+        overlayPlay.textContent = overlayVideo.paused ? "Play" : "Pause";
+      }
+
+      async function openVideo(button) {
+        const src = button.dataset.video;
+        overlayTitle.textContent = button.dataset.videoTitle || "Operation video";
+        overlayPath.textContent = src;
+        videoOverlay.classList.add("open");
+        videoOverlay.setAttribute("aria-hidden", "false");
+        videoStatus.textContent = "Video is loading";
+        videoStatus.classList.add("show");
+        overlayVideo.src = src;
+        overlayVideo.currentTime = 0;
+        overlayVideo.load();
+        try {
+          await overlayVideo.play();
+        } catch {
+          // Autoplay can be blocked; controls remain available.
+        }
+        syncOverlayVideo();
+      }
+
+      async function closeVideo() {
+        overlayVideo.pause();
+        overlayVideo.removeAttribute("src");
+        overlayVideo.load();
+        videoOverlay.classList.remove("open");
+        videoOverlay.setAttribute("aria-hidden", "true");
+        videoStatus.classList.remove("show");
+        if (document.fullscreenElement === videoOverlay) {
+          await document.exitFullscreen();
+        }
+      }
+
+      function goTo(index) {
+        current = Math.max(0, Math.min(slides.length - 1, index));
+        slides.forEach((slide, slideIndex) => {
+          slide.classList.toggle("active", slideIndex === current);
+        });
+        [...nav.children].forEach((button, buttonIndex) => {
+          button.classList.toggle("active", buttonIndex === current);
+        });
+        progress.style.width = `${((current + 1) / slides.length) * 100}%`;
+        counter.textContent = `${current + 1} / ${slides.length}`;
+      }
+
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && videoOverlay.classList.contains("open")) {
+          event.preventDefault();
+          closeVideo();
+          return;
+        }
+        if (videoOverlay.classList.contains("open")) return;
+        if (["ArrowRight", " ", "Enter", "PageDown"].includes(event.key)) {
+          event.preventDefault();
+          goTo(current + 1);
+        }
+        if (["ArrowLeft", "PageUp"].includes(event.key)) {
+          event.preventDefault();
+          goTo(current - 1);
+        }
+        if (event.key === "Home") goTo(0);
+        if (event.key === "End") goTo(slides.length - 1);
+      });
+
+      function shouldIgnorePageTurn(target) {
+        return Boolean(target.closest("button, video, input, select, textarea, a, [data-jog], [data-main-mode], [data-focus-metric], [data-map-step], [data-map-point], [data-stitch-mode], [data-tile], [data-gds], [data-matrix-node], [data-measure-step], [data-agent-mode], [data-plan-step], [data-config]"));
+      }
+
+      function turnPageFromPointer(event) {
+        const target = event.target;
+        if (videoOverlay.classList.contains("open")) return;
+        if (shouldIgnorePageTurn(target)) return;
+        const rect = event.currentTarget.getBoundingClientRect();
+        goTo(event.clientX - rect.left > rect.width / 2 ? current + 1 : current - 1);
+      }
+
+      document.querySelector(".main").addEventListener("click", (event) => {
+        if (Date.now() - lastPointerTurnAt < 260) return;
+        turnPageFromPointer(event);
+      });
+      document.querySelector(".main").addEventListener("pointerup", (event) => {
+        if (event.pointerType === "mouse" && event.button !== 0) return;
+        lastPointerTurnAt = Date.now();
+        turnPageFromPointer(event);
+      });
+
+      document.querySelector(".main").addEventListener("wheel", (event) => {
+        if (videoOverlay.classList.contains("open")) return;
+        event.preventDefault();
+        if (wheelLocked || Math.abs(event.deltaY) < 14) return;
+        wheelLocked = true;
+        goTo(current + (event.deltaY > 0 ? 1 : -1));
+        window.setTimeout(() => {
+          wheelLocked = false;
+        }, 520);
+      }, { passive: false });
+
+      document.querySelectorAll(".video-launch").forEach((button) => {
+        button.addEventListener("click", (event) => {
+          event.stopPropagation();
+          openVideo(button);
+        });
+      });
+
+      document.querySelectorAll("[data-jump]").forEach((button) => {
+        button.addEventListener("click", (event) => {
+          event.stopPropagation();
+          const id = button.dataset.jump;
+          const index = slides.findIndex((slide) => slide.dataset.id === id);
+          if (index >= 0) goTo(index);
+        });
+      });
+
+      videoClose.addEventListener("click", closeVideo);
+
+      overlayPlay.addEventListener("click", async () => {
+        if (overlayVideo.paused) {
+          await overlayVideo.play();
+        } else {
+          overlayVideo.pause();
+        }
+        syncOverlayVideo();
+      });
+
+      overlayBack.addEventListener("click", () => {
+        overlayVideo.currentTime = Math.max(0, overlayVideo.currentTime - 10);
+        syncOverlayVideo();
+      });
+
+      overlayForward.addEventListener("click", () => {
+        overlayVideo.currentTime = Math.min(overlayVideo.duration || overlayVideo.currentTime + 10, overlayVideo.currentTime + 10);
+        syncOverlayVideo();
+      });
+
+      overlayFull.addEventListener("click", async () => {
+        if (document.fullscreenElement === videoOverlay) {
+          await document.exitFullscreen();
+        } else if (videoOverlay.requestFullscreen) {
+          await videoOverlay.requestFullscreen();
+        }
+      });
+
+      overlayProgress.addEventListener("input", () => {
+        const duration = overlayVideo.duration || 0;
+        if (duration) overlayVideo.currentTime = (Number(overlayProgress.value) / 1000) * duration;
+        syncOverlayVideo();
+      });
+
+      overlayVideo.addEventListener("loadedmetadata", () => {
+        videoStatus.classList.remove("show");
+        syncOverlayVideo();
+      });
+      overlayVideo.addEventListener("error", () => {
+        videoStatus.textContent = "Video file could not be loaded. Please check the file name.";
+        videoStatus.classList.add("show");
+      });
+      overlayVideo.addEventListener("timeupdate", syncOverlayVideo);
+      overlayVideo.addEventListener("play", syncOverlayVideo);
+      overlayVideo.addEventListener("pause", syncOverlayVideo);
+      overlayVideo.addEventListener("ended", async () => {
+        syncOverlayVideo();
+        await closeVideo();
+      });
+
+      window.addEventListener("resize", fitStage);
+      fitStage();
+      goTo(0);
+    </script>
+  </body>
+</html>

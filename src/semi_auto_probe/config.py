@@ -245,7 +245,7 @@ class ProbeConfig:
     camera_exposure: float = 0.0
     camera_gain_mode: str = CAMERA_CONTROL_MODE_AUTO
     camera_gain: float = 0.0
-    cc_accel_time_s: float = 0.1
+    cc_accel_time_s: float = 0.3
     autofocus_settle_ms: int = 100
     autofocus_sample_count: int = 5
     autofocus_peak_model: str = AUTOFOCUS_PEAK_MODEL_GAUSSIAN
@@ -291,8 +291,8 @@ class ProbeConfig:
             raise ValueError("Camera exposure must be a finite number in range -1000000..1000000.")
         if not math.isfinite(self.camera_gain) or self.camera_gain < 0 or self.camera_gain > 1_000_000:
             raise ValueError("Camera gain must be a finite number in range 0..1000000.")
-        if self.cc_accel_time_s < 0 or self.cc_accel_time_s > 2.55:
-            raise ValueError("CC acceleration time must be in range 0..2.55 seconds.")
+        if self.cc_accel_time_s < 0.05 or self.cc_accel_time_s > 2.55:
+            raise ValueError("CC acceleration time must be in range 0.05..2.55 seconds.")
         if self.autofocus_settle_ms < 0 or self.autofocus_settle_ms > 10000:
             raise ValueError("AutoFocus settle time must be in range 0..10000 ms.")
         if self.autofocus_sample_count <= 0 or self.autofocus_sample_count > 1000:

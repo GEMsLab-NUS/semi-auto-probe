@@ -52,8 +52,19 @@ class ProbeConfigTest(unittest.TestCase):
                 "Z": {"minimum_speed": 0, "work_speed": 0, "acceleration": 0},
             },
         )
-        self.assertAlmostEqual(config.cc_accel_time_s, 0.1)
-        self.assertEqual(config.cc_acceleration_units(), 10)
+        self.assertAlmostEqual(config.cc_accel_time_s, 0.3)
+        self.assertEqual(config.cc_acceleration_units(), 30)
+
+    def test_cc_acceleration_time_cannot_be_zero(self) -> None:
+        config = ProbeConfig(cc_accel_time_s=0)
+
+        with self.assertRaises(ValueError):
+            config.validate()
+
+    def test_cc_acceleration_time_lower_bound_is_005s(self) -> None:
+        ProbeConfig(cc_accel_time_s=0.05).validate()
+        with self.assertRaises(ValueError):
+            ProbeConfig(cc_accel_time_s=0.049).validate()
 
     def test_calibration_lookup_is_per_lens_combination(self) -> None:
         config = ProbeConfig()
