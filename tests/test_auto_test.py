@@ -3,12 +3,14 @@ from __future__ import annotations
 import unittest
 
 from semi_auto_probe.auto_test import (
+    AutoTestPanel,
     AutoTestSettings,
     compile_autotest_point_name,
     create_autotest_flow_card,
     generate_autotest_points,
     index_to_letters,
     legacy_measurement_steps_from_flow,
+    measurement_flow_steps_from_cards,
     summarize_autotest_flow,
 )
 from semi_auto_probe.gds_stage_mapper import AffineCoordinateMapper, CalibrationPoint
@@ -80,9 +82,39 @@ class AutoTestTests(unittest.TestCase):
 
         self.assertEqual(
             summarize_autotest_flow(cards),
-            "Measurement flow: Entity Pause -> IV Test -> Capture Photo",
+            "Measurement flow: Entity Pause -> Keithley IV -> Capture Photo",
         )
         self.assertEqual(legacy_measurement_steps_from_flow(cards), ("pause", "photo"))
+
+        steps = measurement_flow_steps_from_cards(cards)
+        self.assertEqual([step.type_id for step in steps], ["wait", "iv", "photo"])
+        self.assertEqual(steps[1].params["resource"], "GPIB0::18::INSTR")
+        self.assertEqual(steps[1].params["output_terminal"], "rear")
+        self.assertEqual(steps[1].params["sweep_mode"], "voltage")
+        self.assertEqual(steps[1].params["output_statistics"], "true")
+        self.assertEqual(steps[1].params["resistance_method"], "linear_fit")
+
+    def test_expanded_iv_card_height_accounts_for_all_params(self) -> None:
+        panel = object.__new__(AutoTestPanel)
+        panel._flow_zoom = 1.0
+        card = create_autotest_flow_card("iv", "card_1", expanded=True)
+
+        self.assertGreaterEqual(panel._flow_card_height_for_card(card), 382)
+
+    def test_discarding_flow_widget_cache_preserves_flow_cards_and_entry_vars(self) -> None:
+        panel = object.__new__(AutoTestPanel)
+        card = create_autotest_flow_card("iv", "card_1")
+        panel.measurement_flow_cards = [card]
+        panel._flow_entry_vars = {("card_1", "resource"): "kept"}
+        panel._flow_card_widgets = {"card_1": (1, object())}
+        panel._flow_card_render_state = {"card_1": "stale"}
+
+        panel._discard_flow_widget_cache(destroy=False)
+
+        self.assertEqual(panel.measurement_flow_cards, [card])
+        self.assertEqual(panel._flow_entry_vars[("card_1", "resource")], "kept")
+        self.assertEqual(panel._flow_card_widgets, {})
+        self.assertEqual(panel._flow_card_render_state, {})
 
 
 if __name__ == "__main__":

@@ -37,6 +37,7 @@ assets/EBL-Mark-Array.gds
 assets/run.ps1
 imgstitch_session/
 imgmatrix_session/
+autotest_session/
 last_autofocus_history*.csv
 tmp_check*
 tmp_output*

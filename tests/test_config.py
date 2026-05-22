@@ -38,12 +38,16 @@ class ProbeConfigTest(unittest.TestCase):
         self.assertEqual(config.cc_speed_percent, 100)
         self.assertEqual(config.fine_speed_percent, 40)
         self.assertEqual(config.safe_speed_percent, 15)
+        self.assertEqual(config.probe_safe_z_margin_um, 100.0)
         self.assertEqual(config.active_motor_speed_profile, MOTOR_SPEED_PROFILE_FAST)
         self.assertEqual(config.motor_speed_percent(), 100)
         self.assertEqual(config.camera_exposure_mode, CAMERA_CONTROL_MODE_AUTO)
         self.assertEqual(config.camera_exposure, 0.0)
         self.assertEqual(config.camera_gain_mode, CAMERA_CONTROL_MODE_AUTO)
         self.assertEqual(config.camera_gain, 0.0)
+        self.assertEqual(config.camera_source, "auto")
+        self.assertEqual(config.objective, 10)
+        self.assertEqual(config.motor_axis_polarity, {"X": 1, "Y": 1, "Z": 1})
         self.assertEqual(
             config.controller_motion_parameters,
             {
@@ -68,6 +72,7 @@ class ProbeConfigTest(unittest.TestCase):
 
     def test_calibration_lookup_is_per_lens_combination(self) -> None:
         config = ProbeConfig()
+        config.objective = 20
         config.eyepiece = 1.5
         config.set_calibration(20, 1.5, 0.42)
         config.set_calibration(10, 1.5, 0.84)
@@ -102,16 +107,19 @@ class ProbeConfigTest(unittest.TestCase):
                 cc_speed_percent=80,
                 fine_speed_percent=35,
                 safe_speed_percent=12,
+                probe_safe_z_margin_um=125.0,
                 active_motor_speed_profile=MOTOR_SPEED_PROFILE_SAFE,
                 controller_motion_parameters={
                     "X": {"minimum_speed": 5, "work_speed": 100, "acceleration": 10},
                     "Y": {"minimum_speed": 6, "work_speed": 90, "acceleration": 11},
                     "Z": {"minimum_speed": 7, "work_speed": 80, "acceleration": 12},
                 },
+                motor_axis_polarity={"X": -1, "Y": 1, "Z": 1},
                 camera_exposure_mode=CAMERA_CONTROL_MODE_MANUAL,
                 camera_exposure=-6.0,
                 camera_gain_mode=CAMERA_CONTROL_MODE_MANUAL,
                 camera_gain=12.5,
+                camera_source="miicam:0",
                 cc_accel_time_s=0.2,
                 layoutbond_fov_width_um=320.0,
                 layoutbond_fov_height_um=240.0,
@@ -129,19 +137,28 @@ class ProbeConfigTest(unittest.TestCase):
             self.assertEqual(loaded.cc_speed_percent, 80)
             self.assertEqual(loaded.fine_speed_percent, 35)
             self.assertEqual(loaded.safe_speed_percent, 12)
+            self.assertAlmostEqual(loaded.probe_safe_z_margin_um, 125.0)
             self.assertEqual(loaded.active_motor_speed_profile, MOTOR_SPEED_PROFILE_SAFE)
             self.assertEqual(loaded.motor_speed_percent(), 12)
             self.assertEqual(loaded.controller_motion_parameters["X"], {"minimum_speed": 5, "work_speed": 100, "acceleration": 10})
             self.assertEqual(loaded.controller_motion_parameters["Y"], {"minimum_speed": 6, "work_speed": 90, "acceleration": 11})
             self.assertEqual(loaded.controller_motion_parameters["Z"], {"minimum_speed": 7, "work_speed": 80, "acceleration": 12})
+            self.assertEqual(loaded.motor_axis_polarity, {"X": -1, "Y": 1, "Z": 1})
             self.assertEqual(loaded.camera_exposure_mode, CAMERA_CONTROL_MODE_MANUAL)
             self.assertAlmostEqual(loaded.camera_exposure, -6.0)
             self.assertEqual(loaded.camera_gain_mode, CAMERA_CONTROL_MODE_MANUAL)
             self.assertAlmostEqual(loaded.camera_gain, 12.5)
+            self.assertEqual(loaded.camera_source, "miicam:0")
             self.assertAlmostEqual(loaded.cc_accel_time_s, 0.2)
             self.assertAlmostEqual(loaded.layoutbond_fov_width_um, 320.0)
             self.assertAlmostEqual(loaded.layoutbond_fov_height_um, 240.0)
             self.assertAlmostEqual(loaded.current_um_per_px(), 1.25)
+
+    def test_motor_axis_polarity_rejects_invalid_values(self) -> None:
+        with self.assertRaises(ValueError):
+            ProbeConfig(motor_axis_polarity={"X": 0, "Y": 1, "Z": 1}).validate()
+        with self.assertRaises(ValueError):
+            ProbeConfig(motor_axis_polarity={"X": "reverse", "Y": 1, "Z": 1}).validate()
 
     def test_imgstitch_seam_thresholds_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -16,7 +16,7 @@ from fastapi import Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from .camera import UsbCamera
+from .camera import DEFAULT_CAMERA_SOURCE, UsbCamera, camera_source_choices, normalize_camera_source
 from .monitor_feed import publisher_url
 from .protocol import hex_bytes
 from .serial_client import ControllerSerialClient, list_serial_ports
@@ -27,6 +27,7 @@ STATIC_DIR = WEB_DIR / "static"
 ACCESS_TOKEN_ENV = "SEMI_AUTO_PROBE_WEB_TOKEN"
 PID_FILE_ENV = "SEMI_AUTO_PROBE_WEB_PID_FILE"
 DIRECT_CAMERA_INDEX_ENV = "SEMI_AUTO_PROBE_WEB_CAMERA_INDEX"
+DIRECT_CAMERA_SOURCE_ENV = "SEMI_AUTO_PROBE_WEB_CAMERA_SOURCE"
 DIRECT_CAMERA_WIDTH_ENV = "SEMI_AUTO_PROBE_WEB_CAMERA_WIDTH"
 DIRECT_CAMERA_HEIGHT_ENV = "SEMI_AUTO_PROBE_WEB_CAMERA_HEIGHT"
 DIRECT_CAMERA_FPS_ENV = "SEMI_AUTO_PROBE_WEB_DIRECT_CAMERA_FPS"
@@ -63,6 +64,7 @@ class WebProbeService:
         self._serial: ControllerSerialClient | None = None
         self._direct_camera: UsbCamera | None = None
         self._direct_camera_index: int | None = None
+        self._direct_camera_source: str | None = None
         self._selected_camera_source = "auto"
         self._active_camera_streams = 0
         self._metrics_lock = threading.RLock()
@@ -94,7 +96,7 @@ class WebProbeService:
                 serial_port=self._serial.port if self._serial else None,
                 camera_running=(camera_available and self._selected_camera_source in {"auto", "desktop"}) or direct_camera_running,
                 camera_source=active_source,
-                camera_source_label=self._camera_source_label(active_source, self._direct_camera_index),
+                camera_source_label=self._camera_source_label(active_source, self._direct_camera_source, self._direct_camera_index),
                 selected_camera_source=self._selected_camera_source,
                 frame_age_seconds=publisher_status.get("frame_age_seconds") if publisher_status else None,
                 publisher_fps=publisher_status.get("publisher_fps") if active_source == "desktop" and publisher_status else (self._direct_camera_fps() if active_source == "direct" else None),
@@ -227,10 +229,10 @@ class WebProbeService:
             }
 
     def set_camera_source(self, source: str) -> dict[str, object]:
-        parsed_source, index = self._parse_camera_source(source)
+        parsed_source, camera_source, index = self._parse_camera_source(source)
         with self._camera_lock:
-            self._selected_camera_source = parsed_source if index is None else f"direct:{index}"
-            if parsed_source != "direct" or index != self._direct_camera_index:
+            self._selected_camera_source = parsed_source if camera_source is None else ("auto-direct" if source == "auto-direct" else camera_source)
+            if parsed_source != "direct" or camera_source != self._direct_camera_source:
                 self._close_direct_camera()
             return {"selected_camera_source": self._selected_camera_source}
 
@@ -242,8 +244,17 @@ class WebProbeService:
             {"id": "auto", "label": "Auto", "fps": "1/10", "available": True},
             {"id": "desktop", "label": "Microscope feed", "fps": 1, "available": desktop_available},
         ]
+        seen = {item["id"] for item in sources}
+        for source in camera_source_choices(max_opencv_index=max_index):
+            source_id = "auto-direct" if source == DEFAULT_CAMERA_SOURCE else source
+            if source_id in seen:
+                continue
+            sources.append({"id": source_id, "label": self._direct_camera_label(source_id), "fps": self._direct_camera_fps(), "available": True})
+            seen.add(source_id)
         for index in range(max_index + 1):
-            sources.append({"id": f"direct:{index}", "label": self._direct_camera_label(index), "fps": self._direct_camera_fps(), "available": True})
+            source_id = f"direct:{index}"
+            if source_id not in seen:
+                sources.append({"id": source_id, "label": self._direct_camera_label(source_id), "fps": self._direct_camera_fps(), "available": True})
         return {"selected": self._selected_camera_source, "sources": sources}
 
     def mjpeg_frames(self, request: Request, source: str | None = None) -> Iterator[bytes]:
@@ -266,8 +277,8 @@ class WebProbeService:
                         time.sleep(1.0)
                         continue
 
-                direct_index = self._direct_index_for_selected_source(selected)
-                direct_frame = self._read_direct_camera_frame(direct_index)
+                direct_source = self._direct_source_for_selected_source(selected)
+                direct_frame = self._read_direct_camera_frame(direct_source)
                 if direct_frame is not None:
                     yield self._mjpeg_part(direct_frame)
                     time.sleep(1.0 / self._direct_camera_fps())
@@ -291,19 +302,20 @@ class WebProbeService:
             raise HTTPException(status_code=409, detail="Serial port is not connected.")
         return self._serial
 
-    def _read_direct_camera_frame(self, index: int) -> bytes | None:
+    def _read_direct_camera_frame(self, source: str) -> bytes | None:
         with self._camera_lock:
             try:
-                if self._direct_camera and self._direct_camera_index != index:
+                if self._direct_camera and self._direct_camera_source != source:
                     self._close_direct_camera()
                 if not self._direct_camera:
                     self._direct_camera = UsbCamera(
-                        index=index,
+                        source=source,
                         width=int(os.environ.get(DIRECT_CAMERA_WIDTH_ENV, "960")),
                         height=int(os.environ.get(DIRECT_CAMERA_HEIGHT_ENV, "540")),
                     )
                     self._direct_camera.open()
                     self._direct_camera_index = self._direct_camera.index
+                    self._direct_camera_source = source
                 frame = self._direct_camera.read()
                 if frame is None:
                     return None
@@ -323,11 +335,14 @@ class WebProbeService:
             self._direct_camera.close()
         self._direct_camera = None
         self._direct_camera_index = None
+        self._direct_camera_source = None
 
     @staticmethod
-    def _parse_camera_source(source: str) -> tuple[str, int | None]:
+    def _parse_camera_source(source: str) -> tuple[str, str | None, int | None]:
         if source in {"auto", "desktop"}:
-            return source, None
+            return source, None, None
+        if source == "auto-direct":
+            return "direct", DEFAULT_CAMERA_SOURCE, None
         if source.startswith("direct:"):
             try:
                 index = int(source.split(":", 1)[1])
@@ -335,26 +350,47 @@ class WebProbeService:
                 raise HTTPException(status_code=400, detail="Invalid direct camera source.") from exc
             if index < 0 or index > 16:
                 raise HTTPException(status_code=400, detail="Camera index out of range.")
-            return "direct", index
+            return "direct", f"opencv:{index}", index
+        normalized = normalize_camera_source(source)
+        if normalized.startswith(("miicam", "opencv", "toupcam", "dshow", "msmf", "any")):
+            return "direct", normalized, None
         raise HTTPException(status_code=400, detail="Unsupported camera source.")
 
     @staticmethod
-    def _direct_index_for_selected_source(source: str) -> int:
+    def _direct_source_for_selected_source(source: str) -> str:
         if source.startswith("direct:"):
-            return int(source.split(":", 1)[1])
-        return int(os.environ.get(DIRECT_CAMERA_INDEX_ENV, "0"))
+            return f"opencv:{int(source.split(':', 1)[1])}"
+        if source in {"auto", "desktop"}:
+            configured = os.environ.get(DIRECT_CAMERA_SOURCE_ENV) or os.environ.get("SEMI_AUTO_PROBE_CAMERA_SOURCE")
+            if configured:
+                return normalize_camera_source(configured)
+            index = os.environ.get(DIRECT_CAMERA_INDEX_ENV)
+            return f"opencv:{int(index)}" if index else DEFAULT_CAMERA_SOURCE
+        if source == "auto-direct":
+            return DEFAULT_CAMERA_SOURCE
+        return normalize_camera_source(source)
 
     @staticmethod
-    def _camera_source_label(source: str | None, direct_index: int | None) -> str | None:
+    def _camera_source_label(source: str | None, direct_source: str | None, direct_index: int | None) -> str | None:
         if source == "desktop":
             return "Microscope feed"
         if source == "direct":
-            return WebProbeService._direct_camera_label(direct_index) if direct_index is not None else "Direct camera"
+            return WebProbeService._direct_camera_label(direct_source or (f"direct:{direct_index}" if direct_index is not None else "auto-direct"))
         return None
 
     @staticmethod
-    def _direct_camera_label(index: int) -> str:
-        return DIRECT_CAMERA_LABELS.get(index, f"Camera {index}")
+    def _direct_camera_label(source: str) -> str:
+        normalized = normalize_camera_source(source.replace("auto-direct", DEFAULT_CAMERA_SOURCE))
+        if normalized == DEFAULT_CAMERA_SOURCE:
+            return "Auto direct camera"
+        if normalized.startswith("miicam:"):
+            return f"MiiCam SDK {normalized.split(':', 1)[1]}"
+        if normalized.startswith("toupcam:"):
+            return f"ToupCam SDK {normalized.split(':', 1)[1]}"
+        if normalized.startswith("opencv:"):
+            index = int(normalized.split(":", 1)[1])
+            return DIRECT_CAMERA_LABELS.get(index, f"OpenCV camera {index}")
+        return normalized
 
     @staticmethod
     def _direct_camera_fps() -> float:

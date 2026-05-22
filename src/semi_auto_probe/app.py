@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import csv
 import hmac
 import json
 import math
@@ -40,8 +41,8 @@ from .agent import (
     stage_move_axes,
     stage_move_parameter_blockers,
 )
-from .auto_test import AutoTestPanel, AutoTestPoint, AutoTestSettings, generate_autotest_points
-from .camera import CameraSettings, UsbCamera
+from .auto_test import AutoTestFlowStep, AutoTestPanel, AutoTestPoint, AutoTestSettings, generate_autotest_points
+from .camera import CameraSettings, UsbCamera, camera_source_choices, normalize_camera_source
 from .config import (
     AUTOFOCUS_PEAK_MODEL_GAUSSIAN,
     AUTOFOCUS_PEAK_MODEL_LABELS,
@@ -103,6 +104,14 @@ from .img_stitch import (
     serpentine_indices,
     stitch_displacement_diagnostics,
     z_stack_positions,
+)
+from .keithley2450 import (
+    IVSweepConfig,
+    IVSweepSample,
+    IVSweepStatistics,
+    Keithley2450IVRunner,
+    calculate_iv_statistics,
+    iv_sweep_config_from_params,
 )
 from .logging_utils import colorize_hex_frame, configure_logging, print_startup_banner
 from .monitor_feed import publish_camera_frame, request_web_fallback_camera_release, start_frame_publisher
@@ -190,6 +199,166 @@ class ToggleSwitch(tk.Canvas):
         )
 
 
+class IVPlotWindow:
+    def __init__(self, parent: tk.Tk, colors: dict[str, str]) -> None:
+        self.parent = parent
+        self.colors = colors
+        self.samples: list[dict[str, object]] = []
+        self.heatmap_values: dict[tuple[int, int], float] = {}
+        self.heatmap_rows = 1
+        self.heatmap_cols = 1
+        self.heatmap_label = "Resistance (ohm)"
+        self.window = tk.Toplevel(parent)
+        self.window.title("Keithley 2450 IV")
+        self.window.geometry("980x560")
+        self.window.configure(bg=colors["bg"])
+        self.window.protocol("WM_DELETE_WINDOW", self.hide)
+
+        header = ttk.Frame(self.window, style="App.TFrame", padding=(14, 12, 14, 8))
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        self.title_var = tk.StringVar(value="IV sweep")
+        self.status_var = tk.StringVar(value="Waiting")
+        ttk.Label(header, textvariable=self.title_var, style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header, textvariable=self.status_var, style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(3, 0))
+
+        plot_frame = ttk.Frame(self.window, style="Panel.TFrame", padding=8)
+        plot_frame.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        plot_frame.columnconfigure(0, weight=1)
+        plot_frame.rowconfigure(0, weight=1)
+        self.window.columnconfigure(0, weight=1)
+        self.window.rowconfigure(1, weight=1)
+
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.figure import Figure
+
+        self.figure = Figure(figsize=(8.8, 4.2), dpi=100, facecolor=colors["surface"])
+        self.iv_axes = self.figure.add_subplot(121)
+        self.heatmap_axes = self.figure.add_subplot(122)
+        self._style_axes(self.iv_axes)
+        self._style_axes(self.heatmap_axes)
+        self.iv_axes.set_xlabel("Voltage (V)", color=colors["text"])
+        self.iv_axes.set_ylabel("Current (A)", color=colors["text"])
+        self.iv_axes.grid(True, color=colors["border"], alpha=0.45)
+        (self.line,) = self.iv_axes.plot([], [], color=colors["accent"], marker="o", markersize=3, linewidth=1.4)
+        self._draw_empty_heatmap()
+        self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
+        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
+    def _style_axes(self, axes) -> None:
+        axes.set_facecolor(self.colors["surface_2"])
+        axes.tick_params(colors=self.colors["muted"])
+        for spine in axes.spines.values():
+            spine.set_color(self.colors["border"])
+
+    def hide(self) -> None:
+        self.window.withdraw()
+
+    def show(self) -> None:
+        self.window.deiconify()
+        self.window.lift()
+
+    def start(
+        self,
+        point_name: str,
+        config: IVSweepConfig,
+        *,
+        row: int | None = None,
+        col: int | None = None,
+        rows: int | None = None,
+        cols: int | None = None,
+        reset_heatmap: bool = False,
+    ) -> None:
+        self.samples.clear()
+        self.title_var.set(f"IV sweep: {point_name}")
+        self.status_var.set(config.summary())
+        self.line.set_data([], [])
+        self.iv_axes.relim()
+        self.iv_axes.autoscale_view()
+        if rows is not None and cols is not None:
+            self.heatmap_rows = max(1, int(rows))
+            self.heatmap_cols = max(1, int(cols))
+        if reset_heatmap:
+            self.heatmap_values.clear()
+            self.heatmap_label = "Resistance (ohm)"
+        self._draw_heatmap(active=(row, col) if row is not None and col is not None else None)
+        self.show()
+        self.canvas.draw_idle()
+
+    def add_sample(self, sample: dict[str, object]) -> None:
+        self.samples.append(sample)
+        voltages = [float(item["voltage_v"]) for item in self.samples if _finite_number(item.get("voltage_v"))]
+        currents = [float(item["current_a"]) for item in self.samples if _finite_number(item.get("current_a"))]
+        if len(voltages) != len(currents) or not voltages:
+            return
+        self.line.set_data(voltages, currents)
+        self.iv_axes.relim()
+        self.iv_axes.autoscale_view()
+        index = int(sample.get("index", len(self.samples)))
+        total = int(sample.get("total", len(self.samples)))
+        self.status_var.set(f"Point {index}/{total} | V={voltages[-1]:.6g} V | I={currents[-1]:.6g} A")
+        self.canvas.draw_idle()
+
+    def add_statistics(self, row: int, col: int, statistics: dict[str, object]) -> None:
+        value = None
+        label = "Resistance (ohm)"
+        if _finite_number(statistics.get("resistivity_ohm_cm")):
+            value = float(statistics["resistivity_ohm_cm"])
+            label = "Resistivity (ohm cm)"
+        elif _finite_number(statistics.get("resistance_ohm")):
+            value = float(statistics["resistance_ohm"])
+        if value is None:
+            return
+        self.heatmap_label = label
+        self.heatmap_values[(int(row), int(col))] = value
+        self._draw_heatmap()
+        self.canvas.draw_idle()
+
+    def _draw_empty_heatmap(self) -> None:
+        self.heatmap_axes.clear()
+        self._style_axes(self.heatmap_axes)
+        self.heatmap_axes.set_title("Resistance heatmap", color=self.colors["text"])
+        self.heatmap_axes.text(0.5, 0.5, "No IV statistics", ha="center", va="center", color=self.colors["muted"], transform=self.heatmap_axes.transAxes)
+        self.heatmap_axes.set_xticks([])
+        self.heatmap_axes.set_yticks([])
+
+    def _draw_heatmap(self, active: tuple[int, int] | None = None) -> None:
+        if not self.heatmap_values:
+            self._draw_empty_heatmap()
+            return
+        matrix = [[math.nan for _col in range(self.heatmap_cols)] for _row in range(self.heatmap_rows)]
+        for (row, col), value in self.heatmap_values.items():
+            if 0 <= row < self.heatmap_rows and 0 <= col < self.heatmap_cols:
+                matrix[row][col] = value
+        self.heatmap_axes.clear()
+        self._style_axes(self.heatmap_axes)
+        self.heatmap_axes.set_title(self.heatmap_label, color=self.colors["text"])
+        image = self.heatmap_axes.imshow(matrix, cmap="viridis", interpolation="nearest")
+        image.cmap.set_bad(color=self.colors["surface_3"])
+        self.heatmap_axes.set_xticks(range(self.heatmap_cols))
+        self.heatmap_axes.set_yticks(range(self.heatmap_rows))
+        self.heatmap_axes.set_xlabel("Column", color=self.colors["text"])
+        self.heatmap_axes.set_ylabel("Row", color=self.colors["text"])
+        for (row, col), value in self.heatmap_values.items():
+            if 0 <= row < self.heatmap_rows and 0 <= col < self.heatmap_cols:
+                self.heatmap_axes.text(col, row, f"{value:.3g}", ha="center", va="center", color="#f8fafc", fontsize=8)
+        if active is not None:
+            row, col = active
+            if 0 <= row < self.heatmap_rows and 0 <= col < self.heatmap_cols:
+                self.heatmap_axes.plot(col, row, marker="s", markersize=18, markerfacecolor="none", markeredgecolor="#facc15", markeredgewidth=1.5)
+
+    def finish(self, message: str) -> None:
+        self.status_var.set(message)
+        self.show()
+
+
+def _finite_number(value: object) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
 class ProbeApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -210,6 +379,7 @@ class ProbeApp(tk.Tk):
         self.gds_stage_mapper_panel: GDSStageMapperPanel | None = None
         self.imgmatrix_panel: ImgMatrixPanel | None = None
         self.autotest_panel: AutoTestPanel | None = None
+        self.iv_plot_window: IVPlotWindow | None = None
         self.edge_trace_panel: EdgeTracePanel | None = None
         self.agent_panel: AgentPanel | None = None
         self.agent_function_spec_path = Path.cwd() / "docs" / "agent-function-spec.md"
@@ -270,7 +440,7 @@ class ProbeApp(tk.Tk):
         self.agent_planner = self._build_agent_planner()
 
         self.port_var = tk.StringVar(value=DEFAULT_SERIAL_PORT)
-        self.camera_index_var = tk.StringVar(value="0")
+        self.camera_index_var = tk.StringVar(value=normalize_camera_source(os.environ.get("SEMI_AUTO_PROBE_CAMERA_SOURCE") or self.probe_config.camera_source))
         self.status_var = tk.StringVar(value="Ready")
         self.rx_var = tk.StringVar(value="-")
         self.tx_var = tk.StringVar(value="-")
@@ -355,6 +525,8 @@ class ProbeApp(tk.Tk):
         }
         self.motion_mode_var = tk.StringVar(value="Relative")
         self.main_focusmap_plane_var = tk.BooleanVar(value=False)
+        self.probe_down_var = tk.BooleanVar(value=False)
+        self.probe_down_state_var = tk.StringVar(value="UP")
         self.keyboard_move_enabled_var = tk.BooleanVar(value=True)
         self.realtime_enabled = False
         self.realtime_button_var = tk.StringVar(value="Continue")
@@ -435,6 +607,7 @@ class ProbeApp(tk.Tk):
         self.cc_speed_percent_var = tk.StringVar(value=str(self.probe_config.cc_speed_percent))
         self.fine_speed_percent_var = tk.StringVar(value=str(self.probe_config.fine_speed_percent))
         self.safe_speed_percent_var = tk.StringVar(value=str(self.probe_config.safe_speed_percent))
+        self.probe_safe_z_margin_um_var = tk.StringVar(value=f"{self.probe_config.probe_safe_z_margin_um:g}")
         self.motor_speed_profile_var = tk.StringVar(value=self._motor_speed_profile_label(self.probe_config.active_motor_speed_profile))
         self.controller_motion_parameter_vars = {
             axis: {
@@ -572,6 +745,7 @@ class ProbeApp(tk.Tk):
             bordercolor=[("focus", self.colors["border_focus"]), ("!disabled", self.colors["border"])],
             arrowcolor=[("active", self.colors["accent"]), ("focus", self.colors["accent"]), ("!disabled", self.colors["muted"])],
         )
+        style.configure("Error.TCombobox", fieldbackground="#3f1018", background="#4c0519", foreground="#fecdd3", bordercolor="#be123c", lightcolor="#be123c", darkcolor="#be123c", arrowcolor="#fecdd3", relief="flat", borderwidth=1, padding=(10, 7))
         style.configure("TSpinbox", fieldbackground=self.colors["input"], background=self.colors["surface_3"], foreground=self.colors["text"], bordercolor=self.colors["border"], lightcolor=self.colors["border"], darkcolor=self.colors["border"], arrowcolor=self.colors["muted"], relief="flat", borderwidth=1, padding=(10, 7), arrowsize=14)
         style.map(
             "TSpinbox",
@@ -813,15 +987,26 @@ class ProbeApp(tk.Tk):
         ttk.Label(toolbar, text="SERIAL", style="Muted.TLabel").grid(row=0, column=0, padx=(0, 6))
         self.port_combo = ttk.Combobox(toolbar, textvariable=self.port_var, width=10, state="readonly")
         self.port_combo.grid(row=0, column=1, padx=(0, 6), ipady=1)
-        ttk.Button(toolbar, text="Refresh", style="Ghost.TButton", command=self.refresh_ports).grid(row=0, column=2, padx=(0, 6))
-        ttk.Button(toolbar, text="Connect", style="Accent.TButton", command=self.connect_and_test_serial).grid(row=0, column=3, padx=(0, 6))
-        ttk.Button(toolbar, text="Test", command=self.run_comm_test).grid(row=0, column=4, padx=(0, 12))
+        ttk.Label(toolbar, text="PROBE", style="Muted.TLabel").grid(row=0, column=2, padx=(4, 5))
+        ToggleSwitch(
+            toolbar,
+            self.probe_down_var,
+            self.colors,
+            command=self._on_probe_down_toggle,
+            background=self.colors["surface"],
+            width=42,
+            height=22,
+        ).grid(row=0, column=3, padx=(0, 5))
+        ttk.Label(toolbar, textvariable=self.probe_down_state_var, style="Muted.TLabel").grid(row=0, column=4, padx=(0, 12))
+        ttk.Button(toolbar, text="Refresh", style="Ghost.TButton", command=self.refresh_ports).grid(row=0, column=5, padx=(0, 6))
+        ttk.Button(toolbar, text="Connect", style="Accent.TButton", command=self.connect_and_test_serial).grid(row=0, column=6, padx=(0, 6))
+        ttk.Button(toolbar, text="Test", command=self.run_comm_test).grid(row=0, column=7, padx=(0, 12))
 
-        ttk.Label(toolbar, text="CAM", style="Muted.TLabel").grid(row=0, column=5, padx=(0, 6))
-        self.camera_index_spinbox = self._numeric_spinbox(toolbar, self.camera_index_var, from_value=0, to_value=8, width=3)
-        self.camera_index_spinbox.grid(row=0, column=6, padx=(0, 6), ipady=1)
-        ttk.Button(toolbar, text="Restart", command=self.restart_camera).grid(row=0, column=7, padx=(0, 10))
-        ttk.Button(toolbar, text="EMERGENCY STOP", style="Danger.TButton", command=self.emergency_stop).grid(row=0, column=8)
+        ttk.Label(toolbar, text="CAM", style="Muted.TLabel").grid(row=0, column=8, padx=(0, 6))
+        self.camera_index_spinbox = ttk.Combobox(toolbar, textvariable=self.camera_index_var, values=camera_source_choices(), width=15)
+        self.camera_index_spinbox.grid(row=0, column=9, padx=(0, 6), ipady=1)
+        ttk.Button(toolbar, text="Restart", command=self.restart_camera).grid(row=0, column=10, padx=(0, 10))
+        ttk.Button(toolbar, text="EMERGENCY STOP", style="Danger.TButton", command=self.emergency_stop).grid(row=0, column=11)
 
         content = ttk.Frame(self, style="App.TFrame")
         content.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 14))
@@ -1623,7 +1808,7 @@ class ProbeApp(tk.Tk):
         for axis_name, controller_axis in (("X", Axis.X), ("Y", Axis.Y)):
             _stage_um, pulses, reverse = move[axis_name]
             signed_pulses[axis_name] = -pulses if reverse else pulses
-            axis_params[controller_axis] = self._cc_axis_param(reverse, pulses)
+            axis_params[controller_axis] = self._cc_axis_param_for_logical_delta(axis_name, signed_pulses[axis_name])
             if pulses:
                 has_motion = True
                 target_positions[axis_name] = self.current_position_values[axis_name] + signed_pulses[axis_name]
@@ -1661,6 +1846,9 @@ class ProbeApp(tk.Tk):
     def _move_vision_center_worker(self, axis_params: dict[Axis, tuple[bool, int, int, int]], expected_targets: dict[str, int]) -> None:
         assert self.serial_client is not None
         try:
+            guarded_entries = self._try_probe_guarded_expected_move(expected_targets, source="vision")
+            if guarded_entries is not None:
+                return
             command, completed = self.serial_client.move_multi_axis_relative_and_wait(axis_params, timeout=self._cc_move_timeout(axis_params))
             self.result_queue.put(("motor_command", "XY", "cc image center", command, "vision"))
             self.result_queue.put(("cc_done", completed, "vision"))
@@ -1787,12 +1975,15 @@ class ProbeApp(tk.Tk):
                 self.result_queue.put(("gds_mapper_status", "Stage is already at the selected GDS target."))
                 self.result_queue.put(("read_positions", entries, "gds_mapper"))
                 return
+            guarded_entries = self._try_probe_guarded_expected_move(plan.target_pulses, source="gds_mapper")
+            if guarded_entries is not None:
+                return
 
             axis_params = {}
             for axis_name, delta in plan.deltas.items():
                 controller_axis = self._controller_axis(axis_name)
                 if controller_axis is not None:
-                    axis_params[controller_axis] = self._cc_axis_param(delta < 0, abs(delta))
+                    axis_params[controller_axis] = self._cc_axis_param_for_logical_delta(axis_name, delta)
             command, completed = self.serial_client.move_multi_axis_relative_and_wait(axis_params, timeout=self._cc_move_timeout(axis_params))
             self.result_queue.put(("motor_command", "".join(sorted(plan.deltas)), "cc LayoutBond", command, "gds_mapper"))
             self.result_queue.put(("cc_done", completed, "gds_mapper"))
@@ -2732,6 +2923,8 @@ class ProbeApp(tk.Tk):
         ):
             ttk.Label(speed_panel, text=label, style="Muted.TLabel").grid(row=row_index, column=0, sticky="w", pady=2)
             self._numeric_entry(speed_panel, variable, minimum=0, maximum=100, width=7).grid(row=row_index, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+        ttk.Label(speed_panel, text="Probe safe Z (um)", style="Muted.TLabel").grid(row=5, column=0, sticky="w", pady=(8, 2))
+        self._numeric_entry(speed_panel, self.probe_safe_z_margin_um_var, kind="float", minimum=0, maximum=1_000_000, width=7).grid(row=5, column=1, sticky="ew", padx=(8, 0), pady=(8, 2), ipady=5)
 
         d5_panel = ttk.Frame(motion_panel, style="Panel.TFrame")
         d5_panel.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(22, 0))
@@ -3061,6 +3254,33 @@ class ProbeApp(tk.Tk):
 
     def _motion_speed_percent(self, profile: str | None = None) -> int:
         return self.probe_config.motor_speed_percent(profile)
+
+    def _axis_polarity(self, axis: str | Axis) -> int:
+        axis_name = axis.name if isinstance(axis, Axis) else str(axis).upper()
+        polarity_map = getattr(self.probe_config, "motor_axis_polarity", {}) or {}
+        try:
+            polarity = int(polarity_map.get(axis_name, 1))
+        except (TypeError, ValueError):
+            polarity = 1
+        return -1 if polarity < 0 else 1
+
+    def _logical_position_from_controller(self, axis: str | Axis, controller_position: int) -> int:
+        return int(controller_position) * self._axis_polarity(axis)
+
+    def _controller_position_from_logical(self, axis: str | Axis, logical_position: int) -> int:
+        return int(logical_position) * self._axis_polarity(axis)
+
+    def _controller_delta_from_logical_delta(self, axis: str | Axis, logical_delta: int) -> int:
+        return int(logical_delta) * self._axis_polarity(axis)
+
+    def _cc_axis_param_for_logical_delta(self, axis: str | Axis, logical_delta: int, speed_profile: str | None = None) -> tuple[bool, int, int, int]:
+        controller_delta = self._controller_delta_from_logical_delta(axis, logical_delta)
+        return self._cc_axis_param(controller_delta < 0, abs(controller_delta), speed_profile)
+
+    def _relative_move_args_for_logical_step(self, axis: str | Axis, reverse: bool, pulses: int) -> tuple[bool, int]:
+        logical_delta = -int(pulses) if reverse else int(pulses)
+        controller_delta = self._controller_delta_from_logical_delta(axis, logical_delta)
+        return controller_delta < 0, abs(controller_delta)
 
     def _on_motor_speed_profile_selected(self, _event: tk.Event | None = None) -> None:
         profile = self._motor_speed_profile_from_label(self.motor_speed_profile_var.get())
@@ -3394,6 +3614,7 @@ class ProbeApp(tk.Tk):
                 cc_speed_percent=int(self.cc_speed_percent_var.get()),
                 fine_speed_percent=int(self.fine_speed_percent_var.get()),
                 safe_speed_percent=int(self.safe_speed_percent_var.get()),
+                probe_safe_z_margin_um=float(self.probe_safe_z_margin_um_var.get()),
                 active_motor_speed_profile=self._motor_speed_profile_from_label(self.motor_speed_profile_var.get()),
                 controller_motion_parameters={
                     axis: {
@@ -3406,6 +3627,7 @@ class ProbeApp(tk.Tk):
                 camera_exposure=float(self.camera_exposure_var.get() or 0.0),
                 camera_gain_mode=self._camera_control_mode_from_label(self.camera_gain_mode_var.get()),
                 camera_gain=float(self.camera_gain_var.get() or 0.0),
+                camera_source=normalize_camera_source(self.camera_index_var.get()),
                 cc_accel_time_s=float(self.cc_accel_time_var.get()),
                 autofocus_settle_ms=int(self.autofocus_settle_ms_var.get()),
                 autofocus_sample_count=int(self.autofocus_sample_count_var.get()),
@@ -3481,6 +3703,7 @@ class ProbeApp(tk.Tk):
         self.cc_speed_percent_var.set(str(self.probe_config.cc_speed_percent))
         self.fine_speed_percent_var.set(str(self.probe_config.fine_speed_percent))
         self.safe_speed_percent_var.set(str(self.probe_config.safe_speed_percent))
+        self.probe_safe_z_margin_um_var.set(f"{self.probe_config.probe_safe_z_margin_um:g}")
         self.motor_speed_profile_var.set(self._motor_speed_profile_label(self.probe_config.active_motor_speed_profile))
         for axis in JOG_STEP_AXES:
             for field_name in ("minimum_speed", "work_speed", "acceleration"):
@@ -3489,6 +3712,7 @@ class ProbeApp(tk.Tk):
         self.camera_exposure_var.set(f"{self.probe_config.camera_exposure:g}")
         self.camera_gain_mode_var.set(self._camera_control_mode_label(self.probe_config.camera_gain_mode))
         self.camera_gain_var.set(f"{self.probe_config.camera_gain:g}")
+        self.camera_index_var.set(normalize_camera_source(self.probe_config.camera_source))
         self.cc_accel_time_var.set(f"{self.probe_config.cc_accel_time_s:g}")
         self.autofocus_settle_ms_var.set(str(self.probe_config.autofocus_settle_ms))
         self.autofocus_sample_count_var.set(str(self.probe_config.autofocus_sample_count))
@@ -3550,6 +3774,7 @@ class ProbeApp(tk.Tk):
             ),
             (
                 "Camera: "
+                f"source {self.probe_config.camera_source}, "
                 f"exposure {self._camera_control_mode_label(self.probe_config.camera_exposure_mode)} "
                 f"{self.probe_config.camera_exposure:g}, "
                 f"gain {self._camera_control_mode_label(self.probe_config.camera_gain_mode)} "
@@ -3560,6 +3785,7 @@ class ProbeApp(tk.Tk):
             f"AF integration: {self.probe_config.autofocus_sample_count} frame(s)",
             f"AF peak model: {self._autofocus_peak_model_label(self.probe_config.autofocus_peak_model)}",
             f"Stitch settle: {self.probe_config.imgstitch_settle_ms} ms",
+            f"Probe safe Z margin: {self.probe_config.probe_safe_z_margin_um:g} um",
             f"LayoutBond FOV: {self.probe_config.layoutbond_fov_width_um:g} x {self.probe_config.layoutbond_fov_height_um:g} um",
             f"Keyboard: {self._keyboard_motion_scheme_label(self.probe_config.keyboard_motion_scheme)}",
             "Jog levels: "
@@ -3658,10 +3884,11 @@ class ProbeApp(tk.Tk):
 
     def _update_axis_position(self, position: AxisPosition) -> None:
         axis_name = position.axis_name
+        logical_position = self._logical_position_from_controller(position.axis, position.position)
         if axis_name in self.position_vars:
-            self.current_position_values[axis_name] = position.position
+            self.current_position_values[axis_name] = logical_position
             if axis_name == "Z":
-                self.autofocus_z_var.set(str(position.position))
+                self.autofocus_z_var.set(str(logical_position))
                 if hasattr(self, "autofocus_z_label"):
                     self.autofocus_z_label.configure(fg=self.colors["accent"])
             if not self._axis_is_actively_editing(axis_name):
@@ -3670,7 +3897,7 @@ class ProbeApp(tk.Tk):
                 if axis_name in self.position_inputs:
                     self.position_inputs[axis_name].configure(state="normal")
                     self.position_inputs[axis_name].configure(fg=self.colors["accent"])
-                self.position_vars[axis_name].set(str(position.position))
+                self.position_vars[axis_name].set(str(logical_position))
                 if axis_name in self.position_inputs:
                     self.position_inputs[axis_name].configure(state="readonly", readonlybackground=self.colors["surface_2"])
         if self.main_focusmap_plane_var.get() and axis_name in {"X", "Y", "Z"}:
@@ -4047,13 +4274,16 @@ class ProbeApp(tk.Tk):
     def _go_xyz_zero_worker(self, axes: tuple[str, ...], expected_targets: dict[str, int]) -> None:
         assert self.serial_client is not None
         try:
+            guarded_entries = self._try_probe_guarded_expected_move(expected_targets, source="go_zero")
+            if guarded_entries is not None:
+                return
             axis_params: dict[Axis, tuple[bool, int, int, int]] = {}
             for axis_name in axes:
                 controller_axis = self._controller_axis(axis_name)
                 if controller_axis is None:
                     continue
                 delta = -self.current_position_values[axis_name]
-                axis_params[controller_axis] = self._cc_axis_param(delta < 0, abs(delta))
+                axis_params[controller_axis] = self._cc_axis_param_for_logical_delta(axis_name, delta)
             if not any(params[1] for params in axis_params.values()):
                 raise ValueError("Go Zero requires at least one non-zero axis position.")
 
@@ -4671,7 +4901,7 @@ class ProbeApp(tk.Tk):
     def _z_from_position_entries(self, entries: list[tuple[bytes, bytes, AxisPosition]]) -> int:
         for _command, _response, position in entries:
             if position.axis == Axis.Z:
-                return position.position
+                return self._logical_position_from_controller(Axis.Z, position.position)
         return self.current_position_values["Z"]
 
     def _autofocus_move_to_z(self, target_z: int, current_z: int, metric: str, stage: str = "sample", source: str = "autofocus") -> tuple[float, int]:
@@ -5904,6 +6134,16 @@ class ProbeApp(tk.Tk):
         self.imgstitch_status_var.set(message)
         self.status_var.set(message)
 
+    def _on_probe_down_toggle(self) -> None:
+        if self.probe_down_var.get():
+            self.probe_down_state_var.set("DOWN")
+            self.status_var.set(f"Probe-down guard enabled. XY moves use {self.probe_config.probe_safe_z_margin_um:g} um safe Z clearance.")
+            logger.info("Probe-down guard enabled.")
+        else:
+            self.probe_down_state_var.set("UP")
+            self.status_var.set("Probe-down guard disabled.")
+            logger.info("Probe-down guard disabled.")
+
     def _disable_focusmap_plane_z_controls_if_unavailable(self) -> None:
         if get_sample_plane_model() is not None:
             return
@@ -5974,7 +6214,10 @@ class ProbeApp(tk.Tk):
         assert self.serial_client is not None
         try:
             entries = self.serial_client.read_stable_xyz_positions()
-            positions = {position.axis_name: position.position for _command, _response, position in entries}
+            positions = {
+                position.axis_name: self._logical_position_from_controller(position.axis, position.position)
+                for _command, _response, position in entries
+            }
             self.result_queue.put(("read_positions", entries, "focusmap"))
 
             x_position = positions.get("X", self.current_position_values["X"])
@@ -6605,13 +6848,21 @@ class ProbeApp(tk.Tk):
             deltas = ", ".join(f"d{axis}={delta}" for axis, delta in plan.deltas.items() if delta)
             targets = ", ".join(f"{axis}={plan.target_pulses[axis]}" for axis in sorted(plan.target_pulses))
             self.result_queue.put(("edge_trace_status", f"{move_label}: {deltas} pulse(s), target {targets}."))
+        if self._probe_down_guard_enabled() and any(axis in plan.deltas and plan.deltas[axis] for axis in ("X", "Y")):
+            return self._move_absolute_stage(
+                plan.target_pulses["X"],
+                plan.target_pulses["Y"],
+                plan.target_pulses["Z"],
+                source="edge_trace",
+                expected_targets=plan.target_pulses,
+            )
         axis_params = {}
         for axis_name, delta in plan.deltas.items():
             if delta == 0:
                 continue
             controller_axis = self._controller_axis(axis_name)
             if controller_axis is not None:
-                axis_params[controller_axis] = self._cc_axis_param(delta < 0, abs(delta), speed_profile)
+                axis_params[controller_axis] = self._cc_axis_param_for_logical_delta(axis_name, delta, speed_profile)
         if not axis_params:
             return entries
         timeout = self._cc_move_timeout(axis_params)
@@ -6646,7 +6897,10 @@ class ProbeApp(tk.Tk):
             if self.edge_trace_stop_event.is_set():
                 return last_entries or self.serial_client.read_xyz_positions()
             last_entries = self.serial_client.read_xyz_positions()
-            last_positions = {position.axis_name: position.position for _command, _response, position in last_entries}
+            last_positions = {
+                position.axis_name: self._logical_position_from_controller(position.axis, position.position)
+                for _command, _response, position in last_entries
+            }
             last_running = {position.axis_name for _command, _response, position in last_entries if position.axis_name in axes and position.is_running}
             if not last_running and all(abs(last_positions.get(axis, 10**18) - int(target_pulses[axis])) <= tolerance_pulses for axis in axes):
                 return last_entries
@@ -6693,7 +6947,7 @@ class ProbeApp(tk.Tk):
                     self.autotest_panel.set_status("No camera frame available for AutoTest photo.")
                 return
         try:
-            session_dir = self._prepare_autotest_session_dir() if "photo" in normalized_settings.measurement_steps else None
+            session_dir = self._prepare_autotest_session_dir() if self._autotest_requires_session_dir(normalized_settings) else None
         except Exception as exc:
             if self.autotest_panel is not None:
                 self.autotest_panel.set_status(f"AutoTest session setup failed: {exc}")
@@ -6721,6 +6975,11 @@ class ProbeApp(tk.Tk):
         )
         self.autotest_thread.start()
 
+    @staticmethod
+    def _autotest_requires_session_dir(settings: AutoTestSettings) -> bool:
+        flow_types = {step.type_id for step in settings.measurement_flow}
+        return "photo" in settings.measurement_steps or "photo" in flow_types or "iv" in flow_types
+
     def stop_autotest(self) -> None:
         self.autotest_stop_event.set()
         if self.autotest_panel is not None:
@@ -6737,6 +6996,7 @@ class ProbeApp(tk.Tk):
             session_dir = self.autotest_session_root / f"{time.strftime('%Y%m%d_%H%M%S')}_{suffix:02d}"
             suffix += 1
         (session_dir / "images").mkdir(parents=True, exist_ok=False)
+        (session_dir / "iv").mkdir(parents=True, exist_ok=True)
         return session_dir
 
     def _autotest_worker(self, settings: AutoTestSettings, points: tuple[AutoTestPoint, ...], session_dir: Path | None) -> None:
@@ -6792,8 +7052,10 @@ class ProbeApp(tk.Tk):
                 if self.autotest_stop_event.is_set():
                     break
 
-                self._execute_autotest_measurement_steps(point, normalized_settings.measurement_steps, session_dir, cv2)
-                measure_text = self._autotest_measurement_summary(normalized_settings.measurement_steps)
+                self._execute_autotest_measurement_flow(point, normalized_settings, session_dir, cv2)
+                if self.autotest_stop_event.is_set():
+                    break
+                measure_text = self._autotest_measurement_summary(normalized_settings)
                 self.result_queue.put(("autotest_progress", index, total, f"{measure_text} at {point.name}", point.row, point.col, "done"))
             if not self.autotest_stop_event.is_set():
                 self.result_queue.put(("autotest_done", len(points)))
@@ -6835,11 +7097,50 @@ class ProbeApp(tk.Tk):
         return entries
 
     @staticmethod
-    def _autotest_measurement_summary(steps: tuple[str, ...]) -> str:
-        if not steps:
+    def _autotest_measurement_summary(settings: AutoTestSettings) -> str:
+        if settings.measurement_flow:
+            labels = {
+                "wait": "Pause",
+                "photo": "Photo",
+                "iv": "IV",
+                "transfer": "Transfer",
+                "it": "IT",
+                "light_control": "Light",
+                "light_pulse": "Light pulse",
+                "wavelength": "Wavelength",
+            }
+            return "Measure " + " -> ".join(labels.get(step.type_id, step.type_id) for step in settings.measurement_flow)
+        if not settings.measurement_steps:
             return "Measurement placeholder"
         labels = {"pause": "Pause", "photo": "Photo"}
-        return "Measure " + " -> ".join(labels.get(step, step) for step in steps)
+        return "Measure " + " -> ".join(labels.get(step, step) for step in settings.measurement_steps)
+
+    def _execute_autotest_measurement_flow(self, point: AutoTestPoint, settings: AutoTestSettings, session_dir: Path | None, cv2_module) -> None:
+        if settings.measurement_flow:
+            for step in settings.measurement_flow:
+                if self.autotest_stop_event.is_set():
+                    return
+                self._execute_autotest_flow_step(point, settings, step, session_dir, cv2_module)
+            return
+        self._execute_autotest_measurement_steps(point, settings.measurement_steps, session_dir, cv2_module)
+
+    def _execute_autotest_flow_step(self, point: AutoTestPoint, settings: AutoTestSettings, step: AutoTestFlowStep, session_dir: Path | None, cv2_module) -> None:
+        params = dict(step.params)
+        if step.type_id == "wait":
+            duration = max(0.0, float(params.get("duration_s", "0")))
+            reason = params.get("reason", "Settle")
+            self.result_queue.put(("autotest_status", f"Pause {duration:g}s at {point.name}: {reason}"))
+            if duration > 0:
+                self.autotest_stop_event.wait(duration)
+            return
+        if step.type_id == "photo":
+            self._capture_autotest_photo(point, session_dir, cv2_module)
+            return
+        if step.type_id == "iv":
+            config = iv_sweep_config_from_params(params)
+            self._run_autotest_iv_sweep(point, settings, config, session_dir)
+            return
+        self.result_queue.put(("autotest_status", f"{step.type_id} step placeholder at {point.name}."))
 
     def _execute_autotest_measurement_steps(self, point: AutoTestPoint, steps: tuple[str, ...], session_dir: Path | None, cv2_module) -> None:
         for step in steps:
@@ -6848,12 +7149,79 @@ class ProbeApp(tk.Tk):
             if step == "pause":
                 self.result_queue.put(("autotest_status", f"Pause step placeholder at {point.name}."))
             elif step == "photo":
-                if session_dir is None:
-                    raise RuntimeError("AutoTest photo session directory is unavailable.")
-                image = self._capture_stitch_frame(stop_event=self.autotest_stop_event)
-                output_path = session_dir / "images" / f"{self._safe_autotest_name(point.name)}.png"
-                cv2_module.imwrite(str(output_path), image)
-                self.result_queue.put(("autotest_status", f"Photo saved for {point.name}: {output_path.name}"))
+                self._capture_autotest_photo(point, session_dir, cv2_module)
+
+    def _capture_autotest_photo(self, point: AutoTestPoint, session_dir: Path | None, cv2_module) -> None:
+        if session_dir is None:
+            raise RuntimeError("AutoTest photo session directory is unavailable.")
+        image = self._capture_stitch_frame(stop_event=self.autotest_stop_event)
+        output_path = session_dir / "images" / f"{self._safe_autotest_name(point.name)}.png"
+        cv2_module.imwrite(str(output_path), image)
+        self.result_queue.put(("autotest_status", f"Photo saved for {point.name}: {output_path.name}"))
+
+    def _run_autotest_iv_sweep(self, point: AutoTestPoint, settings: AutoTestSettings, config: IVSweepConfig, session_dir: Path | None) -> None:
+        self.result_queue.put(("iv_started", point.name, config, point.row, point.col, settings.rows, settings.cols, point.order == 1))
+        self.result_queue.put(("autotest_status", f"IV started at {point.name}: {config.summary()}"))
+        runner = Keithley2450IVRunner()
+
+        def handle_sample(sample: IVSweepSample) -> None:
+            payload = sample.to_dict()
+            payload["point_name"] = point.name
+            self.result_queue.put(("iv_sample", point.name, payload))
+
+        samples = runner.run_sweep(
+            config,
+            stop_requested=self.autotest_stop_event.is_set,
+            on_sample=handle_sample,
+        )
+        statistics = calculate_iv_statistics(samples, config)
+        output_path = None
+        if session_dir is not None:
+            output_path = session_dir / "iv" / f"{self._safe_autotest_name(point.name)}_iv.csv"
+            self._write_iv_samples_csv(output_path, point, config, samples, statistics)
+        self.result_queue.put(("iv_done", point.name, len(samples), output_path, statistics.to_dict(), point.row, point.col, settings.rows, settings.cols))
+
+    @staticmethod
+    def _write_iv_samples_csv(output_path: Path, point: AutoTestPoint, config: IVSweepConfig, samples: list[IVSweepSample], statistics: IVSweepStatistics) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(["point", point.name])
+            writer.writerow(["resource", config.resource_name])
+            writer.writerow(["output_terminal", config.output_terminal])
+            writer.writerow(["sweep_mode", config.sweep_mode])
+            writer.writerow(["start", config.start])
+            writer.writerow(["stop", config.stop])
+            writer.writerow(["step", config.step])
+            writer.writerow(["bidirectional", config.bidirectional])
+            writer.writerow(["voltage_limit_v", config.voltage_limit_v])
+            writer.writerow(["current_limit_a", config.current_limit_a])
+            writer.writerow(["output_statistics", config.output_statistics])
+            writer.writerow(["resistance_method", config.resistance_method])
+            writer.writerow(["device_length_um", config.device_length_um])
+            writer.writerow(["device_width_um", config.device_width_um])
+            writer.writerow(["film_thickness_nm", config.film_thickness_nm])
+            writer.writerow([])
+            writer.writerow(["statistics"])
+            writer.writerow(["sample_count", statistics.sample_count])
+            writer.writerow(["resistance_ohm", "" if statistics.resistance_ohm is None else f"{statistics.resistance_ohm:.12g}"])
+            writer.writerow(["sheet_resistance_ohm_sq", "" if statistics.sheet_resistance_ohm_sq is None else f"{statistics.sheet_resistance_ohm_sq:.12g}"])
+            writer.writerow(["resistivity_ohm_cm", "" if statistics.resistivity_ohm_cm is None else f"{statistics.resistivity_ohm_cm:.12g}"])
+            writer.writerow([])
+            writer.writerow(["index", "total", "elapsed_s", "source_value", "voltage_v", "current_a", "resistance_ohm", "raw"])
+            for sample in samples:
+                writer.writerow(
+                    [
+                        sample.index,
+                        sample.total,
+                        f"{sample.elapsed_s:.9g}",
+                        f"{sample.source_value:.12g}",
+                        f"{sample.voltage_v:.12g}",
+                        f"{sample.current_a:.12g}",
+                        "" if sample.resistance_ohm is None else f"{sample.resistance_ohm:.12g}",
+                        sample.raw,
+                    ]
+                )
 
     @staticmethod
     def _safe_autotest_name(value: str) -> str:
@@ -7445,7 +7813,109 @@ class ProbeApp(tk.Tk):
             return True
         return False
 
-    def _move_absolute_stage(self, x_value: int, y_value: int, z_value: int, source: str = "imgstitch"):
+    def _probe_down_guard_enabled(self) -> bool:
+        variable = self.__dict__.get("probe_down_var")
+        try:
+            return bool(variable.get()) if variable is not None else False
+        except Exception:
+            return False
+
+    def _probe_safe_z_margin_pulses(self) -> int:
+        margin_um = max(0.0, float(getattr(self.probe_config, "probe_safe_z_margin_um", 100.0)))
+        return int(round(margin_um / self.probe_config.um_per_pulse("Z")))
+
+    def _probe_contact_z_at_xy(self, x_value: int, y_value: int, fallback_z: int) -> int:
+        focus_z = self._focusmap_z_target_at_xy(x_value, y_value) if get_sample_plane_model() is not None else None
+        return int(focus_z) if focus_z is not None else int(fallback_z)
+
+    def _read_logical_xyz_from_entries(self, entries: list[tuple[bytes, bytes, AxisPosition]]) -> dict[str, int]:
+        return {
+            "X": self._axis_from_position_entries(entries, Axis.X),
+            "Y": self._axis_from_position_entries(entries, Axis.Y),
+            "Z": self._axis_from_position_entries(entries, Axis.Z),
+        }
+
+    def _read_positions_event(self, entries: list[tuple[bytes, bytes, AxisPosition]], source: str, expected_targets: dict[str, int] | None = None) -> None:
+        if expected_targets is None:
+            self.result_queue.put(("read_positions", entries, source))
+        else:
+            self.result_queue.put(("read_positions", entries, source, expected_targets))
+
+    def _move_absolute_stage(
+        self,
+        x_value: int,
+        y_value: int,
+        z_value: int,
+        source: str = "imgstitch",
+        expected_targets: dict[str, int] | None = None,
+    ):
+        if self._probe_down_guard_enabled():
+            return self._move_absolute_stage_with_probe_guard(
+                int(x_value),
+                int(y_value),
+                int(z_value),
+                source=source,
+                expected_targets=expected_targets,
+            )
+        return self._move_absolute_stage_raw(
+            int(x_value),
+            int(y_value),
+            int(z_value),
+            source=source,
+            expected_targets=expected_targets,
+        )
+
+    def _try_probe_guarded_expected_move(self, expected_targets: dict[str, int], *, source: str):
+        if not self._probe_down_guard_enabled() or not any(axis in expected_targets for axis in ("X", "Y")):
+            return None
+        target_x = int(expected_targets.get("X", self.current_position_values["X"]))
+        target_y = int(expected_targets.get("Y", self.current_position_values["Y"]))
+        target_z = int(expected_targets.get("Z", self.current_position_values["Z"]))
+        return self._move_absolute_stage(target_x, target_y, target_z, source=source, expected_targets=expected_targets)
+
+    def _move_absolute_stage_with_probe_guard(
+        self,
+        x_value: int,
+        y_value: int,
+        z_value: int,
+        *,
+        source: str,
+        expected_targets: dict[str, int] | None = None,
+    ):
+        assert self.serial_client is not None
+        entries = self.serial_client.read_stable_xyz_positions()
+        current = self._read_logical_xyz_from_entries(entries)
+        if current["X"] == int(x_value) and current["Y"] == int(y_value):
+            return self._move_absolute_stage_raw(x_value, y_value, z_value, source=source, expected_targets=expected_targets)
+
+        margin = self._probe_safe_z_margin_pulses()
+        current_contact_z = self._probe_contact_z_at_xy(current["X"], current["Y"], current["Z"])
+        target_contact_z = self._probe_contact_z_at_xy(int(x_value), int(y_value), int(z_value))
+        current_safe_z = current_contact_z - margin
+        target_safe_z = target_contact_z - margin
+        travel_safe_z = min(current_safe_z, target_safe_z)
+        final_targets = dict(expected_targets or {})
+        final_targets.update({"X": int(x_value), "Y": int(y_value), "Z": int(target_contact_z)})
+        status_event = "autotest_status" if source == "autotest" else "motor_guard_status"
+
+        self.result_queue.put((status_event, f"Probe-down guard: moving Z to safe distance ({travel_safe_z})."))
+        self._move_absolute_stage_raw(current["X"], current["Y"], travel_safe_z, source=source)
+        self.result_queue.put((status_event, f"Probe-down guard: moving XY at safe Z to X={int(x_value)} Y={int(y_value)}."))
+        self._move_absolute_stage_raw(int(x_value), int(y_value), travel_safe_z, source=source)
+        if target_safe_z != travel_safe_z:
+            self._move_absolute_stage_raw(int(x_value), int(y_value), target_safe_z, source=source)
+        self.result_queue.put((status_event, f"Probe-down guard: raising Z to {target_contact_z}."))
+        return self._move_absolute_stage_raw(int(x_value), int(y_value), target_contact_z, source=source, expected_targets=final_targets)
+
+    def _move_absolute_stage_raw(
+        self,
+        x_value: int,
+        y_value: int,
+        z_value: int,
+        *,
+        source: str = "imgstitch",
+        expected_targets: dict[str, int] | None = None,
+    ):
         assert self.serial_client is not None
         entries = self.serial_client.read_stable_xyz_positions()
         current_x = self._axis_from_position_entries(entries, Axis.X)
@@ -7456,10 +7926,11 @@ class ProbeApp(tk.Tk):
             delta = target - current
             if not delta:
                 continue
-            self.serial_client.move_relative(axis=axis, reverse=delta < 0, pulses=abs(delta), speed_percent=speed_percent)
-            self.serial_client.wait_axis_reached(axis, timeout=self._axis_move_timeout(abs(delta), speed_percent))
+            controller_delta = self._controller_delta_from_logical_delta(axis, delta)
+            self.serial_client.move_relative(axis=axis, reverse=controller_delta < 0, pulses=abs(controller_delta), speed_percent=speed_percent)
+            self.serial_client.wait_axis_reached(axis, timeout=self._axis_move_timeout(abs(controller_delta), speed_percent))
         entries = self.serial_client.read_stable_xyz_positions()
-        self.result_queue.put(("read_positions", entries, source))
+        self._read_positions_event(entries, source, expected_targets)
         return entries
 
     def _wait_after_imgstitch_motion(self) -> None:
@@ -7486,7 +7957,7 @@ class ProbeApp(tk.Tk):
     def _axis_from_position_entries(self, entries: list[tuple[bytes, bytes, AxisPosition]], axis: Axis) -> int:
         for _command, _response, position in entries:
             if position.axis == axis:
-                return position.position
+                return self._logical_position_from_controller(axis, position.position)
         return self.current_position_values[axis.name]
 
     def _show_imgstitch_preview(self, image_bgr) -> None:
@@ -8021,15 +8492,22 @@ class ProbeApp(tk.Tk):
     def _move_axis_worker(self, axis: str, controller_axis: Axis, reverse: bool, pulses: int, source: str, mode: str, expected_targets: dict[str, int]) -> None:
         assert self.serial_client is not None
         try:
+            guarded_entries = self._try_probe_guarded_expected_move(expected_targets, source=source)
+            if guarded_entries is not None:
+                return
             speed_percent = self._motion_speed_percent()
-            if mode == "Absolute":
+            if mode == "Absolute" and self._axis_polarity(axis) == 1 and pulses >= 0:
                 command = self.serial_client.move_absolute(axis=controller_axis, target_position=pulses, speed_percent=speed_percent)
                 action = "absolute"
+                wait_pulses = abs(pulses - self.current_position_values[axis])
             else:
-                command = self.serial_client.move_relative(axis=controller_axis, reverse=reverse, pulses=pulses, speed_percent=speed_percent)
-                action = "reverse" if reverse else "forward"
+                logical_delta = pulses - self.current_position_values[axis] if mode == "Absolute" else (-pulses if reverse else pulses)
+                controller_delta = self._controller_delta_from_logical_delta(axis, logical_delta)
+                command = self.serial_client.move_relative(axis=controller_axis, reverse=controller_delta < 0, pulses=abs(controller_delta), speed_percent=speed_percent)
+                action = "absolute relative" if mode == "Absolute" else ("reverse" if reverse else "forward")
+                wait_pulses = abs(controller_delta)
             self.result_queue.put(("motor_command", axis, action, command, source))
-            reached = self.serial_client.wait_axis_reached(controller_axis, timeout=self._axis_move_timeout(pulses, speed_percent))
+            reached = self.serial_client.wait_axis_reached(controller_axis, timeout=self._axis_move_timeout(wait_pulses, speed_percent))
             self.result_queue.put(("axis_done", axis, reached, source))
             self.result_queue.put(("moving",))
             entries = self.serial_client.read_xyz_positions()
@@ -8062,6 +8540,9 @@ class ProbeApp(tk.Tk):
     ) -> None:
         assert self.serial_client is not None
         try:
+            guarded_entries = self._try_probe_guarded_expected_move(expected_targets, source=source)
+            if guarded_entries is not None:
+                return
             speed_percent = self._motion_speed_percent()
             if len(axes) == 1:
                 axis_name = axes[0]
@@ -8069,16 +8550,19 @@ class ProbeApp(tk.Tk):
                 if controller_axis is None:
                     return
                 value = values[axis_name]
-                if modes[axis_name] == "Absolute":
+                if modes[axis_name] == "Absolute" and self._axis_polarity(axis_name) == 1 and value >= 0:
                     command = self.serial_client.move_absolute(axis=controller_axis, target_position=value, speed_percent=speed_percent)
                     action = "absolute"
+                    wait_pulses = abs(value - self.current_position_values[axis_name])
                 else:
-                    if value == 0:
+                    logical_delta = value - self.current_position_values[axis_name] if modes[axis_name] == "Absolute" else value
+                    if logical_delta == 0:
                         raise ValueError("Relative move value must be non-zero.")
-                    command = self.serial_client.move_relative(axis=controller_axis, reverse=value < 0, pulses=abs(value), speed_percent=speed_percent)
+                    controller_delta = self._controller_delta_from_logical_delta(axis_name, logical_delta)
+                    command = self.serial_client.move_relative(axis=controller_axis, reverse=controller_delta < 0, pulses=abs(controller_delta), speed_percent=speed_percent)
                     action = "relative"
+                    wait_pulses = abs(controller_delta)
                 self.result_queue.put(("motor_command", axis_name, action, command, source))
-                wait_pulses = abs(value) if modes[axis_name] == "Relative" else abs(value - self.current_position_values[axis_name])
                 reached = self.serial_client.wait_axis_reached(controller_axis, timeout=self._axis_move_timeout(wait_pulses, speed_percent))
                 self.result_queue.put(("axis_done", axis_name, reached, source))
             else:
@@ -8091,7 +8575,7 @@ class ProbeApp(tk.Tk):
                         delta = values[axis_name] - self.current_position_values[axis_name]
                     else:
                         delta = values[axis_name]
-                    axis_params[controller_axis] = self._cc_axis_param(delta < 0, abs(delta))
+                    axis_params[controller_axis] = self._cc_axis_param_for_logical_delta(axis_name, delta)
                 if not any(params[1] for params in axis_params.values()):
                     raise ValueError("CC move requires at least one non-zero relative delta.")
                 command, completed = self.serial_client.move_multi_axis_relative_and_wait(axis_params, timeout=self._cc_move_timeout(axis_params))
@@ -8109,10 +8593,13 @@ class ProbeApp(tk.Tk):
     def _move_xyz_cc_worker(self, steps: dict[str, int], expected_targets: dict[str, int]) -> None:
         assert self.serial_client is not None
         try:
+            guarded_entries = self._try_probe_guarded_expected_move(expected_targets, source="button")
+            if guarded_entries is not None:
+                return
             axis_params = {
-                Axis.X: self._cc_axis_param(False, steps["X"]),
-                Axis.Y: self._cc_axis_param(False, steps["Y"]),
-                Axis.Z: self._cc_axis_param(False, steps["Z"]),
+                Axis.X: self._cc_axis_param_for_logical_delta("X", steps["X"]),
+                Axis.Y: self._cc_axis_param_for_logical_delta("Y", steps["Y"]),
+                Axis.Z: self._cc_axis_param_for_logical_delta("Z", steps["Z"]),
             }
             command, completed = self.serial_client.move_multi_axis_relative_and_wait(axis_params, timeout=self._cc_move_timeout(axis_params))
             self.result_queue.put(("motor_command", "XYZ", "cc relative", command, "button"))
@@ -8235,6 +8722,17 @@ class ProbeApp(tk.Tk):
         except Exception as exc:
             self.result_queue.put(exc)
 
+    def _ensure_iv_plot_window(self) -> IVPlotWindow:
+        if self.iv_plot_window is None:
+            self.iv_plot_window = IVPlotWindow(self, self.colors)
+            return self.iv_plot_window
+        try:
+            if not self.iv_plot_window.window.winfo_exists():
+                self.iv_plot_window = IVPlotWindow(self, self.colors)
+        except tk.TclError:
+            self.iv_plot_window = IVPlotWindow(self, self.colors)
+        return self.iv_plot_window
+
     def _poll_result_queue(self) -> None:
         started_at = time.monotonic()
         processed = 0
@@ -8291,7 +8789,7 @@ class ProbeApp(tk.Tk):
                     self._append_hex_history("TX", command_hex)
                     self._append_hex_history("RX", response_hex)
                 self._update_axis_position(position)
-                positions[position.axis_name] = position.position
+                positions[position.axis_name] = self._logical_position_from_controller(position.axis, position.position)
             self.status_var.set("Current position read completed.")
             if source == "autofocus":
                 self.autofocus_status_var.set("Moving, score sampling")
@@ -8863,12 +9361,65 @@ class ProbeApp(tk.Tk):
                 self.toggle_home_signal_polling()
             return
 
+        if event_type == "iv_started":
+            _, point_name, config, *payload = event
+            if isinstance(config, IVSweepConfig):
+                row = int(payload[0]) if len(payload) >= 1 else None
+                col = int(payload[1]) if len(payload) >= 2 else None
+                rows = int(payload[2]) if len(payload) >= 3 else None
+                cols = int(payload[3]) if len(payload) >= 4 else None
+                reset_heatmap = bool(payload[4]) if len(payload) >= 5 else False
+                self._ensure_iv_plot_window().start(
+                    str(point_name),
+                    config,
+                    row=row,
+                    col=col,
+                    rows=rows,
+                    cols=cols,
+                    reset_heatmap=reset_heatmap,
+                )
+                self.status_var.set(f"IV started at {point_name}.")
+            return
+
+        if event_type == "iv_sample":
+            _, point_name, sample = event
+            if isinstance(sample, dict):
+                self._ensure_iv_plot_window().add_sample(sample)
+                self.status_var.set(f"IV sample {sample.get('index')}/{sample.get('total')} at {point_name}.")
+            return
+
+        if event_type == "iv_done":
+            _, point_name, count, output_path, *payload = event
+            statistics = payload[0] if payload and isinstance(payload[0], dict) else None
+            row = int(payload[1]) if len(payload) >= 2 else None
+            col = int(payload[2]) if len(payload) >= 3 else None
+            if statistics is not None and row is not None and col is not None:
+                self._ensure_iv_plot_window().add_statistics(row, col, statistics)
+            suffix = f"; saved {Path(output_path).name}" if output_path else ""
+            message = f"IV completed at {point_name}: {count} sample(s){suffix}."
+            if statistics is not None and _finite_number(statistics.get("resistance_ohm")):
+                message += f" R={float(statistics['resistance_ohm']):.6g} ohm."
+            if statistics is not None and _finite_number(statistics.get("resistivity_ohm_cm")):
+                message += f" rho={float(statistics['resistivity_ohm_cm']):.6g} ohm cm."
+            self._ensure_iv_plot_window().finish(message)
+            if self.autotest_panel is not None:
+                self.autotest_panel.set_status(message)
+            self.status_var.set(message)
+            logger.info(message)
+            return
+
         if event_type == "autotest_status":
             _, message = event
             if self.autotest_panel is not None:
                 self.autotest_panel.set_status(str(message))
             self.status_var.set(str(message))
             logger.info("AutoTest: %s", message)
+            return
+
+        if event_type == "motor_guard_status":
+            _, message = event
+            self.status_var.set(str(message))
+            logger.info("%s", message)
             return
 
         if event_type == "autotest_progress":
@@ -8983,11 +9534,11 @@ class ProbeApp(tk.Tk):
 
     def start_camera(self) -> None:
         try:
-            index = int(self.camera_index_var.get())
+            source = normalize_camera_source(self.camera_index_var.get())
         except ValueError:
-            self.status_var.set("Camera index must be an integer.")
+            self.status_var.set("Camera source must be auto, miicam:0, opencv:0, opencv-msmf:0, opencv-dshow:0, or toupcam:0.")
             self._set_camera_index_error(True)
-            logger.warning("Camera start skipped because index is not an integer: %s", self.camera_index_var.get())
+            logger.warning("Camera start skipped because source is invalid: %s", self.camera_index_var.get())
             return
 
         self.camera_session_id += 1
@@ -8997,10 +9548,12 @@ class ProbeApp(tk.Tk):
             self.latest_camera_frame = None
             self.latest_stitch_frame = None
             self.latest_stitch_frame_captured_at = 0.0
-        self.camera = UsbCamera(index=index, width=800, height=450, settings=self._camera_settings_from_config())
+        self.probe_config.camera_source = source
+        self.camera_index_var.set(source)
+        self.camera = UsbCamera(index=0, source=source, width=800, height=450, settings=self._camera_settings_from_config())
         self.camera_running = True
         self.camera_rendering = True
-        logger.info("Starting USB camera preview on index %s.", index)
+        logger.info("Starting USB camera preview from source %s.", source)
         self.camera_thread = threading.Thread(target=self._camera_worker, args=(session_id, self.camera), daemon=True)
         self.camera_thread.start()
         self._update_camera_frame()
@@ -9056,7 +9609,7 @@ class ProbeApp(tk.Tk):
 
     def _set_camera_index_error(self, is_error: bool) -> None:
         if hasattr(self, "camera_index_spinbox"):
-            self.camera_index_spinbox.configure(style="Error.TSpinbox" if is_error else "TSpinbox")
+            self.camera_index_spinbox.configure(style="Error.TCombobox" if is_error else "TCombobox")
 
     def _update_camera_frame(self) -> None:
         if not self.camera_rendering:

@@ -4,6 +4,7 @@ import unittest
 
 from semi_auto_probe.app import ProbeApp
 from semi_auto_probe.config import KEYBOARD_MOTION_SCHEME_WASD_QE, MOTOR_SPEED_PROFILE_FINE, MOTOR_SPEED_PROFILE_SAFE, ProbeConfig
+from semi_auto_probe.protocol import Axis, AxisPosition
 
 
 class DummyVar:
@@ -46,6 +47,32 @@ class KeyboardControlsTests(unittest.TestCase):
         self.assertEqual(bindings["s"], ("Y", True))
         self.assertEqual(bindings["q"], ("Z", False))
         self.assertEqual(bindings["e"], ("Z", True))
+
+    def test_x_axis_polarity_reverses_controller_direction_without_changing_key_bindings(self) -> None:
+        app = self.make_app_shell(KEYBOARD_MOTION_SCHEME_WASD_QE)
+        app.probe_config.motor_axis_polarity = {"X": -1, "Y": 1, "Z": 1}
+
+        bindings = ProbeApp._keyboard_bindings_for_configured_scheme(app)
+        reverse, pulses = ProbeApp._relative_move_args_for_logical_step(app, *bindings["d"], pulses=10)
+
+        self.assertEqual(bindings["d"], ("X", False))
+        self.assertEqual((reverse, pulses), (True, 10))
+
+    def test_x_axis_polarity_converts_controller_position_to_logical_position(self) -> None:
+        app = self.make_app_shell()
+        app.probe_config.motor_axis_polarity = {"X": -1, "Y": 1, "Z": 1}
+        app.position_vars = {"X": DummyVar(), "Y": DummyVar(), "Z": DummyVar()}
+        app.current_position_values = {"X": 0, "Y": 0, "Z": 0}
+        app.modified_position_axes = set()
+        app.position_edit_modes = {"X": None, "Y": None, "Z": None}
+        app.position_inputs = {}
+        app.autofocus_z_var = DummyVar()
+        app.main_focusmap_plane_var = DummyVar(False)
+
+        ProbeApp._update_axis_position(app, AxisPosition(Axis.X, False, -12, b""))
+
+        self.assertEqual(app.current_position_values["X"], 12)
+        self.assertEqual(app.position_vars["X"].get(), "12")
 
     def test_cycle_jog_step_uses_configured_levels_for_axis(self) -> None:
         app = self.make_app_shell()

@@ -11,6 +11,12 @@ from .img_matrix import fov_polygon_for_stage_target
 
 
 @dataclass(frozen=True)
+class AutoTestFlowStep:
+    type_id: str
+    params: dict[str, str]
+
+
+@dataclass(frozen=True)
 class AutoTestSettings:
     origin_u: float
     origin_v: float
@@ -28,6 +34,7 @@ class AutoTestSettings:
     z_slow_speed_percent: int
     name_pattern: str
     measurement_steps: tuple[str, ...] = ()
+    measurement_flow: tuple[AutoTestFlowStep, ...] = ()
 
     def normalized(self) -> "AutoTestSettings":
         values = (
@@ -88,6 +95,10 @@ class AutoTestSettings:
             z_slow_speed_percent=z_slow_speed_percent,
             name_pattern=name_pattern,
             measurement_steps=tuple(str(step) for step in self.measurement_steps),
+            measurement_flow=tuple(
+                AutoTestFlowStep(str(step.type_id), {str(key): str(value) for key, value in step.params.items()})
+                for step in self.measurement_flow
+            ),
         )
 
 
@@ -141,14 +152,27 @@ AUTOTEST_FLOW_DEFINITIONS: tuple[AutoTestFlowDefinition, ...] = (
     ),
     AutoTestFlowDefinition(
         "iv",
-        "IV Test",
-        "Run an IV sweep placeholder.",
+        "Keithley IV",
+        "Run a Keithley 2450 voltage or current sweep.",
         "#34d399",
         (
-            AutoTestFlowParam("start_v", "Start V", "0"),
-            AutoTestFlowParam("stop_v", "Stop V", "1"),
-            AutoTestFlowParam("step_v", "Step V", "0.05"),
-            AutoTestFlowParam("compliance_a", "Compliance A", "1e-3"),
+            AutoTestFlowParam("resource", "VISA resource", "GPIB0::18::INSTR"),
+            AutoTestFlowParam("output_terminal", "Output terminal", "rear"),
+            AutoTestFlowParam("sweep_mode", "Sweep mode", "voltage"),
+            AutoTestFlowParam("bidirectional", "Bidirectional", "false"),
+            AutoTestFlowParam("start", "Start", "0"),
+            AutoTestFlowParam("stop", "Stop", "1"),
+            AutoTestFlowParam("step", "Step", "0.05"),
+            AutoTestFlowParam("voltage_limit_v", "Voltage limit V", "20"),
+            AutoTestFlowParam("current_limit_a", "Current limit A", "1e-3"),
+            AutoTestFlowParam("source_delay_s", "Delay s", "0.02"),
+            AutoTestFlowParam("nplc", "NPLC", "1"),
+            AutoTestFlowParam("output_statistics", "Output stats", "true"),
+            AutoTestFlowParam("resistance_method", "Resistance method", "linear_fit"),
+            AutoTestFlowParam("device_length_um", "Length um", "0"),
+            AutoTestFlowParam("device_width_um", "Width um", "0"),
+            AutoTestFlowParam("film_thickness_nm", "Thickness nm", "0"),
+            AutoTestFlowParam("output_off_after", "Output off after", "true"),
         ),
     ),
     AutoTestFlowDefinition(
@@ -248,6 +272,16 @@ def legacy_measurement_steps_from_flow(cards: tuple[AutoTestFlowCard, ...] | lis
         elif card.type_id == "photo":
             steps.append("photo")
     return tuple(steps)
+
+
+def measurement_flow_steps_from_cards(cards: tuple[AutoTestFlowCard, ...] | list[AutoTestFlowCard]) -> tuple[AutoTestFlowStep, ...]:
+    return tuple(
+        AutoTestFlowStep(
+            type_id=str(card.type_id),
+            params={str(key): str(value) for key, value in card.params.items()},
+        )
+        for card in cards
+    )
 
 
 def generate_autotest_points(settings: AutoTestSettings, mapper: AffineCoordinateMapper) -> tuple[AutoTestPoint, ...]:
@@ -811,6 +845,7 @@ class AutoTestPanel:
                 z_slow_speed_percent=int(float(self.z_slow_speed_percent_var.get())),
                 name_pattern=self.name_pattern_var.get(),
                 measurement_steps=self.measurement_steps(),
+                measurement_flow=self.measurement_flow(),
             ).normalized()
         except ValueError as exc:
             raise ValueError(f"Invalid AutoTest settings: {exc}") from exc
@@ -916,6 +951,9 @@ class AutoTestPanel:
             fallback_steps.append("photo")
         return tuple(fallback_steps)
 
+    def measurement_flow(self) -> tuple[AutoTestFlowStep, ...]:
+        return measurement_flow_steps_from_cards(self.measurement_flow_cards)
+
     def _update_measurement_summary(self) -> None:
         self.measure_pause_var.set(any(card.type_id == "wait" for card in self.measurement_flow_cards))
         self.measure_photo_var.set(any(card.type_id == "photo" for card in self.measurement_flow_cards))
@@ -975,12 +1013,22 @@ class AutoTestPanel:
         return float(x_um), float(y_um), float(z_um)
 
     def _open_measurement_dialog(self) -> None:
+        existing = getattr(self, "_measurement_dialog", None)
+        try:
+            if existing is not None and existing.winfo_exists():
+                existing.deiconify()
+                existing.lift()
+                return
+        except tk.TclError:
+            pass
+        self._discard_flow_widget_cache(destroy=False)
         dialog = tk.Toplevel(self.frame)
+        self._measurement_dialog = dialog
         dialog.title("AutoTest Measurement Flow")
         dialog.transient(self.frame.winfo_toplevel())
         dialog.configure(bg=self.colors["surface"])
-        dialog.geometry("1120x660")
-        dialog.minsize(900, 540)
+        dialog.geometry("1240x760")
+        dialog.minsize(980, 620)
         dialog.columnconfigure(0, weight=0, minsize=260)
         dialog.columnconfigure(1, weight=1)
         dialog.rowconfigure(1, weight=1)
@@ -1085,11 +1133,40 @@ class AutoTestPanel:
             anchor="w",
         ).grid(row=0, column=0, sticky="ew", padx=(2, 8))
         ttk.Button(footer, text="Clear", command=self._clear_measurement_flow).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(footer, text="Close", command=dialog.destroy).grid(row=0, column=2)
+        ttk.Button(footer, text="Close", command=lambda: self._close_measurement_dialog(dialog)).grid(row=0, column=2)
 
         self._redraw_flow_workspace()
         dialog.update_idletasks()
+        dialog.protocol("WM_DELETE_WINDOW", lambda: self._close_measurement_dialog(dialog))
         dialog.grab_set()
+
+    def _close_measurement_dialog(self, dialog: tk.Toplevel) -> None:
+        self._discard_flow_widget_cache(destroy=True)
+        if getattr(self, "_measurement_dialog", None) is dialog:
+            self._measurement_dialog = None
+        try:
+            dialog.grab_release()
+        except tk.TclError:
+            pass
+        try:
+            dialog.destroy()
+        except tk.TclError:
+            pass
+
+    def _discard_flow_widget_cache(self, *, destroy: bool) -> None:
+        if destroy:
+            for item_id, frame in list(self._flow_card_widgets.values()):
+                try:
+                    if hasattr(self, "_flow_canvas"):
+                        self._flow_canvas.delete(item_id)
+                except tk.TclError:
+                    pass
+                try:
+                    frame.destroy()
+                except tk.TclError:
+                    pass
+        self._flow_card_widgets.clear()
+        self._flow_card_render_state.clear()
 
     def _build_flow_library(self, parent: tk.Frame, wheel_target: tk.Canvas | None = None) -> None:
         for row, definition in enumerate(AUTOTEST_FLOW_DEFINITIONS):
@@ -1265,7 +1342,7 @@ class AutoTestPanel:
         cards = [card for card in self.measurement_flow_cards if card.card_id != dragged_card_id]
         current_y = self._flow_origin_y()
         for index, card in enumerate(cards):
-            card_height = self._flow_card_height(card.expanded)
+            card_height = self._flow_card_height_for_card(card)
             if y < current_y + card_height / 2:
                 return index
             current_y += card_height + self._flow_card_gap()
@@ -1274,8 +1351,10 @@ class AutoTestPanel:
     def _flow_card_bounds(self, index: int, expanded: bool) -> tuple[int, int, int, int]:
         y = self._flow_origin_y()
         for card in self.measurement_flow_cards[:index]:
-            y += self._flow_card_height(card.expanded) + self._flow_card_gap()
-        return self._flow_origin_x(), y, self._flow_card_width(), self._flow_card_height(expanded)
+            y += self._flow_card_height_for_card(card) + self._flow_card_gap()
+        card = self.measurement_flow_cards[index] if 0 <= index < len(self.measurement_flow_cards) else None
+        height = self._flow_card_height_for_card(card) if card is not None else self._flow_card_height(expanded)
+        return self._flow_origin_x(), y, self._flow_card_width(), height
 
     def _flow_origin_x(self) -> int:
         return int(42 * self._flow_zoom)
@@ -1289,6 +1368,13 @@ class AutoTestPanel:
 
     def _flow_card_height(self, expanded: bool) -> int:
         return int((214 if expanded else 58) * self._flow_zoom)
+
+    def _flow_card_height_for_card(self, card: AutoTestFlowCard) -> int:
+        if not card.expanded:
+            return self._flow_card_height(False)
+        definition = autotest_flow_definitions_by_type()[card.type_id]
+        rows = max(1, math.ceil(len(definition.parameters) / 2))
+        return int((116 + rows * 38) * self._flow_zoom)
 
     def _flow_card_gap(self) -> int:
         return int(18 * self._flow_zoom)
@@ -1391,7 +1477,7 @@ class AutoTestPanel:
                 )
                 current_y += placeholder_height + self._flow_card_gap()
                 continue
-            card_height = self._flow_card_height(card.expanded)
+            card_height = self._flow_card_height_for_card(card)
             x, y = card_x, current_y
             item_id, _frame = self._ensure_flow_card_widget(card, card_width, card_height)
             target_positions[card.card_id] = (x, y)
@@ -1473,7 +1559,7 @@ class AutoTestPanel:
     def _ensure_flow_card_widget(self, card: AutoTestFlowCard, width: int, height: int) -> tuple[int, tk.Frame]:
         canvas: tk.Canvas = self._flow_canvas
         existing = self._flow_card_widgets.get(card.card_id)
-        render_state = (width, height, card.expanded, self._flow_card_param_summary(card))
+        render_state = (width, height, card.expanded, tuple(sorted(card.params.items())))
         if existing is not None:
             item_id, frame = existing
             frame.configure(width=width, height=height)
@@ -1582,7 +1668,10 @@ class AutoTestPanel:
         params = tk.Frame(frame, bg=self.colors["surface"], padx=10, pady=4)
         params.grid(row=2, column=1, columnspan=4, sticky="nsew")
         params.columnconfigure(1, weight=1)
-        for row, param in enumerate(definition.parameters):
+        params.columnconfigure(3, weight=1)
+        for index, param in enumerate(definition.parameters):
+            row = index // 2
+            column = (index % 2) * 2
             tk.Label(
                 params,
                 text=param.label,
@@ -1590,25 +1679,42 @@ class AutoTestPanel:
                 fg=self.colors["muted"],
                 font=("Segoe UI", 8),
                 anchor="w",
-            ).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
+            ).grid(row=row, column=column, sticky="w", padx=(0 if column == 0 else 16, 8), pady=3)
             var = self._flow_entry_vars.get((card.card_id, param.key))
             if var is None:
                 var = tk.StringVar(value=card.params.get(param.key, param.default))
                 self._flow_entry_vars[(card.card_id, param.key)] = var
                 var.trace_add("write", lambda *_args, target=card, key=param.key, value_var=var: self._set_flow_card_param(target, key, value_var.get()))
-            entry = tk.Entry(
-                params,
-                textvariable=var,
-                bg=self.colors["input"],
-                fg=self.colors["text"],
-                insertbackground=self.colors["accent"],
-                relief="flat",
-                highlightthickness=1,
-                highlightbackground=self.colors["border"],
-                highlightcolor=self.colors["border_focus"],
-                font=("Cascadia Mono", 9),
-            )
-            entry.grid(row=row, column=1, sticky="ew", pady=3)
+            choices = self._flow_param_choices(param.key)
+            if choices:
+                entry = ttk.Combobox(params, textvariable=var, values=choices, state="readonly", width=12)
+                entry.grid(row=row, column=column + 1, sticky="ew", pady=3)
+            else:
+                entry = tk.Entry(
+                    params,
+                    textvariable=var,
+                    bg=self.colors["input"],
+                    fg=self.colors["text"],
+                    insertbackground=self.colors["accent"],
+                    relief="flat",
+                    highlightthickness=1,
+                    highlightbackground=self.colors["border"],
+                    highlightcolor=self.colors["border_focus"],
+                    font=("Cascadia Mono", 9),
+                )
+                entry.grid(row=row, column=column + 1, sticky="ew", pady=3)
+
+    @staticmethod
+    def _flow_param_choices(key: str) -> tuple[str, ...]:
+        choices = {
+            "output_terminal": ("rear", "front"),
+            "sweep_mode": ("voltage", "current"),
+            "bidirectional": ("false", "true"),
+            "output_statistics": ("true", "false"),
+            "resistance_method": ("linear_fit", "median_ratio"),
+            "output_off_after": ("true", "false"),
+        }
+        return choices.get(key, ())
 
     def _set_flow_card_param(self, card: AutoTestFlowCard, key: str, value: str) -> None:
         card.params[key] = value

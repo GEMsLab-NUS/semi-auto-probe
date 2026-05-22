@@ -1,0 +1,470 @@
+from __future__ import annotations
+
+import math
+import time
+from dataclasses import dataclass
+from typing import Callable, Iterable, Protocol
+
+
+DEFAULT_KEITHLEY2450_RESOURCE = "GPIB0::18::INSTR"
+IV_SWEEP_MODE_VOLTAGE = "voltage"
+IV_SWEEP_MODE_CURRENT = "current"
+IV_SWEEP_MODES = (IV_SWEEP_MODE_VOLTAGE, IV_SWEEP_MODE_CURRENT)
+OUTPUT_TERMINAL_FRONT = "front"
+OUTPUT_TERMINAL_REAR = "rear"
+OUTPUT_TERMINALS = (OUTPUT_TERMINAL_FRONT, OUTPUT_TERMINAL_REAR)
+RESISTANCE_METHOD_LINEAR_FIT = "linear_fit"
+RESISTANCE_METHOD_MEDIAN_RATIO = "median_ratio"
+RESISTANCE_METHODS = (RESISTANCE_METHOD_LINEAR_FIT, RESISTANCE_METHOD_MEDIAN_RATIO)
+
+
+class VisaInstrument(Protocol):
+    timeout: int
+
+    def write(self, command: str) -> object: ...
+
+    def query(self, command: str) -> str: ...
+
+    def close(self) -> object: ...
+
+
+@dataclass(frozen=True)
+class IVSweepSample:
+    index: int
+    total: int
+    elapsed_s: float
+    source_value: float
+    voltage_v: float
+    current_a: float
+    resistance_ohm: float | None
+    raw: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "index": self.index,
+            "total": self.total,
+            "elapsed_s": self.elapsed_s,
+            "source_value": self.source_value,
+            "voltage_v": self.voltage_v,
+            "current_a": self.current_a,
+            "resistance_ohm": self.resistance_ohm,
+            "raw": self.raw,
+        }
+
+
+@dataclass(frozen=True)
+class IVSweepStatistics:
+    sample_count: int
+    resistance_ohm: float | None
+    sheet_resistance_ohm_sq: float | None
+    resistivity_ohm_cm: float | None
+    resistance_method: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "sample_count": self.sample_count,
+            "resistance_ohm": self.resistance_ohm,
+            "sheet_resistance_ohm_sq": self.sheet_resistance_ohm_sq,
+            "resistivity_ohm_cm": self.resistivity_ohm_cm,
+            "resistance_method": self.resistance_method,
+        }
+
+
+@dataclass(frozen=True)
+class IVSweepConfig:
+    resource_name: str = DEFAULT_KEITHLEY2450_RESOURCE
+    output_terminal: str = OUTPUT_TERMINAL_REAR
+    sweep_mode: str = IV_SWEEP_MODE_VOLTAGE
+    start: float = 0.0
+    stop: float = 1.0
+    step: float = 0.05
+    bidirectional: bool = False
+    voltage_limit_v: float = 20.0
+    current_limit_a: float = 0.001
+    source_delay_s: float = 0.02
+    nplc: float = 1.0
+    output_statistics: bool = True
+    resistance_method: str = RESISTANCE_METHOD_LINEAR_FIT
+    device_length_um: float = 0.0
+    device_width_um: float = 0.0
+    film_thickness_nm: float = 0.0
+    output_off_after: bool = True
+
+    def normalized(self) -> "IVSweepConfig":
+        mode = normalize_sweep_mode(self.sweep_mode)
+        output_terminal = normalize_output_terminal(self.output_terminal)
+        resistance_method = normalize_resistance_method(self.resistance_method)
+        values = (
+            self.start,
+            self.stop,
+            self.step,
+            self.voltage_limit_v,
+            self.current_limit_a,
+            self.source_delay_s,
+            self.nplc,
+            self.device_length_um,
+            self.device_width_um,
+            self.film_thickness_nm,
+        )
+        if any(not math.isfinite(float(value)) for value in values):
+            raise ValueError("IV sweep numeric parameters must be finite.")
+        if float(self.step) == 0:
+            raise ValueError("IV sweep step must be non-zero.")
+        if abs(float(self.step)) > abs(float(self.stop) - float(self.start)) and float(self.start) != float(self.stop):
+            raise ValueError("IV sweep step is larger than the sweep span.")
+        if float(self.voltage_limit_v) <= 0:
+            raise ValueError("IV voltage limit must be positive.")
+        if float(self.current_limit_a) <= 0:
+            raise ValueError("IV current limit must be positive.")
+        if float(self.source_delay_s) < 0 or float(self.source_delay_s) > 60:
+            raise ValueError("IV source delay must be in range 0..60 seconds.")
+        if float(self.nplc) <= 0 or float(self.nplc) > 25:
+            raise ValueError("IV NPLC must be in range 0..25.")
+        if float(self.device_length_um) < 0 or float(self.device_width_um) < 0 or float(self.film_thickness_nm) < 0:
+            raise ValueError("IV geometry values must be zero or positive.")
+        resource_name = str(self.resource_name or DEFAULT_KEITHLEY2450_RESOURCE).strip()
+        if not resource_name:
+            raise ValueError("Keithley VISA resource cannot be empty.")
+        return IVSweepConfig(
+            resource_name=resource_name,
+            output_terminal=output_terminal,
+            sweep_mode=mode,
+            start=float(self.start),
+            stop=float(self.stop),
+            step=float(self.step),
+            bidirectional=bool(self.bidirectional),
+            voltage_limit_v=float(self.voltage_limit_v),
+            current_limit_a=float(self.current_limit_a),
+            source_delay_s=float(self.source_delay_s),
+            nplc=float(self.nplc),
+            output_statistics=bool(self.output_statistics),
+            resistance_method=resistance_method,
+            device_length_um=float(self.device_length_um),
+            device_width_um=float(self.device_width_um),
+            film_thickness_nm=float(self.film_thickness_nm),
+            output_off_after=bool(self.output_off_after),
+        )
+
+    def sweep_values(self) -> tuple[float, ...]:
+        config = self.normalized()
+        forward = tuple(_inclusive_sweep_values(config.start, config.stop, config.step))
+        if not config.bidirectional or len(forward) <= 1:
+            return forward
+        reverse_step = -abs(config.step) if config.stop >= config.start else abs(config.step)
+        reverse = tuple(_inclusive_sweep_values(config.stop + reverse_step, config.start, reverse_step))
+        return forward + reverse
+
+    def summary(self) -> str:
+        direction = "bidirectional" if self.bidirectional else "single"
+        unit = "V" if normalize_sweep_mode(self.sweep_mode) == IV_SWEEP_MODE_VOLTAGE else "A"
+        return f"{self.resource_name} | {self.output_terminal} terminal | {self.sweep_mode} {direction} {self.start:g}->{self.stop:g} step {self.step:g} {unit}"
+
+
+def normalize_sweep_mode(value: object) -> str:
+    text = str(value or IV_SWEEP_MODE_VOLTAGE).strip().lower().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "v": IV_SWEEP_MODE_VOLTAGE,
+        "volt": IV_SWEEP_MODE_VOLTAGE,
+        "voltage": IV_SWEEP_MODE_VOLTAGE,
+        "v_sweep": IV_SWEEP_MODE_VOLTAGE,
+        "voltage_sweep": IV_SWEEP_MODE_VOLTAGE,
+        "i": IV_SWEEP_MODE_CURRENT,
+        "curr": IV_SWEEP_MODE_CURRENT,
+        "current": IV_SWEEP_MODE_CURRENT,
+        "i_sweep": IV_SWEEP_MODE_CURRENT,
+        "current_sweep": IV_SWEEP_MODE_CURRENT,
+    }
+    normalized = aliases.get(text, text)
+    if normalized not in IV_SWEEP_MODES:
+        raise ValueError("IV sweep mode must be voltage or current.")
+    return normalized
+
+
+def normalize_output_terminal(value: object) -> str:
+    text = str(value or OUTPUT_TERMINAL_REAR).strip().lower().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "front": OUTPUT_TERMINAL_FRONT,
+        "fron": OUTPUT_TERMINAL_FRONT,
+        "front_panel": OUTPUT_TERMINAL_FRONT,
+        "frontpanel": OUTPUT_TERMINAL_FRONT,
+        "rear": OUTPUT_TERMINAL_REAR,
+        "rear_panel": OUTPUT_TERMINAL_REAR,
+        "rearpanel": OUTPUT_TERMINAL_REAR,
+    }
+    normalized = aliases.get(text, text)
+    if normalized not in OUTPUT_TERMINALS:
+        raise ValueError("Keithley output terminal must be front or rear.")
+    return normalized
+
+
+def normalize_resistance_method(value: object) -> str:
+    text = str(value or RESISTANCE_METHOD_LINEAR_FIT).strip().lower().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "linear": RESISTANCE_METHOD_LINEAR_FIT,
+        "fit": RESISTANCE_METHOD_LINEAR_FIT,
+        "linear_fit": RESISTANCE_METHOD_LINEAR_FIT,
+        "slope": RESISTANCE_METHOD_LINEAR_FIT,
+        "median": RESISTANCE_METHOD_MEDIAN_RATIO,
+        "median_ratio": RESISTANCE_METHOD_MEDIAN_RATIO,
+        "v_over_i": RESISTANCE_METHOD_MEDIAN_RATIO,
+    }
+    normalized = aliases.get(text, text)
+    if normalized not in RESISTANCE_METHODS:
+        raise ValueError("IV resistance method must be linear_fit or median_ratio.")
+    return normalized
+
+
+def parse_bool(value: object, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    if text in {"1", "true", "yes", "y", "on", "bidirectional", "both", "double"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "single", "forward"}:
+        return False
+    raise ValueError(f"Cannot parse boolean value: {value!r}.")
+
+
+def iv_sweep_config_from_params(params: dict[str, str]) -> IVSweepConfig:
+    mode = normalize_sweep_mode(params.get("sweep_mode", params.get("mode", "voltage")))
+    return IVSweepConfig(
+        resource_name=params.get("resource", params.get("resource_name", DEFAULT_KEITHLEY2450_RESOURCE)),
+        output_terminal=params.get("output_terminal", params.get("terminal", OUTPUT_TERMINAL_REAR)),
+        sweep_mode=mode,
+        start=float(params.get("start", params.get("start_v" if mode == IV_SWEEP_MODE_VOLTAGE else "start_a", 0.0))),
+        stop=float(params.get("stop", params.get("stop_v" if mode == IV_SWEEP_MODE_VOLTAGE else "stop_a", 1.0))),
+        step=float(params.get("step", params.get("step_v" if mode == IV_SWEEP_MODE_VOLTAGE else "step_a", 0.05))),
+        bidirectional=parse_bool(params.get("bidirectional", params.get("direction", "single"))),
+        voltage_limit_v=float(params.get("voltage_limit_v", params.get("limit_v", 20.0))),
+        current_limit_a=float(params.get("current_limit_a", params.get("limit_a", params.get("compliance_a", 0.001)))),
+        source_delay_s=float(params.get("source_delay_s", params.get("delay_s", 0.02))),
+        nplc=float(params.get("nplc", 1.0)),
+        output_statistics=parse_bool(params.get("output_statistics", "true"), default=True),
+        resistance_method=params.get("resistance_method", RESISTANCE_METHOD_LINEAR_FIT),
+        device_length_um=float(params.get("device_length_um", params.get("length_um", 0.0))),
+        device_width_um=float(params.get("device_width_um", params.get("width_um", 0.0))),
+        film_thickness_nm=float(params.get("film_thickness_nm", params.get("thickness_nm", 0.0))),
+        output_off_after=parse_bool(params.get("output_off_after", "true"), default=True),
+    ).normalized()
+
+
+def calculate_iv_statistics(samples: list[IVSweepSample] | tuple[IVSweepSample, ...], config: IVSweepConfig) -> IVSweepStatistics:
+    normalized = config.normalized()
+    if not normalized.output_statistics:
+        return IVSweepStatistics(
+            sample_count=len(samples),
+            resistance_ohm=None,
+            sheet_resistance_ohm_sq=None,
+            resistivity_ohm_cm=None,
+            resistance_method=normalized.resistance_method,
+        )
+    resistance = _calculate_resistance_ohm(samples, normalized.resistance_method)
+    sheet_resistance = None
+    resistivity = None
+    if resistance is not None and normalized.device_length_um > 0 and normalized.device_width_um > 0:
+        sheet_resistance = resistance * normalized.device_width_um / normalized.device_length_um
+        if normalized.film_thickness_nm > 0:
+            resistivity = sheet_resistance * normalized.film_thickness_nm * 1e-7
+    return IVSweepStatistics(
+        sample_count=len(samples),
+        resistance_ohm=resistance,
+        sheet_resistance_ohm_sq=sheet_resistance,
+        resistivity_ohm_cm=resistivity,
+        resistance_method=normalized.resistance_method,
+    )
+
+
+def _calculate_resistance_ohm(samples: list[IVSweepSample] | tuple[IVSweepSample, ...], method: str) -> float | None:
+    if method == RESISTANCE_METHOD_MEDIAN_RATIO:
+        return _median_resistance(samples)
+    pairs = [
+        (float(sample.current_a), float(sample.voltage_v))
+        for sample in samples
+        if math.isfinite(float(sample.current_a)) and math.isfinite(float(sample.voltage_v))
+    ]
+    if len(pairs) >= 2:
+        mean_i = sum(current for current, _voltage in pairs) / len(pairs)
+        mean_v = sum(voltage for _current, voltage in pairs) / len(pairs)
+        denominator = sum((current - mean_i) ** 2 for current, _voltage in pairs)
+        if denominator > 1e-30:
+            numerator = sum((current - mean_i) * (voltage - mean_v) for current, voltage in pairs)
+            slope = numerator / denominator
+            if math.isfinite(slope):
+                return slope
+    return _median_resistance(samples)
+
+
+def _median_resistance(samples: list[IVSweepSample] | tuple[IVSweepSample, ...]) -> float | None:
+    values: list[float] = []
+    for sample in samples:
+        if sample.resistance_ohm is not None and math.isfinite(float(sample.resistance_ohm)):
+            values.append(float(sample.resistance_ohm))
+        elif abs(float(sample.current_a)) > 1e-15 and math.isfinite(float(sample.voltage_v)) and math.isfinite(float(sample.current_a)):
+            values.append(float(sample.voltage_v) / float(sample.current_a))
+    if not values:
+        return None
+    values.sort()
+    mid = len(values) // 2
+    if len(values) % 2:
+        return values[mid]
+    return (values[mid - 1] + values[mid]) / 2.0
+
+
+def _inclusive_sweep_values(start: float, stop: float, step: float) -> Iterable[float]:
+    if start == stop:
+        yield float(start)
+        return
+    direction = 1.0 if stop > start else -1.0
+    step_value = abs(float(step)) * direction
+    value = float(start)
+    tolerance = abs(step_value) * 1e-9
+    index = 0
+    while (value - stop) * direction <= tolerance:
+        yield float(value)
+        index += 1
+        value = float(start) + index * step_value
+    if abs((value - step_value) - stop) > abs(step_value) * 1e-6:
+        yield float(stop)
+
+
+class Keithley2450IVRunner:
+    def __init__(self, instrument: VisaInstrument | None = None) -> None:
+        self.instrument = instrument
+        self._owns_instrument = instrument is None
+
+    def run_sweep(
+        self,
+        config: IVSweepConfig,
+        *,
+        stop_requested: Callable[[], bool] | None = None,
+        on_sample: Callable[[IVSweepSample], None] | None = None,
+    ) -> list[IVSweepSample]:
+        normalized = config.normalized()
+        instrument = self.instrument or self._open_resource(normalized.resource_name)
+        self.instrument = instrument
+        values = normalized.sweep_values()
+        samples: list[IVSweepSample] = []
+        started_at = time.monotonic()
+        try:
+            self._configure_instrument(instrument, normalized)
+            instrument.write(":OUTP ON")
+            for index, source_value in enumerate(values, start=1):
+                if stop_requested is not None and stop_requested():
+                    break
+                self._set_source_value(instrument, normalized.sweep_mode, source_value)
+                if normalized.source_delay_s > 0:
+                    time.sleep(normalized.source_delay_s)
+                raw = instrument.query(":READ?")
+                sample = self._sample_from_reading(
+                    raw,
+                    index=index,
+                    total=len(values),
+                    elapsed_s=time.monotonic() - started_at,
+                    source_value=source_value,
+                    sweep_mode=normalized.sweep_mode,
+                )
+                samples.append(sample)
+                if on_sample is not None:
+                    on_sample(sample)
+        finally:
+            if normalized.output_off_after:
+                try:
+                    instrument.write(":OUTP OFF")
+                except Exception:
+                    pass
+            if self._owns_instrument:
+                try:
+                    instrument.close()
+                except Exception:
+                    pass
+                self.instrument = None
+        return samples
+
+    def _open_resource(self, resource_name: str) -> VisaInstrument:
+        try:
+            import pyvisa
+        except ImportError as exc:
+            raise RuntimeError("PyVISA is required for Keithley IV testing. Install pyvisa and a VISA backend first.") from exc
+        manager = pyvisa.ResourceManager()
+        instrument = manager.open_resource(resource_name)
+        instrument.timeout = 10000
+        return instrument
+
+    def _configure_instrument(self, instrument: VisaInstrument, config: IVSweepConfig) -> None:
+        instrument.write("*RST")
+        instrument.write(f":ROUT:TERM {'FRON' if config.output_terminal == OUTPUT_TERMINAL_FRONT else 'REAR'}")
+        if config.sweep_mode == IV_SWEEP_MODE_VOLTAGE:
+            instrument.write(":SOUR:FUNC:MODE VOLT")
+            instrument.write(":SOUR:VOLT:MODE FIX")
+            instrument.write(":SOUR:VOLT:RANG:AUTO 1")
+            instrument.write(':SENS:FUNC "CURR"')
+            instrument.write(f":SENS:CURR:PROT:LEV {config.current_limit_a:.12g}")
+            instrument.write(":SENS:CURR:RANG:AUTO 1")
+            instrument.write(f":SENS:CURR:NPLC {config.nplc:.12g}")
+        else:
+            instrument.write(":SOUR:FUNC:MODE CURR")
+            instrument.write(":SOUR:CURR:MODE FIX")
+            instrument.write(":SOUR:CURR:RANG:AUTO 1")
+            instrument.write(':SENS:FUNC "VOLT"')
+            instrument.write(f":SENS:VOLT:PROT:LEV {config.voltage_limit_v:.12g}")
+            instrument.write(":SENS:VOLT:RANG:AUTO 1")
+            instrument.write(f":SENS:VOLT:NPLC {config.nplc:.12g}")
+
+    def _set_source_value(self, instrument: VisaInstrument, sweep_mode: str, source_value: float) -> None:
+        if sweep_mode == IV_SWEEP_MODE_VOLTAGE:
+            instrument.write(f":SOUR:VOLT:LEV {source_value:.12g}")
+        else:
+            instrument.write(f":SOUR:CURR:LEV {source_value:.12g}")
+
+    @staticmethod
+    def _sample_from_reading(
+        raw: str,
+        *,
+        index: int,
+        total: int,
+        elapsed_s: float,
+        source_value: float,
+        sweep_mode: str,
+    ) -> IVSweepSample:
+        numbers = _parse_reading_numbers(raw)
+        if len(numbers) >= 2:
+            voltage = numbers[0]
+            current = numbers[1]
+        elif sweep_mode == IV_SWEEP_MODE_VOLTAGE:
+            voltage = source_value
+            current = numbers[0] if numbers else math.nan
+        else:
+            voltage = numbers[0] if numbers else math.nan
+            current = source_value
+        resistance = None
+        if len(numbers) >= 3 and math.isfinite(numbers[2]):
+            resistance = numbers[2]
+        elif current and math.isfinite(voltage) and math.isfinite(current):
+            resistance = voltage / current
+        return IVSweepSample(
+            index=index,
+            total=total,
+            elapsed_s=elapsed_s,
+            source_value=source_value,
+            voltage_v=voltage,
+            current_a=current,
+            resistance_ohm=resistance,
+            raw=str(raw).strip(),
+        )
+
+
+def _parse_reading_numbers(raw: str) -> list[float]:
+    numbers: list[float] = []
+    for part in str(raw).replace(";", ",").split(","):
+        text = part.strip()
+        if not text:
+            continue
+        try:
+            numbers.append(float(text))
+        except ValueError:
+            continue
+    return numbers

@@ -58,7 +58,7 @@ class VisionCenterMoveTests(unittest.TestCase):
 
     def test_preview_and_cc_plan_share_signed_pulses(self) -> None:
         app = self.make_app_shell()
-        app.probe_config.set_calibration(20, 2.0, 0.5)
+        app.probe_config.set_calibration(10, 2.0, 0.5)
 
         plan = app._image_centering_cc_plan(
             point_x=430,
@@ -93,6 +93,22 @@ class VisionCenterMoveTests(unittest.TestCase):
         )
 
         self.assertEqual(plan["axis_params"], {1: (False, 15, 60, 25), 2: (False, 0, 0, 25)})
+
+    def test_x_axis_polarity_reverses_controller_direction_not_logical_preview(self) -> None:
+        app = self.make_app_shell()
+        app.probe_config.motor_axis_polarity = {"X": -1, "Y": 1, "Z": 1}
+
+        plan = app._image_centering_cc_plan(
+            point_x=430,
+            point_y=205,
+            image_width=800,
+            image_height=450,
+            um_per_px=0.5,
+        )
+
+        self.assertEqual(plan["signed_pulses"], {"X": 15, "Y": 10})
+        self.assertEqual(plan["target_positions"], {"X": 115, "Y": 210})
+        self.assertEqual(plan["axis_params"], {1: (True, 15, 100, 30), 2: (False, 10, 100, 30)})
 
 
 if __name__ == "__main__":

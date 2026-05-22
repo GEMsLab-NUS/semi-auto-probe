@@ -181,6 +181,21 @@ def normalize_controller_motion_parameters_map(data: Any) -> dict[str, dict[str,
     return normalized
 
 
+def normalize_motor_axis_polarity_map(data: Any) -> dict[str, int]:
+    raw_map = data if isinstance(data, dict) else {}
+    normalized: dict[str, int] = {}
+    for axis in JOG_STEP_AXES:
+        raw_value = raw_map.get(axis, raw_map.get(axis.lower(), 1))
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{axis} motor axis polarity must be 1 or -1.") from exc
+        if value not in (-1, 1):
+            raise ValueError(f"{axis} motor axis polarity must be 1 or -1.")
+        normalized[axis] = value
+    return normalized
+
+
 def calibration_key(objective: int, eyepiece: float) -> str:
     return f"objective_{objective:g}__eyepiece_{eyepiece:g}"
 
@@ -227,7 +242,7 @@ def pulses_from_um(distance_um: float, config: "ProbeConfig", axis: str) -> int:
 
 @dataclass
 class ProbeConfig:
-    objective: int = 20
+    objective: int = 10
     eyepiece: float = 2.0
     microstep: int = 2
     lead_xy_mm: float = 1.0
@@ -236,15 +251,18 @@ class ProbeConfig:
     cc_speed_percent: int = 100
     fine_speed_percent: int = 40
     safe_speed_percent: int = 15
+    probe_safe_z_margin_um: float = 100.0
     active_motor_speed_profile: str = MOTOR_SPEED_PROFILE_FAST
     controller_motion_parameters: dict[str, dict[str, int]] = field(default_factory=lambda: {
         axis: dict(DEFAULT_CONTROLLER_MOTION_PARAMETERS[axis])
         for axis in JOG_STEP_AXES
     })
+    motor_axis_polarity: dict[str, int] = field(default_factory=lambda: {axis: 1 for axis in JOG_STEP_AXES})
     camera_exposure_mode: str = CAMERA_CONTROL_MODE_AUTO
     camera_exposure: float = 0.0
     camera_gain_mode: str = CAMERA_CONTROL_MODE_AUTO
     camera_gain: float = 0.0
+    camera_source: str = "auto"
     cc_accel_time_s: float = 0.3
     autofocus_settle_ms: int = 100
     autofocus_sample_count: int = 5
@@ -281,12 +299,19 @@ class ProbeConfig:
             raise ValueError("Fine motor speed percent must be in range 0..100.")
         if self.safe_speed_percent < 0 or self.safe_speed_percent > 100:
             raise ValueError("Safe motor speed percent must be in range 0..100.")
+        self.probe_safe_z_margin_um = float(self.probe_safe_z_margin_um)
+        if not math.isfinite(self.probe_safe_z_margin_um) or self.probe_safe_z_margin_um < 0 or self.probe_safe_z_margin_um > 1_000_000:
+            raise ValueError("Probe safe Z margin must be a finite number in range 0..1000000 um.")
         self.active_motor_speed_profile = normalize_motor_speed_profile(self.active_motor_speed_profile)
         self.controller_motion_parameters = normalize_controller_motion_parameters_map(self.controller_motion_parameters)
+        self.motor_axis_polarity = normalize_motor_axis_polarity_map(self.motor_axis_polarity)
         self.camera_exposure_mode = normalize_camera_control_mode(self.camera_exposure_mode)
         self.camera_gain_mode = normalize_camera_control_mode(self.camera_gain_mode)
         self.camera_exposure = float(self.camera_exposure)
         self.camera_gain = float(self.camera_gain)
+        self.camera_source = str(self.camera_source or "auto").strip().lower()
+        if not self.camera_source:
+            raise ValueError("Camera source cannot be empty.")
         if not math.isfinite(self.camera_exposure) or abs(self.camera_exposure) > 1_000_000:
             raise ValueError("Camera exposure must be a finite number in range -1000000..1000000.")
         if not math.isfinite(self.camera_gain) or self.camera_gain < 0 or self.camera_gain > 1_000_000:
@@ -390,15 +415,21 @@ class ProbeConfig:
             "cc_speed_percent": self.cc_speed_percent,
             "fine_speed_percent": self.fine_speed_percent,
             "safe_speed_percent": self.safe_speed_percent,
+            "probe_safe_z_margin_um": self.probe_safe_z_margin_um,
             "active_motor_speed_profile": self.active_motor_speed_profile,
             "controller_motion_parameters": {
                 axis: dict(self.controller_motion_parameters[axis])
+                for axis in JOG_STEP_AXES
+            },
+            "motor_axis_polarity": {
+                axis: int(self.motor_axis_polarity[axis])
                 for axis in JOG_STEP_AXES
             },
             "camera_exposure_mode": self.camera_exposure_mode,
             "camera_exposure": self.camera_exposure,
             "camera_gain_mode": self.camera_gain_mode,
             "camera_gain": self.camera_gain,
+            "camera_source": self.camera_source,
             "cc_accel_time_s": self.cc_accel_time_s,
             "autofocus_settle_ms": self.autofocus_settle_ms,
             "autofocus_sample_count": self.autofocus_sample_count,
@@ -444,12 +475,15 @@ class ProbeConfig:
             cc_speed_percent=int(data.get("cc_speed_percent", cls.cc_speed_percent)),
             fine_speed_percent=int(data.get("fine_speed_percent", cls.fine_speed_percent)),
             safe_speed_percent=int(data.get("safe_speed_percent", cls.safe_speed_percent)),
+            probe_safe_z_margin_um=float(data.get("probe_safe_z_margin_um", cls.probe_safe_z_margin_um)),
             active_motor_speed_profile=normalize_motor_speed_profile(data.get("active_motor_speed_profile", MOTOR_SPEED_PROFILE_FAST)),
             controller_motion_parameters=normalize_controller_motion_parameters_map(controller_motion_parameters),
+            motor_axis_polarity=normalize_motor_axis_polarity_map(data.get("motor_axis_polarity")),
             camera_exposure_mode=normalize_camera_control_mode(data.get("camera_exposure_mode", CAMERA_CONTROL_MODE_AUTO)),
             camera_exposure=float(data.get("camera_exposure", cls.camera_exposure)),
             camera_gain_mode=normalize_camera_control_mode(data.get("camera_gain_mode", CAMERA_CONTROL_MODE_AUTO)),
             camera_gain=float(data.get("camera_gain", cls.camera_gain)),
+            camera_source=str(data.get("camera_source", cls.camera_source)),
             cc_accel_time_s=float(data.get("cc_accel_time_s", cls.cc_accel_time_s)),
             autofocus_settle_ms=int(data.get("autofocus_settle_ms", cls.autofocus_settle_ms)),
             autofocus_sample_count=int(data.get("autofocus_sample_count", cls.autofocus_sample_count)),
