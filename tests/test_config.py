@@ -48,6 +48,7 @@ class ProbeConfigTest(unittest.TestCase):
         self.assertEqual(config.camera_source, "auto")
         self.assertEqual(config.objective, 10)
         self.assertEqual(config.motor_axis_polarity, {"X": 1, "Y": 1, "Z": 1})
+        self.assertEqual(config.camera_fov_rotation_deg, 0.0)
         self.assertEqual(
             config.controller_motion_parameters,
             {
@@ -115,6 +116,7 @@ class ProbeConfigTest(unittest.TestCase):
                     "Z": {"minimum_speed": 7, "work_speed": 80, "acceleration": 12},
                 },
                 motor_axis_polarity={"X": -1, "Y": 1, "Z": 1},
+                camera_fov_rotation_deg=12.5,
                 camera_exposure_mode=CAMERA_CONTROL_MODE_MANUAL,
                 camera_exposure=-6.0,
                 camera_gain_mode=CAMERA_CONTROL_MODE_MANUAL,
@@ -144,6 +146,7 @@ class ProbeConfigTest(unittest.TestCase):
             self.assertEqual(loaded.controller_motion_parameters["Y"], {"minimum_speed": 6, "work_speed": 90, "acceleration": 11})
             self.assertEqual(loaded.controller_motion_parameters["Z"], {"minimum_speed": 7, "work_speed": 80, "acceleration": 12})
             self.assertEqual(loaded.motor_axis_polarity, {"X": -1, "Y": 1, "Z": 1})
+            self.assertAlmostEqual(loaded.camera_fov_rotation_deg, 12.5)
             self.assertEqual(loaded.camera_exposure_mode, CAMERA_CONTROL_MODE_MANUAL)
             self.assertAlmostEqual(loaded.camera_exposure, -6.0)
             self.assertEqual(loaded.camera_gain_mode, CAMERA_CONTROL_MODE_MANUAL)

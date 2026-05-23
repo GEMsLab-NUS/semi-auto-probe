@@ -41,6 +41,11 @@ class ImgStitchTest(unittest.TestCase):
         plane = fit_plane([(0, 0, 10), (10, 0, 20), (0, 10, 30), (10, 10, 40)])
         self.assertAlmostEqual(plane.z_at(5, 5), 25.0)
 
+    def test_stitch_settings_missing_registration_weight_defaults_to_point_nine(self) -> None:
+        settings = StitchSettings.from_dict({"overlap_x": 100, "overlap_y": 100})
+
+        self.assertAlmostEqual(settings.registration_weight, 0.9)
+
     def test_flat_field_correction_reduces_gradient(self) -> None:
         height, width = 80, 120
         gradient = np.linspace(0.5, 1.5, width, dtype=np.float32)
@@ -162,6 +167,17 @@ class ImgStitchTest(unittest.TestCase):
         self.assertEqual(positions[(0, 1)], (10.0, 0.0))
         self.assertEqual(positions[(1, 1)], (10.0, -20.0))
 
+    def test_stage_positions_from_um_applies_camera_fov_rotation(self) -> None:
+        records = (
+            TileRecord(0, 0, 1, "a.png", 0, 0, 0, 0.0, 0.0),
+            TileRecord(0, 1, 2, "b.png", 10, 0, 0, 10.0, 0.0),
+        )
+
+        positions = stage_positions_from_um(records, 2.0, camera_fov_rotation_deg=90.0)
+
+        self.assertAlmostEqual(positions[(0, 1)][0], 0.0)
+        self.assertAlmostEqual(positions[(0, 1)][1], 5.0)
+
     def test_recompose_session_zero_weight_uses_stage_positions(self) -> None:
         left = np.zeros((40, 50, 3), dtype=np.uint8)
         right = np.zeros((40, 50, 3), dtype=np.uint8)
@@ -192,6 +208,8 @@ class ImgStitchTest(unittest.TestCase):
 
         self.assertEqual(positions[(0, 1)], (40.0, 0.0))
         self.assertEqual(len(edges), 1)
+        self.assertEqual(edges[0].direction, "right")
+        self.assertEqual(edges[0].expected_shift_px, (40.0, 0.0))
         self.assertAlmostEqual(edges[0].correction_um, 0.0)
 
     def test_recompose_session_clamps_registration_correction(self) -> None:
@@ -242,6 +260,7 @@ class ImgStitchTest(unittest.TestCase):
             origin_stage_z=3,
             settings=StitchSettings(overlap_x=5, overlap_y=4, max_correction_um=8.0, registration_weight=0.25),
             tiles=(TileRecord(0, 0, 1, "tile.png", 1, 2, 3, 0.0, 0.0),),
+            camera_fov_rotation_deg=12.5,
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "session.json"
@@ -381,12 +400,6 @@ class ImgStitchTest(unittest.TestCase):
                 TileRecord(1, 1, 5, "e.png", 10, 10, 0, 10.0, 10.0),
             ),
         )
-        calls = {
-            ((0, 0), (0, 1)): (10.0, 0.0, 0.9),
-            ((0, 1), (0, 2)): (12.0, 0.0, 0.9),
-            ((0, 2), (1, 2)): (0.0, -10.0, 0.9),
-            ((1, 2), (1, 1)): (-40.0, 0.0, 0.0),
-        }
         original = img_stitch_module.estimate_overlap_shift
 
         def fake_estimate(_previous, _current, direction, _overlap_x, _overlap_y):
@@ -398,7 +411,7 @@ class ImgStitchTest(unittest.TestCase):
             elif direction == "left":
                 value = (-40.0, 0.0, 0.0)
             else:
-                value = calls[((0, 0), (0, 1))]
+                value = (10.0, 0.0, 0.9)
             return value
 
         try:

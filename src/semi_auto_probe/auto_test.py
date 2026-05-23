@@ -13,11 +13,13 @@ from .img_matrix import fov_polygon_for_stage_target
 
 AUTOTEST_PREVIEW_INTERVAL_MS = 45
 AUTOTEST_OVERLAY_REDRAW_INTERVAL_MS = 90
-PROBE_ASSIST_PROBES: tuple[tuple[str, str, str], ...] = (
-    ("Drain", "#f43f5e", "square"),
-    ("Source", "#38bdf8", "diamond"),
-    ("Gate", "#34d399", "ring"),
+PROBE_ASSIST_PROBES: tuple[tuple[str, str, str, str, str], ...] = (
+    ("圆", "#34d399", "ring", "100", "0"),
+    ("Low", "#38bdf8", "square", "-100", "0"),
+    ("山", "#f43f5e", "diamond", "0", "100"),
 )
+WOBBTEST_FLOW_CARD_HEIGHT_Z = 464
+WOBBTEST_FLOW_CARD_HEIGHT_ZXY = 544
 
 
 @dataclass(frozen=True)
@@ -924,8 +926,8 @@ class AutoTestPanel:
         self.viewport_var = tk.StringVar(value="Viewport: -")
         self.probe_assist_enabled_var = tk.BooleanVar(value=False)
         self.probe_assist_vars: dict[str, dict[str, tk.StringVar]] = {
-            name: {"du": tk.StringVar(value="0"), "dv": tk.StringVar(value="0")}
-            for name, _color, _style in PROBE_ASSIST_PROBES
+            name: {"du": tk.StringVar(value=default_du), "dv": tk.StringVar(value=default_dv)}
+            for name, _color, _style, default_du, default_dv in PROBE_ASSIST_PROBES
         }
         self.focusmap_status_var = tk.StringVar(value="FocusMap: checking")
         self.layoutmap_status_var = tk.StringVar(value="LayoutMap: checking")
@@ -1088,7 +1090,7 @@ class AutoTestPanel:
         ttk.Label(assist, text="Probe", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 2), padx=(0, 6))
         ttk.Label(assist, text="dU", style="Muted.TLabel").grid(row=1, column=1, sticky="w", pady=(8, 2), padx=(0, 6))
         ttk.Label(assist, text="dV", style="Muted.TLabel").grid(row=1, column=2, sticky="w", pady=(8, 2))
-        for row_index, (name, color, _style) in enumerate(PROBE_ASSIST_PROBES, start=2):
+        for row_index, (name, color, _style, _default_du, _default_dv) in enumerate(PROBE_ASSIST_PROBES, start=2):
             label = tk.Label(
                 assist,
                 text=name,
@@ -1886,7 +1888,7 @@ class AutoTestPanel:
 
     def probe_assist_specs(self) -> tuple[dict[str, object], ...]:
         specs: list[dict[str, object]] = []
-        for name, color, style in PROBE_ASSIST_PROBES:
+        for name, color, style, _default_du, _default_dv in PROBE_ASSIST_PROBES:
             variables = self.probe_assist_vars[name]
             du = float(variables["du"].get() or 0.0)
             dv = float(variables["dv"].get() or 0.0)
@@ -2317,7 +2319,8 @@ class AutoTestPanel:
         if not card.expanded:
             return self._flow_card_height(False)
         if card.type_id == "wobb_test":
-            return int((468 if self._wobb_card_mode_is_zxy(card) else 366) * self._flow_zoom)
+            height = WOBBTEST_FLOW_CARD_HEIGHT_ZXY if self._wobb_card_mode_is_zxy(card) else WOBBTEST_FLOW_CARD_HEIGHT_Z
+            return int(height * self._flow_zoom)
         definition = autotest_flow_definitions_by_type()[card.type_id]
         rows = max(1, math.ceil(len(definition.parameters) / 2))
         return int((116 + rows * 38) * self._flow_zoom)

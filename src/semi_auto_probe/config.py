@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .camera_stage_transform import normalize_camera_fov_rotation_deg
+
 
 DEFAULT_CONFIG_FILENAME = "probe_config.local.json"
 OBJECTIVE_OPTIONS = (20, 10, 5)
@@ -258,6 +260,7 @@ class ProbeConfig:
         for axis in JOG_STEP_AXES
     })
     motor_axis_polarity: dict[str, int] = field(default_factory=lambda: {axis: 1 for axis in JOG_STEP_AXES})
+    camera_fov_rotation_deg: float = 0.0
     camera_exposure_mode: str = CAMERA_CONTROL_MODE_AUTO
     camera_exposure: float = 0.0
     camera_gain_mode: str = CAMERA_CONTROL_MODE_AUTO
@@ -305,6 +308,7 @@ class ProbeConfig:
         self.active_motor_speed_profile = normalize_motor_speed_profile(self.active_motor_speed_profile)
         self.controller_motion_parameters = normalize_controller_motion_parameters_map(self.controller_motion_parameters)
         self.motor_axis_polarity = normalize_motor_axis_polarity_map(self.motor_axis_polarity)
+        self.camera_fov_rotation_deg = normalize_camera_fov_rotation_deg(self.camera_fov_rotation_deg)
         self.camera_exposure_mode = normalize_camera_control_mode(self.camera_exposure_mode)
         self.camera_gain_mode = normalize_camera_control_mode(self.camera_gain_mode)
         self.camera_exposure = float(self.camera_exposure)
@@ -425,6 +429,7 @@ class ProbeConfig:
                 axis: int(self.motor_axis_polarity[axis])
                 for axis in JOG_STEP_AXES
             },
+            "camera_fov_rotation_deg": self.camera_fov_rotation_deg,
             "camera_exposure_mode": self.camera_exposure_mode,
             "camera_exposure": self.camera_exposure,
             "camera_gain_mode": self.camera_gain_mode,
@@ -479,6 +484,7 @@ class ProbeConfig:
             active_motor_speed_profile=normalize_motor_speed_profile(data.get("active_motor_speed_profile", MOTOR_SPEED_PROFILE_FAST)),
             controller_motion_parameters=normalize_controller_motion_parameters_map(controller_motion_parameters),
             motor_axis_polarity=normalize_motor_axis_polarity_map(data.get("motor_axis_polarity")),
+            camera_fov_rotation_deg=normalize_camera_fov_rotation_deg(data.get("camera_fov_rotation_deg", cls.camera_fov_rotation_deg)),
             camera_exposure_mode=normalize_camera_control_mode(data.get("camera_exposure_mode", CAMERA_CONTROL_MODE_AUTO)),
             camera_exposure=float(data.get("camera_exposure", cls.camera_exposure)),
             camera_gain_mode=normalize_camera_control_mode(data.get("camera_gain_mode", CAMERA_CONTROL_MODE_AUTO)),

@@ -7,6 +7,8 @@ from typing import Iterable
 
 import numpy as np
 
+from .camera_stage_transform import normalize_camera_fov_rotation_deg, stage_delta_um_to_image_delta_px
+
 try:
     import cv2
 except ImportError:  # pragma: no cover - exercised in environments without OpenCV.
@@ -31,7 +33,7 @@ class StitchSettings:
     overlap_x: int
     overlap_y: int
     max_correction_um: float = 20.0
-    registration_weight: float = 0.0
+    registration_weight: float = 0.9
     show_seams: bool = True
     seam_response_yellow: float = 0.10
     seam_response_green: float = 0.25
@@ -73,7 +75,7 @@ class StitchSettings:
             overlap_x=int(data.get("overlap_x", 1)),
             overlap_y=int(data.get("overlap_y", 1)),
             max_correction_um=float(data.get("max_correction_um", 20.0)),
-            registration_weight=float(data.get("registration_weight", 0.0)),
+            registration_weight=float(data.get("registration_weight", 0.9)),
             show_seams=bool(data.get("show_seams", True)),
             seam_response_yellow=float(data.get("seam_response_yellow", 0.10)),
             seam_response_green=float(data.get("seam_response_green", 0.25)),
@@ -192,6 +194,7 @@ class StitchSession:
     origin_stage_z: int
     settings: StitchSettings
     tiles: tuple[TileRecord, ...]
+    camera_fov_rotation_deg: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -208,6 +211,7 @@ class StitchSession:
             "origin_stage_x": self.origin_stage_x,
             "origin_stage_y": self.origin_stage_y,
             "origin_stage_z": self.origin_stage_z,
+            "camera_fov_rotation_deg": normalize_camera_fov_rotation_deg(self.camera_fov_rotation_deg),
             "settings": self.settings.to_dict(),
             "tiles": [tile.to_dict() for tile in self.tiles],
         }
@@ -228,6 +232,7 @@ class StitchSession:
             origin_stage_x=int(data["origin_stage_x"]),
             origin_stage_y=int(data["origin_stage_y"]),
             origin_stage_z=int(data["origin_stage_z"]),
+            camera_fov_rotation_deg=normalize_camera_fov_rotation_deg(data.get("camera_fov_rotation_deg", 0.0)),
             settings=StitchSettings.from_dict(data["settings"]),  # type: ignore[arg-type]
             tiles=tuple(TileRecord.from_dict(tile) for tile in data["tiles"]),  # type: ignore[arg-type]
         )
@@ -512,7 +517,11 @@ def compose_mosaic(
     return np.clip(mosaic, 0, 255).astype(np.uint8)
 
 
-def stage_positions_from_um(tiles: Iterable[TileRecord], um_per_px: float) -> dict[GridIndex, tuple[float, float]]:
+def stage_positions_from_um(
+    tiles: Iterable[TileRecord],
+    um_per_px: float,
+    camera_fov_rotation_deg: float = 0.0,
+) -> dict[GridIndex, tuple[float, float]]:
     records = list(tiles)
     if not records:
         return {}
@@ -521,23 +530,22 @@ def stage_positions_from_um(tiles: Iterable[TileRecord], um_per_px: float) -> di
     origin_x_um = records[0].stage_x_um
     origin_y_um = records[0].stage_y_um
     return {
-        tile.key: (
-            (tile.stage_x_um - origin_x_um) / um_per_px,
-            -(tile.stage_y_um - origin_y_um) / um_per_px,
+        tile.key: stage_delta_um_to_image_delta_px(
+            tile.stage_x_um - origin_x_um,
+            tile.stage_y_um - origin_y_um,
+            um_per_px,
+            camera_fov_rotation_deg,
         )
         for tile in records
     }
 
 
-def _direction_between(previous: GridIndex, current: GridIndex) -> str:
-    previous_row, previous_col = previous
-    row, col = current
-    if row == previous_row and col > previous_col:
-        return "right"
-    if row == previous_row and col < previous_col:
-        return "left"
-    if row > previous_row:
-        return "up"
+def _direction_from_expected_shift(previous: GridIndex, current: GridIndex, shift: tuple[float, float]) -> str:
+    dx, dy = shift
+    if abs(dx) >= abs(dy) and abs(dx) > 1e-9:
+        return "right" if dx > 0 else "left"
+    if abs(dy) > 1e-9:
+        return "down" if dy > 0 else "up"
     raise ValueError(f"Unsupported tile transition: {previous} -> {current}")
 
 
@@ -570,11 +578,11 @@ def _measure_edge_shift(
     tile_images: dict[GridIndex, np.ndarray],
     base_positions: dict[GridIndex, tuple[float, float]],
 ) -> tuple[str, tuple[float, float], tuple[float, float], float]:
-    direction = _direction_between(previous_key, current_key)
     expected_shift = (
         base_positions[current_key][0] - base_positions[previous_key][0],
         base_positions[current_key][1] - base_positions[previous_key][1],
     )
+    direction = _direction_from_expected_shift(previous_key, current_key, expected_shift)
     try:
         measured_dx, measured_dy, response = estimate_overlap_shift(
             tile_images[previous_key],
@@ -669,8 +677,9 @@ def compose_mosaic_from_stage_positions(
     tiles: dict[GridIndex, np.ndarray],
     records: Iterable[TileRecord],
     um_per_px: float,
+    camera_fov_rotation_deg: float = 0.0,
 ) -> tuple[np.ndarray, dict[GridIndex, tuple[float, float]]]:
-    positions = stage_positions_from_um(records, um_per_px)
+    positions = stage_positions_from_um(records, um_per_px, camera_fov_rotation_deg)
     return compose_mosaic(tiles, positions), positions
 
 
@@ -834,7 +843,7 @@ def recompose_session(
     if settings.white_balance_correction:
         tile_images = white_balance_tile_set(tile_images)
 
-    base_positions = stage_positions_from_um(session.tiles, session.um_per_px)
+    base_positions = stage_positions_from_um(session.tiles, session.um_per_px, session.camera_fov_rotation_deg)
     initial_positions, _initial_path_edges = _path_positions_and_edges(session, settings, tile_images, base_positions)
     initial_edges = _all_adjacent_edges(session, settings, tile_images, base_positions, initial_positions)
     correction_centers = _green_edge_centers(initial_edges) if settings.use_green_edge_correction else {}

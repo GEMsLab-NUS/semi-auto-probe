@@ -643,6 +643,29 @@ class GDSMapperMotionBridgeTests(unittest.TestCase):
             },
         )
 
+    def test_worker_applies_y_axis_polarity_to_controller_direction(self) -> None:
+        try:
+            from semi_auto_probe.app import ProbeApp
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"ProbeApp import unavailable: {exc}")
+
+        app = ProbeApp.__new__(ProbeApp)
+        app.probe_config = ProbeConfig(motor_axis_polarity={"X": 1, "Y": -1, "Z": 1})
+        app.current_position_values = {"X": 10, "Y": -4, "Z": 0}
+        app.result_queue = queue.Queue()
+        app.serial_client = DummyMapperSerial()
+        app.serial_client.positions["Y"] = 4
+
+        ProbeApp._gds_mapper_move_worker(app, target_x_um=12.0, target_y_um=-6.0)
+
+        self.assertEqual(
+            app.serial_client.axis_params,
+            {
+                Axis.X: (False, 2, 100, 30),
+                Axis.Y: (False, 2, 100, 30),
+            },
+        )
+
     def test_worker_can_include_focus_z_stage_target(self) -> None:
         try:
             from semi_auto_probe.app import ProbeApp

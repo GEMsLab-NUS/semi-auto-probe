@@ -1369,7 +1369,7 @@ class GDSStageMapperPanel:
             "5 um": 5.0,
             "10 um": 10.0,
         }
-        self.snap_grid_var = tk.StringVar(value="1 um")
+        self.snap_grid_var = tk.StringVar(value="10 um")
         self.cursor_var = tk.StringVar(value="Cursor u, v: -")
         self.selection_var = tk.StringVar(value="Selected target: -")
         self.target_stage_var = tk.StringVar(value="Target stage: -")
@@ -1393,11 +1393,11 @@ class GDSStageMapperPanel:
         self.assist_color_var = tk.StringVar(value="#f43f5e")
         self.assist_label_var = tk.StringVar(value="Probe")
         self.motion_status_var = tk.StringVar(value="Idle")
-        self.stage_jog_step_um_var = tk.StringVar(value="10")
+        self.stage_jog_step_um_var = tk.StringVar(value="1")
         self.layout_jog_step_uv_var = tk.StringVar(value="1")
         self.magnifier_enabled_var = tk.BooleanVar(value=False)
-        self.magnifier_scale_var = tk.StringVar(value="2")
-        self.magnifier_radius_var = tk.StringVar(value="26")
+        self.magnifier_scale_var = tk.StringVar(value="4")
+        self.magnifier_radius_var = tk.StringVar(value="40")
         self.layout_jog_buttons: list[ttk.Button] = []
         self.responsive_labels: list[tuple[ttk.Label, float, int]] = []
         self.coord_vars: dict[str, tk.StringVar] = {axis: tk.StringVar(value="-") for axis in ("X", "Y", "Z", "U", "V")}
@@ -2520,13 +2520,13 @@ class GDSStageMapperPanel:
                 try:
                     magnification = float(self.magnifier_scale_var.get())
                 except ValueError:
-                    magnification = 2.0
-                    self.magnifier_scale_var.set("2")
+                    magnification = 4.0
+                    self.magnifier_scale_var.set("4")
                 try:
                     radius_fraction = float(self.magnifier_radius_var.get()) / 100.0
                 except ValueError:
-                    radius_fraction = 0.26
-                    self.magnifier_radius_var.set("26")
+                    radius_fraction = 0.40
+                    self.magnifier_radius_var.set("40")
                 payload = apply_center_magnifier_ppm(payload, magnification, radius_fraction)
                 magnifier_text = f" Magnifier {magnification:.2g}x, size {radius_fraction * 100:.0f}%."
             self.microscope_photo = tk.PhotoImage(data=payload, format="PPM")

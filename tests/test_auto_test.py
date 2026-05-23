@@ -11,6 +11,7 @@ from semi_auto_probe.auto_test import (
     AutoTestPanel,
     AutoTestPointSpec,
     AutoTestSettings,
+    PROBE_ASSIST_PROBES,
     autotest_point_specs_from_json_payload,
     autotest_point_specs_payload,
     compile_autotest_point_name,
@@ -256,22 +257,31 @@ class AutoTestTests(unittest.TestCase):
         card = create_autotest_flow_card("wobb_test", "card_wobb", expanded=True)
         z_height = panel._flow_card_height_for_card(card)
         card.params["mode"] = "Z-XY"
+        zxy_height = panel._flow_card_height_for_card(card)
 
-        self.assertGreater(panel._flow_card_height_for_card(card), z_height)
+        self.assertGreaterEqual(z_height, 450)
+        self.assertGreaterEqual(zxy_height, 530)
+        self.assertGreater(zxy_height, z_height)
 
     def test_autotest_probe_assist_builds_three_named_relative_overlays(self) -> None:
         panel = object.__new__(AutoTestPanel)
         panel.probe_assist_enabled_var = type("Var", (), {"get": lambda self: True})()
         panel.probe_assist_vars = {
-            "Drain": {"du": type("Var", (), {"get": lambda self: "1"})(), "dv": type("Var", (), {"get": lambda self: "2"})()},
-            "Source": {"du": type("Var", (), {"get": lambda self: "-1"})(), "dv": type("Var", (), {"get": lambda self: "0"})()},
-            "Gate": {"du": type("Var", (), {"get": lambda self: "0.5"})(), "dv": type("Var", (), {"get": lambda self: "-0.5"})()},
+            "圆": {"du": type("Var", (), {"get": lambda self: "1"})(), "dv": type("Var", (), {"get": lambda self: "2"})()},
+            "Low": {"du": type("Var", (), {"get": lambda self: "-1"})(), "dv": type("Var", (), {"get": lambda self: "0"})()},
+            "山": {"du": type("Var", (), {"get": lambda self: "0.5"})(), "dv": type("Var", (), {"get": lambda self: "-0.5"})()},
         }
 
         overlays = panel.probe_assist_overlays_for_center((10.0, 20.0))
 
-        self.assertEqual([overlay.label for overlay in overlays], ["Drain", "Source", "Gate"])
+        self.assertEqual([overlay.label for overlay in overlays], ["圆", "Low", "山"])
         self.assertEqual([overlay.point for overlay in overlays], [(11.0, 22.0), (9.0, 20.0), (10.5, 19.5)])
+
+    def test_autotest_probe_assist_default_offsets_match_probe_layout(self) -> None:
+        self.assertEqual(
+            [(name, du, dv) for name, _color, _style, du, dv in PROBE_ASSIST_PROBES],
+            [("圆", "100", "0"), ("Low", "-100", "0"), ("山", "0", "100")],
+        )
 
     def test_expanded_iv_card_height_accounts_for_all_params(self) -> None:
         panel = object.__new__(AutoTestPanel)

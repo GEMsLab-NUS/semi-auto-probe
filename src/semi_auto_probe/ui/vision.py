@@ -96,7 +96,7 @@ class VisionPanel:
         right_tools.grid(row=0, column=5, sticky="e")
         for column, (tool, label, command) in enumerate(
             (
-                ("cross", "+", lambda: self.set_tool("cross")),
+                ("cross", "\u2295", lambda: self.set_tool("cross")),
                 ("gds_overlay", "GDS Overlay", self.toggle_gds_overlay),
                 ("probe_assist", "Probe Assist", self.toggle_probe_assist),
             )
@@ -307,9 +307,10 @@ class VisionPanel:
             if self.cross_enabled:
                 cx = left + width / 2.0
                 cy = top + height / 2.0
-                self.canvas.create_oval(cx - 15, cy - 15, cx + 15, cy + 15, outline="#ef4444", width=2, tags="vision_overlay")
-                self.canvas.create_line(cx - 10, cy, cx + 10, cy, fill="#ef4444", width=2, tags="vision_overlay")
-                self.canvas.create_line(cx, cy - 10, cx, cy + 10, fill="#ef4444", width=2, tags="vision_overlay")
+                self.canvas.create_line(left, cy, right, cy, fill="#ef4444", width=1, dash=(8, 5), tags="vision_overlay")
+                self.canvas.create_line(cx, top, cx, bottom, fill="#ef4444", width=1, dash=(8, 5), tags="vision_overlay")
+                self.canvas.create_line(cx - 10, cy, cx + 10, cy, fill="#fecaca", width=2, tags="vision_overlay")
+                self.canvas.create_line(cx, cy - 10, cx, cy + 10, fill="#fecaca", width=2, tags="vision_overlay")
 
             self._draw_gds_overlay()
             if self.probe_assist_enabled:

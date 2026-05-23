@@ -110,6 +110,21 @@ class VisionCenterMoveTests(unittest.TestCase):
         self.assertEqual(plan["target_positions"], {"X": 115, "Y": 210})
         self.assertEqual(plan["axis_params"], {1: (True, 15, 100, 30), 2: (False, 10, 100, 30)})
 
+    def test_camera_fov_rotation_rotates_image_centering_delta(self) -> None:
+        app = self.make_app_shell()
+        app.probe_config.camera_fov_rotation_deg = 90.0
+
+        move = app._image_centering_move(
+            point_x=430,
+            point_y=225,
+            image_width=800,
+            image_height=450,
+            um_per_px=0.5,
+        )
+
+        self.assertAlmostEqual(move["X"][0], 0.0)
+        self.assertAlmostEqual(move["Y"][0], 15.0)
+
 
 if __name__ == "__main__":
     unittest.main()

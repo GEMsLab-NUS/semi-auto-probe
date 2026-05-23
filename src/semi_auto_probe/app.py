@@ -51,6 +51,11 @@ from .auto_test import (
     wobbtest_z_offsets_um,
 )
 from .camera import CameraSettings, UsbCamera, camera_source_choices, normalize_camera_source
+from .camera_stage_transform import (
+    image_delta_px_to_stage_delta_um,
+    normalize_camera_fov_rotation_deg,
+    stage_delta_um_to_image_delta_px,
+)
 from .config import (
     AUTOFOCUS_PEAK_MODEL_GAUSSIAN,
     AUTOFOCUS_PEAK_MODEL_LABELS,
@@ -128,12 +133,13 @@ from .protocol import COMM_TEST_COMMAND, FUNCTION_READ_POSITION, RESPONSE_HEAD, 
 from .protocol import payload_contains_clear_position_command
 from .serial_client import ControllerSerialClient, CommunicationTestResult, list_serial_ports
 from .ui.calibration_dialog import PixelCalibrationDialog
+from .ui.fov_rotation_dialog import FOVRotationCalibrationDialog
 from .ui.agent_panel import AgentPanel
 from .ui.vision import VisionPanel
 
 
 logger = configure_logging()
-DEFAULT_SERIAL_PORT = "COM5"
+DEFAULT_SERIAL_PORT = "COM7"
 RESULT_POLL_INTERVAL_MS = 25
 RESULT_POLL_MAX_EVENTS = 30
 RESULT_POLL_MAX_SECONDS = 0.012
@@ -712,7 +718,7 @@ class ProbeApp(tk.Tk):
         self.step_vars = {
             "X": tk.StringVar(value="10"),
             "Y": tk.StringVar(value="10"),
-            "Z": tk.StringVar(value="10"),
+            "Z": tk.StringVar(value="5"),
         }
         self.jog_step_levels = {
             axis: tuple(self.probe_config.jog_step_levels[axis])
@@ -750,15 +756,15 @@ class ProbeApp(tk.Tk):
         self.z_stack_save_raw_var = tk.BooleanVar(value=False)
         self.imgstitch_rows_var = tk.StringVar(value="3")
         self.imgstitch_cols_var = tk.StringVar(value="3")
-        self.imgstitch_overlap_x_var = tk.StringVar(value="120")
-        self.imgstitch_overlap_y_var = tk.StringVar(value="90")
+        self.imgstitch_overlap_x_var = tk.StringVar(value="100")
+        self.imgstitch_overlap_y_var = tk.StringVar(value="100")
         self.imgstitch_step_x_var = tk.StringVar(value="1000")
         self.imgstitch_step_y_var = tk.StringVar(value="1000")
         self.imgstitch_range_mode_var = tk.StringVar(value="Array")
         self.imgstitch_width_um_var = tk.StringVar(value="2000")
         self.imgstitch_height_um_var = tk.StringVar(value="2000")
         self.imgstitch_max_correction_um_var = tk.StringVar(value="20")
-        self.imgstitch_registration_weight_var = tk.StringVar(value="0")
+        self.imgstitch_registration_weight_var = tk.StringVar(value="0.9")
         self.imgstitch_show_seams_var = tk.BooleanVar(value=True)
         self.imgstitch_green_edge_correction_var = tk.BooleanVar(value=True)
         self.imgstitch_white_balance_var = tk.BooleanVar(value=True)
@@ -804,6 +810,9 @@ class ProbeApp(tk.Tk):
         self.safe_speed_percent_var = tk.StringVar(value=str(self.probe_config.safe_speed_percent))
         self.probe_safe_z_margin_um_var = tk.StringVar(value=f"{self.probe_config.probe_safe_z_margin_um:g}")
         self.motor_speed_profile_var = tk.StringVar(value=self._motor_speed_profile_label(self.probe_config.active_motor_speed_profile))
+        self.x_axis_reversed_var = tk.BooleanVar(value=self._config_axis_reversed("X"))
+        self.y_axis_reversed_var = tk.BooleanVar(value=self._config_axis_reversed("Y"))
+        self.camera_fov_rotation_var = tk.StringVar(value=f"{self.probe_config.camera_fov_rotation_deg:g}")
         self.controller_motion_parameter_vars = {
             axis: {
                 field_name: tk.StringVar(value=str(self.probe_config.controller_motion_parameters[axis][field_name]))
@@ -2014,8 +2023,12 @@ class ProbeApp(tk.Tk):
 
         image_dx_px = point_x - image_width / 2.0
         image_dy_px = point_y - image_height / 2.0
-        stage_x_um = image_dx_px * um_per_px
-        stage_y_um = -image_dy_px * um_per_px
+        stage_x_um, stage_y_um = image_delta_px_to_stage_delta_um(
+            image_dx_px,
+            image_dy_px,
+            um_per_px,
+            self._camera_fov_rotation_deg(),
+        )
         return {
             "image_dx_px": image_dx_px,
             "image_dy_px": image_dy_px,
@@ -2028,7 +2041,7 @@ class ProbeApp(tk.Tk):
         if pulses_per_um <= 0:
             raise ValueError(f"{axis} pulse-per-um must be positive.")
         pulses = int(round(abs(stage_um) * pulses_per_um))
-        return stage_um, pulses, stage_um < 0
+        return stage_um, pulses, pulses > 0 and stage_um < 0
 
     def _cc_axis_param(self, reverse: bool, pulses: int, speed_profile: str | None = None) -> tuple[bool, int, int, int]:
         speed = self._motion_speed_percent(speed_profile) if pulses else 0
@@ -2087,6 +2100,16 @@ class ProbeApp(tk.Tk):
         return str(plan["preview_text"])
 
     def main_view_gds_overlay_polygons(self, image_width: int, image_height: int) -> list[list[tuple[float, float]]]:
+        return self._main_view_gds_overlay_polygons(image_width, image_height, self._camera_fov_rotation_deg(), use_cache=True)
+
+    def _main_view_gds_overlay_polygons(
+        self,
+        image_width: int,
+        image_height: int,
+        camera_fov_rotation_deg: float,
+        *,
+        use_cache: bool,
+    ) -> list[list[tuple[float, float]]]:
         if image_width <= 0 or image_height <= 0 or self.gds_stage_mapper_panel is None:
             return []
         panel = self.gds_stage_mapper_panel
@@ -2117,12 +2140,11 @@ class ProbeApp(tk.Tk):
             round(float(current_x_um), 4),
             round(float(current_y_um), 4),
             round(float(um_per_px), 8),
+            round(float(normalize_camera_fov_rotation_deg(camera_fov_rotation_deg)), 8),
         )
-        if cache_key == self.main_gds_overlay_cache_key:
+        if use_cache and cache_key == self.main_gds_overlay_cache_key:
             return self.main_gds_overlay_cache_polygons
 
-        center_x = float(image_width) / 2.0
-        center_y = float(image_height) / 2.0
         margin_px = 80.0
         polygons: list[list[tuple[float, float]]] = []
         for shape in model.shapes:
@@ -2131,8 +2153,16 @@ class ProbeApp(tk.Tk):
             image_points: list[tuple[float, float]] = []
             for u, v in shape.points:
                 stage_x_um, stage_y_um = mapper.gds_to_stage(u, v)
-                image_x = center_x + (stage_x_um - current_x_um) / um_per_px
-                image_y = center_y - (stage_y_um - current_y_um) / um_per_px
+                image_x, image_y = self._stage_xy_um_to_main_image_point(
+                    stage_x_um,
+                    stage_y_um,
+                    current_x_um,
+                    current_y_um,
+                    image_width,
+                    image_height,
+                    um_per_px,
+                    camera_fov_rotation_deg,
+                )
                 image_points.append((image_x, image_y))
             min_x = min(point[0] for point in image_points)
             max_x = max(point[0] for point in image_points)
@@ -2143,9 +2173,34 @@ class ProbeApp(tk.Tk):
             polygons.append(image_points)
             if len(polygons) >= 1000:
                 break
-        self.main_gds_overlay_cache_key = cache_key
-        self.main_gds_overlay_cache_polygons = polygons
+        if use_cache:
+            self.main_gds_overlay_cache_key = cache_key
+            self.main_gds_overlay_cache_polygons = polygons
         return polygons
+
+    def _stage_xy_um_to_main_image_point(
+        self,
+        stage_x_um: float,
+        stage_y_um: float,
+        current_x_um: float,
+        current_y_um: float,
+        image_width: int,
+        image_height: int,
+        um_per_px: float,
+        camera_fov_rotation_deg: float | None = None,
+    ) -> tuple[float, float]:
+        center_x = float(image_width) / 2.0
+        center_y = float(image_height) / 2.0
+        image_dx_px, image_dy_px = stage_delta_um_to_image_delta_px(
+            float(stage_x_um) - float(current_x_um),
+            float(stage_y_um) - float(current_y_um),
+            float(um_per_px),
+            self._camera_fov_rotation_deg() if camera_fov_rotation_deg is None else camera_fov_rotation_deg,
+        )
+        return (
+            center_x + image_dx_px,
+            center_y + image_dy_px,
+        )
 
     def _on_autotest_probe_assist_changed(self) -> None:
         if self.vision_panel is not None:
@@ -2168,16 +2223,21 @@ class ProbeApp(tk.Tk):
             overlays = self.autotest_panel.probe_assist_overlays_for_center(center_gds)
         except Exception:
             return []
-        center_x = float(image_width) / 2.0
-        center_y = float(image_height) / 2.0
         points: list[tuple[float, float, str, str]] = []
         for overlay in overlays:
             try:
                 stage_x_um, stage_y_um = mapper.gds_to_stage(*overlay.point)
             except Exception:
                 continue
-            image_x = center_x + (float(stage_x_um) - current_x_um) / um_per_px
-            image_y = center_y - (float(stage_y_um) - current_y_um) / um_per_px
+            image_x, image_y = self._stage_xy_um_to_main_image_point(
+                stage_x_um,
+                stage_y_um,
+                current_x_um,
+                current_y_um,
+                image_width,
+                image_height,
+                um_per_px,
+            )
             points.append((image_x, image_y, overlay.label, overlay.color))
         return points
 
@@ -3152,12 +3212,18 @@ class ProbeApp(tk.Tk):
 
         ttk.Label(optical_panel, text="CALIBRATION", style="Section.TLabel").grid(row=3, column=0, columnspan=2, sticky="w", pady=(24, 6))
         ttk.Label(optical_panel, textvariable=self.calibration_status_var, style="Value.TLabel", wraplength=360, padding=10).grid(row=4, column=0, columnspan=2, sticky="ew")
-        ttk.Button(optical_panel, text="Calibrate Pixels", style="Accent.TButton", command=self.open_pixel_calibration).grid(row=5, column=0, sticky="ew", pady=(14, 0), padx=(0, 8))
-        ttk.Button(optical_panel, text="Save Config", command=self.apply_config).grid(row=5, column=1, sticky="ew", pady=(14, 0), padx=(8, 0))
-        ttk.Label(optical_panel, textvariable=self.config_status_var, style="Status.TLabel", wraplength=360, padding=10).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        ttk.Label(optical_panel, text="Camera FOV rotation (deg)", style="Muted.TLabel").grid(row=5, column=0, sticky="w", pady=(14, 2), padx=(0, 8))
+        fov_rotation_row = ttk.Frame(optical_panel, style="Panel.TFrame")
+        fov_rotation_row.grid(row=5, column=1, sticky="ew", pady=(14, 2), padx=(8, 0))
+        fov_rotation_row.columnconfigure(0, weight=1)
+        self._numeric_entry(fov_rotation_row, self.camera_fov_rotation_var, kind="float", minimum=-180, maximum=180, width=8).grid(row=0, column=0, sticky="ew", padx=(0, 8), ipady=5)
+        ttk.Button(fov_rotation_row, text="Calibrate", command=self.open_fov_rotation_calibration).grid(row=0, column=1, sticky="e")
+        ttk.Button(optical_panel, text="Calibrate Pixels", style="Accent.TButton", command=self.open_pixel_calibration).grid(row=6, column=0, sticky="ew", pady=(14, 0), padx=(0, 8))
+        ttk.Button(optical_panel, text="Save Config", command=self.apply_config).grid(row=6, column=1, sticky="ew", pady=(14, 0), padx=(8, 0))
+        ttk.Label(optical_panel, textvariable=self.config_status_var, style="Status.TLabel", wraplength=360, padding=10).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(18, 0))
 
         main_control_panel = ttk.Frame(optical_panel, style="Panel.TFrame")
-        main_control_panel.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(24, 0))
+        main_control_panel.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(24, 0))
         main_control_panel.columnconfigure(1, weight=1)
         ttk.Label(main_control_panel, text="MAIN CONTROL", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
         ttk.Label(main_control_panel, text="Motion keys", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
@@ -3180,7 +3246,7 @@ class ProbeApp(tk.Tk):
         self._numeric_entry(main_control_panel, self.layoutbond_fov_height_var, kind="float", minimum=0.000001, maximum=1_000_000).grid(row=6, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
 
         camera_control_panel = ttk.Frame(optical_panel, style="Panel.TFrame")
-        camera_control_panel.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(24, 0))
+        camera_control_panel.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(24, 0))
         camera_control_panel.columnconfigure(1, weight=1)
         camera_mode_values = [CAMERA_CONTROL_MODE_LABELS[mode] for mode in CAMERA_CONTROL_MODES]
         ttk.Label(camera_control_panel, text="CAMERA CONTROL", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
@@ -3238,8 +3304,25 @@ class ProbeApp(tk.Tk):
             if variable is self.cc_accel_time_var:
                 self.cc_accel_time_entry = entry
 
+        axis_direction_panel = ttk.Frame(motion_panel, style="Panel.TFrame")
+        axis_direction_panel.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(22, 0))
+        axis_direction_panel.columnconfigure(0, weight=1)
+        ttk.Label(axis_direction_panel, text="GLOBAL AXIS DIRECTION", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        for row_index, (label, variable) in enumerate(
+            (
+                ("Reverse X axis / horizontal", self.x_axis_reversed_var),
+                ("Reverse Y axis / vertical", self.y_axis_reversed_var),
+            ),
+            start=1,
+        ):
+            row_frame = ttk.Frame(axis_direction_panel, style="Panel.TFrame")
+            row_frame.grid(row=row_index, column=0, columnspan=2, sticky="ew", pady=2)
+            row_frame.columnconfigure(0, weight=1)
+            ttk.Label(row_frame, text=label, style="Panel.TLabel").grid(row=0, column=0, sticky="w")
+            ToggleSwitch(row_frame, variable, self.colors, command=lambda: self.apply_config(save=True)).grid(row=0, column=1, sticky="e")
+
         speed_panel = ttk.Frame(motion_panel, style="Panel.TFrame")
-        speed_panel.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(22, 0))
+        speed_panel.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(22, 0))
         speed_panel.columnconfigure(1, weight=1)
         ttk.Label(speed_panel, text="MOTOR SPEED", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
         ttk.Label(speed_panel, text="Speed profile", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
@@ -3265,7 +3348,7 @@ class ProbeApp(tk.Tk):
         self._numeric_entry(speed_panel, self.probe_safe_z_margin_um_var, kind="float", minimum=0, maximum=1_000_000, width=7).grid(row=5, column=1, sticky="ew", padx=(8, 0), pady=(8, 2), ipady=5)
 
         d5_panel = ttk.Frame(motion_panel, style="Panel.TFrame")
-        d5_panel.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(22, 0))
+        d5_panel.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(22, 0))
         d5_panel.columnconfigure((1, 2, 3), weight=1, uniform="d5_params")
         ttk.Label(d5_panel, text="D5 CONTROLLER READBACK", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
         ttk.Label(d5_panel, text="Axis", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
@@ -3284,9 +3367,9 @@ class ProbeApp(tk.Tk):
         ttk.Button(d5_panel, text="Read D5 X/Y/Z", command=self.read_controller_motion_parameters).grid(row=5, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         ttk.Label(d5_panel, textvariable=self.controller_motion_status_var, style="Status.TLabel", wraplength=360, padding=8).grid(row=6, column=0, columnspan=4, sticky="ew", pady=(8, 0))
 
-        ttk.Label(motion_panel, text="CONVERSION", style="Section.TLabel").grid(row=9, column=0, columnspan=2, sticky="w", pady=(24, 6))
-        ttk.Label(motion_panel, textvariable=self.motor_conversion_var, style="Value.TLabel", wraplength=360, padding=10).grid(row=10, column=0, columnspan=2, sticky="ew")
-        ttk.Button(motion_panel, text="Apply Mapping", style="Accent.TButton", command=self.apply_config).grid(row=11, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        ttk.Label(motion_panel, text="CONVERSION", style="Section.TLabel").grid(row=10, column=0, columnspan=2, sticky="w", pady=(24, 6))
+        ttk.Label(motion_panel, textvariable=self.motor_conversion_var, style="Value.TLabel", wraplength=360, padding=10).grid(row=11, column=0, columnspan=2, sticky="ew")
+        ttk.Button(motion_panel, text="Apply Mapping", style="Accent.TButton", command=self.apply_config).grid(row=12, column=0, columnspan=2, sticky="ew", pady=(18, 0))
 
         autofocus_panel = ttk.Frame(system_panel, style="Panel.TFrame")
         autofocus_panel.grid(row=0, column=0, columnspan=3, sticky="ew")
@@ -3476,16 +3559,16 @@ class ProbeApp(tk.Tk):
         scheme = getattr(self.probe_config, "keyboard_motion_scheme", KEYBOARD_MOTION_SCHEME_ARROW_PAGE)
         if scheme == KEYBOARD_MOTION_SCHEME_WASD_QE:
             return {
-                "d": ("X", False),
-                "a": ("X", True),
+                "d": ("X", True),
+                "a": ("X", False),
                 "w": ("Y", False),
                 "s": ("Y", True),
                 "q": ("Z", False),
                 "e": ("Z", True),
             }
         return {
-            "Right": ("X", False),
-            "Left": ("X", True),
+            "Right": ("X", True),
+            "Left": ("X", False),
             "Up": ("Y", False),
             "Down": ("Y", True),
             "Prior": ("Z", False),
@@ -3593,6 +3676,22 @@ class ProbeApp(tk.Tk):
     def _motion_speed_percent(self, profile: str | None = None) -> int:
         return self.probe_config.motor_speed_percent(profile)
 
+    def _camera_fov_rotation_deg(self) -> float:
+        return normalize_camera_fov_rotation_deg(getattr(self.probe_config, "camera_fov_rotation_deg", 0.0))
+
+    def _config_axis_reversed(self, axis: str | Axis) -> bool:
+        return self._axis_polarity(axis) < 0
+
+    def _motor_axis_polarity_from_config_vars(self) -> dict[str, int]:
+        current_polarity = getattr(self.probe_config, "motor_axis_polarity", {}) or {}
+        polarity = {
+            axis: int(current_polarity.get(axis, 1))
+            for axis in JOG_STEP_AXES
+        }
+        polarity["X"] = -1 if bool(self.x_axis_reversed_var.get()) else 1
+        polarity["Y"] = -1 if bool(self.y_axis_reversed_var.get()) else 1
+        return polarity
+
     def _axis_polarity(self, axis: str | Axis) -> int:
         axis_name = axis.name if isinstance(axis, Axis) else str(axis).upper()
         polarity_map = getattr(self.probe_config, "motor_axis_polarity", {}) or {}
@@ -3619,6 +3718,30 @@ class ProbeApp(tk.Tk):
         logical_delta = -int(pulses) if reverse else int(pulses)
         controller_delta = self._controller_delta_from_logical_delta(axis, logical_delta)
         return controller_delta < 0, abs(controller_delta)
+
+    def _remap_current_positions_for_polarity_change(self, previous_polarity: dict[str, int]) -> None:
+        if "current_position_values" not in self.__dict__:
+            return
+        changed = False
+        for axis in JOG_STEP_AXES:
+            old_polarity = -1 if int(previous_polarity.get(axis, 1)) < 0 else 1
+            new_polarity = self._axis_polarity(axis)
+            if old_polarity == new_polarity or axis not in self.current_position_values:
+                continue
+            self.current_position_values[axis] = int(self.current_position_values[axis]) * old_polarity * new_polarity
+            changed = True
+        if not changed:
+            return
+        if "modified_position_axes" in self.__dict__:
+            self.modified_position_axes.clear()
+        if "position_edit_modes" in self.__dict__:
+            for axis in JOG_STEP_AXES:
+                self.position_edit_modes[axis] = None
+        for axis, value in self.current_position_values.items():
+            if "position_vars" in self.__dict__ and axis in self.position_vars:
+                self.position_vars[axis].set(str(value))
+            if axis == "Z" and "autofocus_z_var" in self.__dict__:
+                self.autofocus_z_var.set(str(value))
 
     def _on_motor_speed_profile_selected(self, _event: tk.Event | None = None) -> None:
         profile = self._motor_speed_profile_from_label(self.motor_speed_profile_var.get())
@@ -3961,6 +4084,8 @@ class ProbeApp(tk.Tk):
                     }
                     for axis in JOG_STEP_AXES
                 },
+                motor_axis_polarity=self._motor_axis_polarity_from_config_vars(),
+                camera_fov_rotation_deg=normalize_camera_fov_rotation_deg(self.camera_fov_rotation_var.get()),
                 camera_exposure_mode=self._camera_control_mode_from_label(self.camera_exposure_mode_var.get()),
                 camera_exposure=float(self.camera_exposure_var.get() or 0.0),
                 camera_gain_mode=self._camera_control_mode_from_label(self.camera_gain_mode_var.get()),
@@ -3998,12 +4123,18 @@ class ProbeApp(tk.Tk):
             self.status_var.set(f"Config invalid: {exc}")
             return False
 
+        previous_polarity = {axis: self._axis_polarity(axis) for axis in JOG_STEP_AXES}
         self.probe_config = updated
         derive_missing_calibrations(self.probe_config)
+        self._remap_current_positions_for_polarity_change(previous_polarity)
         self._sync_config_vars_from_config()
         self.agent_planner = self._build_agent_planner()
         self._update_config_display()
         self._refresh_keyboard_bindings()
+        self.main_gds_overlay_cache_key = None
+        vision_panel = getattr(self, "vision_panel", None)
+        if vision_panel is not None:
+            vision_panel.draw_overlay()
         if save:
             try:
                 save_probe_config(self.probe_config, self.config_path)
@@ -4043,6 +4174,9 @@ class ProbeApp(tk.Tk):
         self.safe_speed_percent_var.set(str(self.probe_config.safe_speed_percent))
         self.probe_safe_z_margin_um_var.set(f"{self.probe_config.probe_safe_z_margin_um:g}")
         self.motor_speed_profile_var.set(self._motor_speed_profile_label(self.probe_config.active_motor_speed_profile))
+        self.x_axis_reversed_var.set(self._config_axis_reversed("X"))
+        self.y_axis_reversed_var.set(self._config_axis_reversed("Y"))
+        self.camera_fov_rotation_var.set(f"{self.probe_config.camera_fov_rotation_deg:g}")
         for axis in JOG_STEP_AXES:
             for field_name in ("minimum_speed", "work_speed", "acceleration"):
                 self.controller_motion_parameter_vars[axis][field_name].set(str(self.probe_config.controller_motion_parameters[axis][field_name]))
@@ -4098,6 +4232,11 @@ class ProbeApp(tk.Tk):
             f"X: {self.probe_config.um_per_pulse('X'):.6g} um/pulse, {self.probe_config.pulses_per_um('X'):.6g} pulse/um",
             f"Y: {self.probe_config.um_per_pulse('Y'):.6g} um/pulse, {self.probe_config.pulses_per_um('Y'):.6g} pulse/um",
             f"Z: {self.probe_config.um_per_pulse('Z'):.6g} um/pulse, {self.probe_config.pulses_per_um('Z'):.6g} pulse/um",
+            "Axis direction: "
+            + "; ".join(
+                f"{axis} {'reversed' if self._config_axis_reversed(axis) else 'normal'}"
+                for axis in JOG_STEP_AXES
+            ),
             (
                 f"Motor speed: {self._motor_speed_profile_label(self.probe_config.active_motor_speed_profile)} "
                 f"{self.probe_config.motor_speed_percent()}% "
@@ -4118,6 +4257,7 @@ class ProbeApp(tk.Tk):
                 f"gain {self._camera_control_mode_label(self.probe_config.camera_gain_mode)} "
                 f"{self.probe_config.camera_gain:g}"
             ),
+            f"Camera FOV rotation: {self.probe_config.camera_fov_rotation_deg:g} deg",
             f"CC accel/decel: {self.probe_config.cc_accel_time_s:.3g}s ({self.probe_config.cc_acceleration_units()} units)",
             f"AF settle: {self.probe_config.autofocus_settle_ms} ms",
             f"AF integration: {self.probe_config.autofocus_sample_count} frame(s)",
@@ -4161,6 +4301,47 @@ class ProbeApp(tk.Tk):
         self._update_config_display()
         self.config_status_var.set(f"Calibration saved: {dialog.result_um_per_px:.6g} um/px")
         self.status_var.set("Pixel calibration saved.")
+
+    def open_fov_rotation_calibration(self) -> None:
+        if not self.apply_config(save=False):
+            return
+        with self.camera_lock:
+            image_bgr = None if self.latest_stitch_frame is None else self.latest_stitch_frame.copy()
+        if image_bgr is None:
+            self.config_status_var.set("No camera frame available for FOV rotation calibration.")
+            self.status_var.set("No camera frame available for FOV rotation calibration.")
+            return
+        if self.gds_stage_mapper_panel is None or self.gds_stage_mapper_panel.model is None or self.gds_stage_mapper_panel.mapper is None:
+            self.config_status_var.set("Load and bind a GDS mapping before FOV rotation calibration.")
+            self.status_var.set("Load and bind a GDS mapping before FOV rotation calibration.")
+            return
+        um_per_px = self.probe_config.current_um_per_px()
+        if um_per_px is None or um_per_px <= 0:
+            self.config_status_var.set("Pixel calibration is required before FOV rotation calibration.")
+            self.status_var.set("Pixel calibration is required before FOV rotation calibration.")
+            return
+
+        def overlay_provider(angle_deg: float, image_width: int, image_height: int) -> list[list[tuple[float, float]]]:
+            return self._main_view_gds_overlay_polygons(image_width, image_height, angle_deg, use_cache=False)
+
+        dialog = FOVRotationCalibrationDialog(
+            self,
+            image_bgr,
+            self.colors,
+            self.probe_config.camera_fov_rotation_deg,
+            overlay_provider,
+        )
+        self.wait_window(dialog)
+        if dialog.result_angle_deg is None:
+            return
+        self.camera_fov_rotation_var.set(f"{dialog.result_angle_deg:g}")
+        if not self.apply_config(save=True):
+            return
+        self.main_gds_overlay_cache_key = None
+        if self.vision_panel is not None:
+            self.vision_panel.draw_overlay()
+        self.config_status_var.set(f"FOV rotation saved: {dialog.result_angle_deg:g} deg")
+        self.status_var.set("Camera FOV rotation calibration saved.")
 
     def _append_hex_history(self, direction: str, message: str) -> None:
         if not hasattr(self, "hex_history"):
@@ -8500,6 +8681,7 @@ class ProbeApp(tk.Tk):
                     origin_stage_z=origin_z,
                     settings=settings,
                     tiles=tuple(records),
+                    camera_fov_rotation_deg=self._camera_fov_rotation_deg(),
                 )
                 session.save(self.imgstitch_session_dir / "session.json")
                 mosaic, positions, edges = recompose_session(session, settings, tiles)
