@@ -41,7 +41,15 @@ from .agent import (
     stage_move_axes,
     stage_move_parameter_blockers,
 )
-from .auto_test import AutoTestFlowStep, AutoTestPanel, AutoTestPoint, AutoTestSettings, generate_autotest_points
+from .auto_test import (
+    AutoTestFlowStep,
+    AutoTestPanel,
+    AutoTestPoint,
+    AutoTestSettings,
+    generate_autotest_points,
+    wobbtest_xy_offsets_um,
+    wobbtest_z_offsets_um,
+)
 from .camera import CameraSettings, UsbCamera, camera_source_choices, normalize_camera_source
 from .config import (
     AUTOFOCUS_PEAK_MODEL_GAUSSIAN,
@@ -111,6 +119,7 @@ from .keithley2450 import (
     IVSweepStatistics,
     Keithley2450IVRunner,
     calculate_iv_statistics,
+    constant_voltage_current_config_from_params,
     iv_sweep_config_from_params,
 )
 from .logging_utils import colorize_hex_frame, configure_logging, print_startup_banner
@@ -128,7 +137,12 @@ DEFAULT_SERIAL_PORT = "COM5"
 RESULT_POLL_INTERVAL_MS = 25
 RESULT_POLL_MAX_EVENTS = 30
 RESULT_POLL_MAX_SECONDS = 0.012
+AUTOTEST_RESULT_POLL_INTERVAL_MS = 8
+AUTOTEST_RESULT_POLL_MAX_EVENTS = 12
+AUTOTEST_RESULT_POLL_MAX_SECONDS = 0.004
+PANEL_PREVIEW_MIN_INTERVAL_SECONDS = 1.0 / 24.0
 REALTIME_POSITION_UI_INTERVAL_SECONDS = 0.05
+IV_PLOT_MIN_DRAW_INTERVAL_SECONDS = 0.12
 AUTOFOCUS_POST_SETTLE_DISCARD_FRAMES = 2
 FOCUSMAP_AUTOSAVE_FILENAME = "last_focusmap_mapping.json"
 ADMIN_TOKEN_ENV = "SEMI_AUTO_PROBE_ADMIN_TOKEN"
@@ -204,6 +218,10 @@ class IVPlotWindow:
         self.parent = parent
         self.colors = colors
         self.samples: list[dict[str, object]] = []
+        self.iv_voltages: list[float] = []
+        self.iv_currents: list[float] = []
+        self.iv_draw_job: str | None = None
+        self.last_iv_draw_at = 0.0
         self.heatmap_values: dict[tuple[int, int], float] = {}
         self.heatmap_rows = 1
         self.heatmap_cols = 1
@@ -270,6 +288,14 @@ class IVPlotWindow:
         reset_heatmap: bool = False,
     ) -> None:
         self.samples.clear()
+        self.iv_voltages.clear()
+        self.iv_currents.clear()
+        if self.iv_draw_job is not None:
+            try:
+                self.window.after_cancel(self.iv_draw_job)
+            except tk.TclError:
+                pass
+            self.iv_draw_job = None
         self.title_var.set(f"IV sweep: {point_name}")
         self.status_var.set(config.summary())
         self.line.set_data([], [])
@@ -287,16 +313,41 @@ class IVPlotWindow:
 
     def add_sample(self, sample: dict[str, object]) -> None:
         self.samples.append(sample)
-        voltages = [float(item["voltage_v"]) for item in self.samples if _finite_number(item.get("voltage_v"))]
-        currents = [float(item["current_a"]) for item in self.samples if _finite_number(item.get("current_a"))]
-        if len(voltages) != len(currents) or not voltages:
+        if not _finite_number(sample.get("voltage_v")) or not _finite_number(sample.get("current_a")):
             return
-        self.line.set_data(voltages, currents)
-        self.iv_axes.relim()
-        self.iv_axes.autoscale_view()
+        self.iv_voltages.append(float(sample["voltage_v"]))
+        self.iv_currents.append(float(sample["current_a"]))
         index = int(sample.get("index", len(self.samples)))
         total = int(sample.get("total", len(self.samples)))
-        self.status_var.set(f"Point {index}/{total} | V={voltages[-1]:.6g} V | I={currents[-1]:.6g} A")
+        self.status_var.set(f"Point {index}/{total} | V={self.iv_voltages[-1]:.6g} V | I={self.iv_currents[-1]:.6g} A")
+        self._schedule_iv_draw(force=index >= total)
+
+    def _schedule_iv_draw(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if force or now - self.last_iv_draw_at >= IV_PLOT_MIN_DRAW_INTERVAL_SECONDS:
+            if self.iv_draw_job is not None:
+                try:
+                    self.window.after_cancel(self.iv_draw_job)
+                except tk.TclError:
+                    pass
+                self.iv_draw_job = None
+            self._draw_iv_samples()
+            return
+        if self.iv_draw_job is None:
+            delay_ms = max(20, int((IV_PLOT_MIN_DRAW_INTERVAL_SECONDS - (now - self.last_iv_draw_at)) * 1000))
+            try:
+                self.iv_draw_job = self.window.after(delay_ms, self._draw_iv_samples)
+            except tk.TclError:
+                self.iv_draw_job = None
+
+    def _draw_iv_samples(self) -> None:
+        self.iv_draw_job = None
+        if not self.iv_voltages or len(self.iv_voltages) != len(self.iv_currents):
+            return
+        self.line.set_data(self.iv_voltages, self.iv_currents)
+        self.iv_axes.relim()
+        self.iv_axes.autoscale_view()
+        self.last_iv_draw_at = time.monotonic()
         self.canvas.draw_idle()
 
     def add_statistics(self, row: int, col: int, statistics: dict[str, object]) -> None:
@@ -348,8 +399,144 @@ class IVPlotWindow:
                 self.heatmap_axes.plot(col, row, marker="s", markersize=18, markerfacecolor="none", markeredgecolor="#facc15", markeredgewidth=1.5)
 
     def finish(self, message: str) -> None:
+        self._schedule_iv_draw(force=True)
         self.status_var.set(message)
         self.show()
+
+
+class WobbTestPlotWindow:
+    def __init__(self, parent: tk.Tk, colors: dict[str, str]) -> None:
+        self.parent = parent
+        self.colors = colors
+        self.samples: list[dict[str, object]] = []
+        self.trace_points: list[tuple[float, float]] = []
+        self.draw_job: str | None = None
+        self.last_draw_at = 0.0
+        self.window = tk.Toplevel(parent)
+        self.window.title("AutoTest WobbTest")
+        self.window.geometry("980x560")
+        self.window.configure(bg=colors["bg"])
+        self.window.protocol("WM_DELETE_WINDOW", self.hide)
+
+        header = ttk.Frame(self.window, style="App.TFrame", padding=(14, 12, 14, 8))
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        self.title_var = tk.StringVar(value="WobbTest")
+        self.status_var = tk.StringVar(value="Waiting")
+        ttk.Label(header, textvariable=self.title_var, style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header, textvariable=self.status_var, style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(3, 0))
+
+        plot_frame = ttk.Frame(self.window, style="Panel.TFrame", padding=8)
+        plot_frame.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        plot_frame.columnconfigure(0, weight=1)
+        plot_frame.rowconfigure(0, weight=1)
+        self.window.columnconfigure(0, weight=1)
+        self.window.rowconfigure(1, weight=1)
+
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.figure import Figure
+
+        self.figure = Figure(figsize=(8.8, 4.2), dpi=100, facecolor=colors["surface"])
+        self.trace_axes = self.figure.add_subplot(121)
+        self.current_axes = self.figure.add_subplot(122)
+        self._style_axes(self.trace_axes)
+        self._style_axes(self.current_axes)
+        self.trace_axes.set_title("Time-Z", color=colors["text"])
+        self.trace_axes.set_xlabel("Time (s)", color=colors["text"])
+        self.trace_axes.set_ylabel("Z offset (um)", color=colors["text"])
+        self.current_axes.set_title("Current by Z", color=colors["text"])
+        self.current_axes.set_xlabel("Z offset (um)", color=colors["text"])
+        self.current_axes.set_ylabel("Current (A)", color=colors["text"])
+        self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
+        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
+    def _style_axes(self, axes) -> None:
+        axes.set_facecolor(self.colors["surface_2"])
+        axes.tick_params(colors=self.colors["muted"])
+        axes.grid(True, color=self.colors["border"], alpha=0.45)
+        for spine in axes.spines.values():
+            spine.set_color(self.colors["border"])
+
+    def hide(self) -> None:
+        self.window.withdraw()
+
+    def show(self) -> None:
+        self.window.deiconify()
+        self.window.lift()
+
+    def start(self, point_name: str, mode: str, summary: str) -> None:
+        self.samples.clear()
+        self.trace_points.clear()
+        self.title_var.set(f"WobbTest: {point_name}")
+        self.status_var.set(f"{mode.upper()} | {summary}")
+        self._draw(force=True)
+        self.show()
+
+    def add_position(self, elapsed_s: float, z_um: float) -> None:
+        self.trace_points.append((float(elapsed_s), float(z_um)))
+        self._schedule_draw()
+
+    def add_sample(self, sample: dict[str, object]) -> None:
+        self.samples.append(sample)
+        if _finite_number(sample.get("current_a")) and _finite_number(sample.get("z_um")):
+            self.status_var.set(f"Z={float(sample['z_um']):.6g} um | I={float(sample['current_a']):.6g} A")
+        self._schedule_draw()
+
+    def finish(self, message: str) -> None:
+        self.status_var.set(message)
+        self._draw(force=True)
+        self.show()
+
+    def _schedule_draw(self) -> None:
+        now = time.monotonic()
+        if now - self.last_draw_at >= IV_PLOT_MIN_DRAW_INTERVAL_SECONDS:
+            self._draw(force=True)
+            return
+        if self.draw_job is None:
+            delay_ms = max(20, int((IV_PLOT_MIN_DRAW_INTERVAL_SECONDS - (now - self.last_draw_at)) * 1000))
+            try:
+                self.draw_job = self.window.after(delay_ms, self._draw)
+            except tk.TclError:
+                self.draw_job = None
+
+    def _draw(self, force: bool = False) -> None:
+        self.draw_job = None
+        self.trace_axes.clear()
+        self.current_axes.clear()
+        self._style_axes(self.trace_axes)
+        self._style_axes(self.current_axes)
+        self.trace_axes.set_title("Time-Z", color=self.colors["text"])
+        self.trace_axes.set_xlabel("Time (s)", color=self.colors["text"])
+        self.trace_axes.set_ylabel("Z offset (um)", color=self.colors["text"])
+        if self.trace_points:
+            times = [point[0] for point in self.trace_points]
+            z_values = [point[1] for point in self.trace_points]
+            self.trace_axes.plot(times, z_values, color="#38bdf8", linewidth=1.8, marker="o", markersize=3.5)
+        else:
+            self.trace_axes.text(0.5, 0.5, "No motion samples", ha="center", va="center", color=self.colors["muted"], transform=self.trace_axes.transAxes)
+
+        grouped: dict[float, list[float]] = {}
+        for sample in self.samples:
+            if _finite_number(sample.get("z_um")) and _finite_number(sample.get("current_a")):
+                z_key = round(float(sample["z_um"]), 9)
+                grouped.setdefault(z_key, []).append(float(sample["current_a"]))
+        self.current_axes.set_title("Current by Z", color=self.colors["text"])
+        self.current_axes.set_xlabel("Z offset (um)", color=self.colors["text"])
+        self.current_axes.set_ylabel("Current (A)", color=self.colors["text"])
+        if grouped:
+            z_values = sorted(grouped)
+            data = [grouped[z_value] for z_value in z_values]
+            positions = list(range(1, len(z_values) + 1))
+            self.current_axes.boxplot(data, positions=positions, patch_artist=True, boxprops={"facecolor": "#0f2f57", "color": "#60a5fa"}, medianprops={"color": "#facc15"})
+            for x_position, currents in zip(positions, data):
+                xs = [x_position + (index - (len(currents) - 1) / 2.0) * 0.035 for index in range(len(currents))]
+                self.current_axes.scatter(xs, currents, color="#f8fafc", edgecolors="#38bdf8", s=18, zorder=3)
+            self.current_axes.set_xticks(positions)
+            self.current_axes.set_xticklabels([f"{z_value:.4g}" for z_value in z_values], rotation=30, ha="right", color=self.colors["muted"])
+        else:
+            self.current_axes.text(0.5, 0.5, "No current samples", ha="center", va="center", color=self.colors["muted"], transform=self.current_axes.transAxes)
+        self.last_draw_at = time.monotonic()
+        self.canvas.draw_idle()
 
 
 def _finite_number(value: object) -> bool:
@@ -380,6 +567,7 @@ class ProbeApp(tk.Tk):
         self.imgmatrix_panel: ImgMatrixPanel | None = None
         self.autotest_panel: AutoTestPanel | None = None
         self.iv_plot_window: IVPlotWindow | None = None
+        self.wobb_test_plot_window: WobbTestPlotWindow | None = None
         self.edge_trace_panel: EdgeTracePanel | None = None
         self.agent_panel: AgentPanel | None = None
         self.agent_function_spec_path = Path.cwd() / "docs" / "agent-function-spec.md"
@@ -423,12 +611,19 @@ class ProbeApp(tk.Tk):
         self.edge_trace_stop_event = threading.Event()
         self.latest_stitch_frame = None
         self.latest_stitch_frame_captured_at = 0.0
+        self.latest_panel_preview_ppm: bytes | None = None
+        self.latest_panel_preview_captured_at = 0.0
+        self.latest_panel_preview_source_at = 0.0
+        self.main_gds_overlay_cache_key: tuple[object, ...] | None = None
+        self.main_gds_overlay_cache_polygons: list[list[tuple[float, float]]] = []
         self.imgstitch_progress_current = 0
         self.imgstitch_progress_total = 0
         self.imgmatrix_progress_current = 0
         self.imgmatrix_progress_total = 0
         self.autotest_progress_current = 0
         self.autotest_progress_total = 0
+        self.last_autotest_wobble_status_at = 0.0
+        self.last_iv_sample_status_at = 0.0
         self.current_page = "Main"
         self.active_page_name: str | None = None
         self.config_path = Path.cwd() / DEFAULT_CONFIG_FILENAME
@@ -526,7 +721,7 @@ class ProbeApp(tk.Tk):
         self.motion_mode_var = tk.StringVar(value="Relative")
         self.main_focusmap_plane_var = tk.BooleanVar(value=False)
         self.probe_down_var = tk.BooleanVar(value=False)
-        self.probe_down_state_var = tk.StringVar(value="UP")
+        self.probe_down_state_var = tk.StringVar(value="Separate")
         self.keyboard_move_enabled_var = tk.BooleanVar(value=True)
         self.realtime_enabled = False
         self.realtime_button_var = tk.StringVar(value="Continue")
@@ -746,6 +941,24 @@ class ProbeApp(tk.Tk):
             arrowcolor=[("active", self.colors["accent"]), ("focus", self.colors["accent"]), ("!disabled", self.colors["muted"])],
         )
         style.configure("Error.TCombobox", fieldbackground="#3f1018", background="#4c0519", foreground="#fecdd3", bordercolor="#be123c", lightcolor="#be123c", darkcolor="#be123c", arrowcolor="#fecdd3", relief="flat", borderwidth=1, padding=(10, 7))
+        style.configure("SerialDisconnected.TCombobox", fieldbackground="#fee2e2", background="#fecaca", foreground="#7f1d1d", bordercolor="#f87171", lightcolor="#f87171", darkcolor="#f87171", arrowcolor="#7f1d1d", relief="flat", borderwidth=1, padding=(10, 7))
+        style.map(
+            "SerialDisconnected.TCombobox",
+            fieldbackground=[("readonly", "#fee2e2"), ("focus", "#fecaca"), ("!disabled", "#fee2e2")],
+            foreground=[("readonly", "#7f1d1d"), ("!disabled", "#7f1d1d")],
+            background=[("active", "#fecaca"), ("pressed", "#fca5a5"), ("!disabled", "#fecaca")],
+            bordercolor=[("focus", "#ef4444"), ("!disabled", "#f87171")],
+            arrowcolor=[("active", "#7f1d1d"), ("focus", "#7f1d1d"), ("!disabled", "#7f1d1d")],
+        )
+        style.configure("SerialConnected.TCombobox", fieldbackground="#dcfce7", background="#bbf7d0", foreground="#14532d", bordercolor="#4ade80", lightcolor="#4ade80", darkcolor="#4ade80", arrowcolor="#14532d", relief="flat", borderwidth=1, padding=(10, 7))
+        style.map(
+            "SerialConnected.TCombobox",
+            fieldbackground=[("readonly", "#dcfce7"), ("focus", "#bbf7d0"), ("!disabled", "#dcfce7")],
+            foreground=[("readonly", "#14532d"), ("!disabled", "#14532d")],
+            background=[("active", "#bbf7d0"), ("pressed", "#86efac"), ("!disabled", "#bbf7d0")],
+            bordercolor=[("focus", "#22c55e"), ("!disabled", "#4ade80")],
+            arrowcolor=[("active", "#14532d"), ("focus", "#14532d"), ("!disabled", "#14532d")],
+        )
         style.configure("TSpinbox", fieldbackground=self.colors["input"], background=self.colors["surface_3"], foreground=self.colors["text"], bordercolor=self.colors["border"], lightcolor=self.colors["border"], darkcolor=self.colors["border"], arrowcolor=self.colors["muted"], relief="flat", borderwidth=1, padding=(10, 7), arrowsize=14)
         style.map(
             "TSpinbox",
@@ -984,29 +1197,37 @@ class ProbeApp(tk.Tk):
         toolbar = ttk.Frame(header, style="Toolbar.TFrame", padding=(10, 8))
         toolbar.grid(row=0, column=1, rowspan=2, sticky="e", padx=(16, 0))
 
-        ttk.Label(toolbar, text="SERIAL", style="Muted.TLabel").grid(row=0, column=0, padx=(0, 6))
-        self.port_combo = ttk.Combobox(toolbar, textvariable=self.port_var, width=10, state="readonly")
-        self.port_combo.grid(row=0, column=1, padx=(0, 6), ipady=1)
-        ttk.Label(toolbar, text="PROBE", style="Muted.TLabel").grid(row=0, column=2, padx=(4, 5))
+        probe_group = ttk.Frame(toolbar, style="Toolbar.TFrame")
+        probe_group.grid(row=0, column=0, sticky="w", padx=(0, 14))
+        ttk.Label(probe_group, text="PROBE", style="Muted.TLabel").grid(row=0, column=0, padx=(0, 6))
         ToggleSwitch(
-            toolbar,
+            probe_group,
             self.probe_down_var,
             self.colors,
             command=self._on_probe_down_toggle,
             background=self.colors["surface"],
             width=42,
             height=22,
-        ).grid(row=0, column=3, padx=(0, 5))
-        ttk.Label(toolbar, textvariable=self.probe_down_state_var, style="Muted.TLabel").grid(row=0, column=4, padx=(0, 12))
-        ttk.Button(toolbar, text="Refresh", style="Ghost.TButton", command=self.refresh_ports).grid(row=0, column=5, padx=(0, 6))
-        ttk.Button(toolbar, text="Connect", style="Accent.TButton", command=self.connect_and_test_serial).grid(row=0, column=6, padx=(0, 6))
-        ttk.Button(toolbar, text="Test", command=self.run_comm_test).grid(row=0, column=7, padx=(0, 12))
+        ).grid(row=0, column=1, sticky="w", padx=(0, 5))
+        ttk.Label(probe_group, textvariable=self.probe_down_state_var, style="Muted.TLabel", width=9, anchor="w").grid(row=0, column=2)
 
-        ttk.Label(toolbar, text="CAM", style="Muted.TLabel").grid(row=0, column=8, padx=(0, 6))
-        self.camera_index_spinbox = ttk.Combobox(toolbar, textvariable=self.camera_index_var, values=camera_source_choices(), width=15)
-        self.camera_index_spinbox.grid(row=0, column=9, padx=(0, 6), ipady=1)
-        ttk.Button(toolbar, text="Restart", command=self.restart_camera).grid(row=0, column=10, padx=(0, 10))
-        ttk.Button(toolbar, text="EMERGENCY STOP", style="Danger.TButton", command=self.emergency_stop).grid(row=0, column=11)
+        serial_group = ttk.Frame(toolbar, style="Toolbar.TFrame")
+        serial_group.grid(row=0, column=1, sticky="w", padx=(0, 14))
+        ttk.Label(serial_group, text="SERIAL", style="Muted.TLabel").grid(row=0, column=0, padx=(0, 6))
+        self.port_combo = ttk.Combobox(serial_group, textvariable=self.port_var, width=10, state="readonly")
+        self.port_combo.grid(row=0, column=1, padx=(0, 6), ipady=1)
+        ttk.Button(serial_group, text="Refresh", style="Ghost.TButton", command=self.refresh_ports).grid(row=0, column=2, padx=(0, 6))
+        ttk.Button(serial_group, text="Connect", style="Accent.TButton", command=self.connect_and_test_serial).grid(row=0, column=3, padx=(0, 6))
+        ttk.Button(serial_group, text="Test", command=self.run_comm_test).grid(row=0, column=4)
+        self._update_serial_port_style()
+
+        camera_group = ttk.Frame(toolbar, style="Toolbar.TFrame")
+        camera_group.grid(row=0, column=2, sticky="w", padx=(0, 10))
+        ttk.Label(camera_group, text="CAM", style="Muted.TLabel").grid(row=0, column=0, padx=(0, 6))
+        self.camera_index_spinbox = ttk.Combobox(camera_group, textvariable=self.camera_index_var, values=camera_source_choices(), width=15)
+        self.camera_index_spinbox.grid(row=0, column=1, padx=(0, 6), ipady=1)
+        ttk.Button(camera_group, text="Restart", command=self.restart_camera).grid(row=0, column=2)
+        ttk.Button(toolbar, text="EMERGENCY STOP", style="Danger.TButton", command=self.emergency_stop).grid(row=0, column=3)
 
         content = ttk.Frame(self, style="App.TFrame")
         content.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 14))
@@ -1026,10 +1247,10 @@ class ProbeApp(tk.Tk):
         }
         module_tab_labels["ImgMatrix"] = "🔳 ImgMatrix"
         module_tab_labels["AutoTest"] = "🧪 AutoTest"
-        module_tab_labels["EdgeTrace"] = "EdgeTrace"
+        module_tab_labels["EdgeTrace"] = "\u26a1 EdgeTrace"
         tab_bar = ttk.Frame(content, style="App.TFrame")
         tab_bar.grid(row=0, column=0, sticky="w")
-        for col, name in enumerate(("Main", "AutoFocus", "FocusMap", "ImgStitch", "LayoutBond", "ImgMatrix", "AutoTest", "EdgeTrace", "AI Agent", "Communication", "Config")):
+        for col, name in enumerate(("Main", "AutoFocus", "FocusMap", "LayoutBond", "ImgStitch", "ImgMatrix", "AutoTest", "EdgeTrace", "AI Agent", "Communication", "Config")):
             tab_bar.columnconfigure(col, minsize=116, uniform="top_tabs")
             label = tk.Label(
                 tab_bar,
@@ -1197,6 +1418,8 @@ class ProbeApp(tk.Tk):
             get_um_per_px=self.probe_config.current_um_per_px,
             move_point_to_center=self.move_image_point_to_center,
             get_centering_preview=self.image_centering_preview,
+            get_gds_overlay_polygons=self.main_view_gds_overlay_polygons,
+            get_probe_assist_points=self.main_view_probe_assist_points,
         )
 
         controls_panel = ttk.Frame(self.main_pane, style="Panel.TFrame", padding=10)
@@ -1221,7 +1444,7 @@ class ProbeApp(tk.Tk):
             move_to_stage_um=self.move_gds_mapper_target,
             move_to_stage_xyz_um=self.move_gds_mapper_stage_target,
             get_focus_z_um=self._gds_mapper_focus_z_um,
-            get_microscope_preview=self.agent_microscope_preview,
+            get_microscope_preview=lambda: self.panel_microscope_preview("LayoutBond"),
             fov_width_var=self.layoutbond_fov_width_var,
             fov_height_var=self.layoutbond_fov_height_var,
             use_focus_z_var=self.main_focusmap_plane_var,
@@ -1238,7 +1461,7 @@ class ProbeApp(tk.Tk):
             self.colors,
             get_stage_position_um=self._gds_mapper_current_stage_um,
             get_mapper=self._imgmatrix_mapper,
-            get_microscope_preview=self.agent_microscope_preview,
+            get_microscope_preview=lambda: self.panel_microscope_preview("ImgMatrix"),
             fov_width_var=self.layoutbond_fov_width_var,
             fov_height_var=self.layoutbond_fov_height_var,
             tile_acquisition_var=self.imgstitch_tile_acquisition_var,
@@ -1267,13 +1490,14 @@ class ProbeApp(tk.Tk):
             get_mapper=self._imgmatrix_mapper,
             get_focusmap_ready=self._autotest_focusmap_ready,
             get_layoutmap_ready=self._autotest_layoutmap_ready,
-            get_microscope_preview=self.agent_microscope_preview,
+            get_microscope_preview=lambda: self.panel_microscope_preview("AutoTest"),
             fov_width_var=self.layoutbond_fov_width_var,
             fov_height_var=self.layoutbond_fov_height_var,
             start_run=self.start_autotest,
             stop_run=self.stop_autotest,
             set_status=self.status_var.set,
             on_overlay_changed=self._set_layoutbond_matrix_overlay,
+            on_probe_assist_changed=self._on_autotest_probe_assist_changed,
         )
         self._sync_autotest_from_layoutbond()
 
@@ -1289,7 +1513,7 @@ class ProbeApp(tk.Tk):
             get_focusmap_ready=self._autotest_focusmap_ready,
             get_layoutmap_ready=self._autotest_layoutmap_ready,
             get_layout_context=self._edge_trace_layout_context,
-            get_microscope_preview=self.agent_microscope_preview,
+            get_microscope_preview=lambda: self.panel_microscope_preview("EdgeTrace"),
             fov_width_var=self.layoutbond_fov_width_var,
             fov_height_var=self.layoutbond_fov_height_var,
             start_run=self.start_edge_trace,
@@ -1360,7 +1584,7 @@ class ProbeApp(tk.Tk):
             parent,
             self.colors,
             get_context=self.agent_context,
-            get_microscope_preview=self.agent_microscope_preview,
+            get_microscope_preview=lambda: self.panel_microscope_preview("AI Agent"),
             draw_autofocus_plot=self.draw_agent_autofocus_plot,
             plan_instruction=self.plan_agent_instruction,
             execute_plan=self.execute_agent_plan,
@@ -1459,17 +1683,34 @@ class ProbeApp(tk.Tk):
         return None
 
     def agent_microscope_preview(self) -> bytes | None:
-        with self.camera_lock:
-            frame = None if self.latest_stitch_frame is None else self.latest_stitch_frame.copy()
-        if frame is None:
+        return self.latest_panel_preview_ppm
+
+    def panel_microscope_preview(self, page_name: str) -> bytes | None:
+        if self.current_page != page_name:
             return None
+        return self.latest_panel_preview_ppm
+
+    def _should_build_panel_preview(self) -> bool:
+        return self.current_page in {"LayoutBond", "ImgMatrix", "AutoTest", "EdgeTrace", "AI Agent"}
+
+    def _update_panel_preview_cache(self, image_bgr, captured_at: float) -> None:
+        if not self._should_build_panel_preview():
+            return
+        now = time.monotonic()
+        if captured_at <= self.latest_panel_preview_source_at:
+            return
+        if now - self.latest_panel_preview_captured_at < PANEL_PREVIEW_MIN_INTERVAL_SECONDS:
+            return
         try:
             import cv2
 
+            frame = image_bgr
             height, width = frame.shape[:2]
             scale = min(520 / max(width, 1), 292 / max(height, 1), 1.0)
             if scale < 1.0:
                 frame = cv2.resize(frame, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA)
+            else:
+                frame = frame.copy()
             height, width = frame.shape[:2]
             center_x = width // 2
             center_y = height // 2
@@ -1477,9 +1718,11 @@ class ProbeApp(tk.Tk):
             cv2.line(frame, (center_x, center_y - 18), (center_x, center_y + 18), (45, 212, 191), 1, cv2.LINE_AA)
             cv2.rectangle(frame, (8, 8), (width - 9, height - 9), (51, 65, 85), 1)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            return f"P6 {width} {height} 255\n".encode("ascii") + rgb.tobytes()
+            self.latest_panel_preview_ppm = f"P6 {width} {height} 255\n".encode("ascii") + rgb.tobytes()
+            self.latest_panel_preview_captured_at = now
+            self.latest_panel_preview_source_at = captured_at
         except Exception:
-            return None
+            return
 
     def plan_agent_instruction(self, instruction: str) -> AgentPlan:
         plan = self.agent_planner.plan(instruction, self.agent_context())
@@ -1842,6 +2085,101 @@ class ProbeApp(tk.Tk):
         except ValueError as exc:
             return str(exc)
         return str(plan["preview_text"])
+
+    def main_view_gds_overlay_polygons(self, image_width: int, image_height: int) -> list[list[tuple[float, float]]]:
+        if image_width <= 0 or image_height <= 0 or self.gds_stage_mapper_panel is None:
+            return []
+        panel = self.gds_stage_mapper_panel
+        model = panel.model
+        mapper = panel.mapper
+        if model is None or mapper is None:
+            return []
+        um_per_px = self.probe_config.current_um_per_px()
+        if um_per_px is None or um_per_px <= 0:
+            return []
+        visible_layer = None
+        for layer in panel.viewer.layer_order or list(model.layers):
+            if panel.viewer.layer_visibility.get(layer, False):
+                visible_layer = layer
+                break
+        if visible_layer is None:
+            raise RuntimeError("No active LayoutMap GDS layer is visible.")
+        try:
+            current_x_um, current_y_um, _current_z_um = self._gds_mapper_current_stage_um()
+        except Exception:
+            return []
+        cache_key = (
+            image_width,
+            image_height,
+            id(model),
+            id(mapper),
+            visible_layer,
+            round(float(current_x_um), 4),
+            round(float(current_y_um), 4),
+            round(float(um_per_px), 8),
+        )
+        if cache_key == self.main_gds_overlay_cache_key:
+            return self.main_gds_overlay_cache_polygons
+
+        center_x = float(image_width) / 2.0
+        center_y = float(image_height) / 2.0
+        margin_px = 80.0
+        polygons: list[list[tuple[float, float]]] = []
+        for shape in model.shapes:
+            if shape.layer_key != visible_layer or len(shape.points) < 3:
+                continue
+            image_points: list[tuple[float, float]] = []
+            for u, v in shape.points:
+                stage_x_um, stage_y_um = mapper.gds_to_stage(u, v)
+                image_x = center_x + (stage_x_um - current_x_um) / um_per_px
+                image_y = center_y - (stage_y_um - current_y_um) / um_per_px
+                image_points.append((image_x, image_y))
+            min_x = min(point[0] for point in image_points)
+            max_x = max(point[0] for point in image_points)
+            min_y = min(point[1] for point in image_points)
+            max_y = max(point[1] for point in image_points)
+            if max_x < -margin_px or min_x > image_width + margin_px or max_y < -margin_px or min_y > image_height + margin_px:
+                continue
+            polygons.append(image_points)
+            if len(polygons) >= 1000:
+                break
+        self.main_gds_overlay_cache_key = cache_key
+        self.main_gds_overlay_cache_polygons = polygons
+        return polygons
+
+    def _on_autotest_probe_assist_changed(self) -> None:
+        if self.vision_panel is not None:
+            self.vision_panel.draw_overlay()
+
+    def main_view_probe_assist_points(self, image_width: int, image_height: int) -> list[tuple[float, float, str, str]]:
+        if image_width <= 0 or image_height <= 0 or self.autotest_panel is None:
+            return []
+        if not self.autotest_panel.probe_assist_enabled():
+            return []
+        mapper = self._imgmatrix_mapper()
+        if mapper is None:
+            return []
+        um_per_px = self.probe_config.current_um_per_px()
+        if um_per_px is None or um_per_px <= 0:
+            return []
+        try:
+            current_x_um, current_y_um, _current_z_um = self._gds_mapper_current_stage_um()
+            center_gds = mapper.stage_to_gds(current_x_um, current_y_um)
+            overlays = self.autotest_panel.probe_assist_overlays_for_center(center_gds)
+        except Exception:
+            return []
+        center_x = float(image_width) / 2.0
+        center_y = float(image_height) / 2.0
+        points: list[tuple[float, float, str, str]] = []
+        for overlay in overlays:
+            try:
+                stage_x_um, stage_y_um = mapper.gds_to_stage(*overlay.point)
+            except Exception:
+                continue
+            image_x = center_x + (float(stage_x_um) - current_x_um) / um_per_px
+            image_y = center_y - (float(stage_y_um) - current_y_um) / um_per_px
+            points.append((image_x, image_y, overlay.label, overlay.color))
+        return points
 
     def _move_vision_center_worker(self, axis_params: dict[Axis, tuple[bool, int, int, int]], expected_targets: dict[str, int]) -> None:
         assert self.serial_client is not None
@@ -3864,6 +4202,7 @@ class ProbeApp(tk.Tk):
     def _record_hex_history_for_source(source: str) -> bool:
         motion_sources = {
             "af_plane",
+            "autotest",
             "autofocus",
             "autofocus manual",
             "button",
@@ -6135,14 +6474,105 @@ class ProbeApp(tk.Tk):
         self.status_var.set(message)
 
     def _on_probe_down_toggle(self) -> None:
-        if self.probe_down_var.get():
-            self.probe_down_state_var.set("DOWN")
-            self.status_var.set(f"Probe-down guard enabled. XY moves use {self.probe_config.probe_safe_z_margin_um:g} um safe Z clearance.")
+        self._set_probe_guard_state(bool(self.probe_down_var.get()))
+
+    def _set_probe_guard_state(self, enabled: bool, *, announce: bool = True) -> None:
+        self.probe_down_var.set(bool(enabled))
+        if enabled:
+            self.probe_down_state_var.set("Contact")
+            if announce:
+                self.status_var.set(f"Probe-down guard enabled. XY moves use {self.probe_config.probe_safe_z_margin_um:g} um safe Z clearance.")
             logger.info("Probe-down guard enabled.")
         else:
-            self.probe_down_state_var.set("UP")
-            self.status_var.set("Probe-down guard disabled.")
+            self.probe_down_state_var.set("Separate")
+            if announce:
+                self.status_var.set("Probe-down guard disabled.")
             logger.info("Probe-down guard disabled.")
+        self._update_probe_buttons()
+
+    def _update_probe_buttons(self) -> None:
+        up_button = getattr(self, "probe_up_button", None)
+        down_button = getattr(self, "probe_down_button", None)
+        if up_button is None or down_button is None:
+            return
+        is_down = bool(self.probe_down_var.get())
+        up_button.configure(
+            bg="#0f3b2d" if not is_down else self.colors["surface_3"],
+            fg="#d1fae5" if not is_down else self.colors["text"],
+            highlightthickness=1 if not is_down else 0,
+            highlightbackground="#2dd4bf",
+        )
+        down_button.configure(
+            bg="#0f3b2d" if is_down else self.colors["surface_3"],
+            fg="#d1fae5" if is_down else self.colors["text"],
+            highlightthickness=1 if is_down else 0,
+            highlightbackground="#2dd4bf",
+        )
+
+    def probe_down_to_focusz(self) -> None:
+        self._start_probe_focus_move(probe_down=True)
+
+    def probe_up_to_focusz_safe(self) -> None:
+        self._start_probe_focus_move(probe_down=False)
+
+    def _probe_focus_move_blocker(self) -> str | None:
+        if self.motion_busy or self.keyboard_motion_busy:
+            return "Motion is busy; probe move skipped."
+        if self.position_read_pending:
+            return "Position read is pending; probe move skipped."
+        if get_sample_plane_model() is None:
+            return self._focusmap_plane_missing_message()
+        for flag_name, label in (
+            ("autofocus_running", "AutoFocus"),
+            ("af_plane_running", "FocusMap"),
+            ("imgstitch_running", "ImgStitch"),
+            ("imgmatrix_running", "ImgMatrix"),
+            ("autotest_running", "AutoTest"),
+            ("edge_trace_running", "EdgeTrace"),
+        ):
+            if bool(getattr(self, flag_name, False)):
+                return f"{label} is running; probe move skipped."
+        return None
+
+    def _start_probe_focus_move(self, *, probe_down: bool) -> None:
+        blocker = self._probe_focus_move_blocker()
+        if blocker:
+            self.status_var.set(blocker)
+            logger.warning(blocker)
+            return
+        if not self.serial_client:
+            self.connect_serial()
+        if not self.serial_client:
+            return
+        self.motion_busy = True
+        self.clear_position_edits()
+        direction = "down to FocusZ" if probe_down else "up to FocusZ safe clearance"
+        self.status_var.set(f"Probe moving {direction}...")
+        threading.Thread(target=self._probe_focus_move_worker, args=(probe_down,), daemon=True).start()
+
+    def _probe_focus_move_worker(self, probe_down: bool) -> None:
+        assert self.serial_client is not None
+        try:
+            entries = self.serial_client.read_stable_xyz_positions()
+            self.result_queue.put(("read_positions", entries, "probe"))
+            current_x = self._axis_from_position_entries(entries, Axis.X)
+            current_y = self._axis_from_position_entries(entries, Axis.Y)
+            current_z = self._axis_from_position_entries(entries, Axis.Z)
+            focus_z = self._focusmap_z_target_at_xy(current_x, current_y)
+            if focus_z is None:
+                self.result_queue.put(("probe_focus_unavailable",))
+                return
+            target_z = focus_z if probe_down else focus_z - self._probe_safe_z_margin_pulses()
+            self.result_queue.put(("probe_focus_target", target_z))
+            if current_z != target_z:
+                self._move_absolute_stage(current_x, current_y, target_z, source="probe", expected_targets={"Z": target_z})
+            else:
+                self.result_queue.put(("read_positions", entries, "probe", {"Z": target_z}))
+            self.result_queue.put(("probe_focus_done", probe_down, target_z))
+        except Exception as exc:
+            self.result_queue.put(("motor_error", "PROBE", exc))
+        finally:
+            self.result_queue.put(("motor_done",))
 
     def _disable_focusmap_plane_z_controls_if_unavailable(self) -> None:
         if get_sample_plane_model() is not None:
@@ -6913,7 +7343,7 @@ class ProbeApp(tk.Tk):
             details = f"{details}; running axes: {', '.join(sorted(last_running))}"
         raise RuntimeError(f"{move_label} did not reach target before continuing: {details}")
 
-    def start_autotest(self, settings: AutoTestSettings) -> None:
+    def start_autotest(self, settings: AutoTestSettings, points_override: tuple[AutoTestPoint, ...] | None = None) -> None:
         if self.autotest_running or self.motion_busy:
             if self.autotest_panel is not None:
                 self.autotest_panel.set_status("Motion is busy; AutoTest skipped.")
@@ -6934,7 +7364,9 @@ class ProbeApp(tk.Tk):
             return
         try:
             normalized_settings = settings.normalized()
-            points = generate_autotest_points(normalized_settings, self.gds_stage_mapper_panel.mapper)
+            points = tuple(points_override) if points_override is not None else generate_autotest_points(normalized_settings, self.gds_stage_mapper_panel.mapper)
+            if not points:
+                raise ValueError("AutoTest point list is empty.")
         except Exception as exc:
             if self.autotest_panel is not None:
                 self.autotest_panel.set_status(f"Invalid AutoTest settings: {exc}")
@@ -6963,6 +7395,8 @@ class ProbeApp(tk.Tk):
         self.motion_busy = True
         self.autotest_progress_current = 0
         self.autotest_progress_total = len(points)
+        self.last_autotest_wobble_status_at = 0.0
+        self.last_iv_sample_status_at = 0.0
         self.autotest_stop_event.clear()
         if self.autotest_panel is not None:
             self.autotest_panel.set_running(True)
@@ -6978,7 +7412,7 @@ class ProbeApp(tk.Tk):
     @staticmethod
     def _autotest_requires_session_dir(settings: AutoTestSettings) -> bool:
         flow_types = {step.type_id for step in settings.measurement_flow}
-        return "photo" in settings.measurement_steps or "photo" in flow_types or "iv" in flow_types
+        return "photo" in settings.measurement_steps or bool({"photo", "iv", "wobb_test"} & flow_types)
 
     def stop_autotest(self) -> None:
         self.autotest_stop_event.set()
@@ -6997,6 +7431,7 @@ class ProbeApp(tk.Tk):
             suffix += 1
         (session_dir / "images").mkdir(parents=True, exist_ok=False)
         (session_dir / "iv").mkdir(parents=True, exist_ok=True)
+        (session_dir / "wobb").mkdir(parents=True, exist_ok=True)
         return session_dir
 
     def _autotest_worker(self, settings: AutoTestSettings, points: tuple[AutoTestPoint, ...], session_dir: Path | None) -> None:
@@ -7052,6 +7487,13 @@ class ProbeApp(tk.Tk):
                 if self.autotest_stop_event.is_set():
                     break
 
+                entries = self._autotest_apply_contact_wobble_and_offset(current_z, probe_z, normalized_settings)
+                current_x = self._axis_from_position_entries(entries, Axis.X)
+                current_y = self._axis_from_position_entries(entries, Axis.Y)
+                current_z = self._axis_from_position_entries(entries, Axis.Z)
+                if self.autotest_stop_event.is_set():
+                    break
+
                 self._execute_autotest_measurement_flow(point, normalized_settings, session_dir, cv2)
                 if self.autotest_stop_event.is_set():
                     break
@@ -7096,6 +7538,44 @@ class ProbeApp(tk.Tk):
         self.result_queue.put(("read_positions", entries, "autotest"))
         return entries
 
+    def _autotest_apply_contact_wobble_and_offset(self, current_z: int, focus_z: int, settings: AutoTestSettings):
+        assert self.serial_client is not None
+        z_um_per_pulse = self.probe_config.um_per_pulse("Z")
+        wobble_pulses = int(round(settings.z_wobble_um / z_um_per_pulse))
+        offset_pulses = int(round(settings.z_offset_um / z_um_per_pulse))
+        targets = self._autotest_contact_z_targets(int(focus_z), wobble_pulses, settings.z_wobble_cycles, offset_pulses)
+        slow_speed = max(0, min(100, int(settings.z_slow_speed_percent)))
+        for target_z in targets:
+            if self.autotest_stop_event.is_set():
+                break
+            delta = int(target_z) - int(current_z)
+            if delta == 0:
+                current_z = int(target_z)
+                continue
+            label = "offset" if offset_pulses and target_z == targets[-1] else "wobble"
+            self.result_queue.put(("autotest_status", f"AutoTest Z {label}: target {int(target_z)}."))
+            self.serial_client.move_relative(axis=Axis.Z, reverse=delta < 0, pulses=abs(delta), speed_percent=slow_speed)
+            self.serial_client.wait_axis_reached(Axis.Z, timeout=self._axis_move_timeout(abs(delta), slow_speed))
+            current_z = int(target_z)
+        entries = self.serial_client.read_stable_xyz_positions()
+        self.result_queue.put(("read_positions", entries, "autotest"))
+        return entries
+
+    @staticmethod
+    def _autotest_contact_z_targets(focus_z: int, wobble_pulses: int, wobble_cycles: int, offset_pulses: int) -> list[int]:
+        targets: list[int] = []
+        cycles = max(0, int(wobble_cycles))
+        wobble = max(0, int(wobble_pulses))
+        for _cycle in range(cycles):
+            if wobble <= 0:
+                break
+            targets.extend((int(focus_z) + wobble, int(focus_z) - wobble, int(focus_z)))
+        final_z = int(focus_z) + int(offset_pulses)
+        if final_z != int(focus_z) or (targets and targets[-1] != final_z):
+            if not targets or targets[-1] != final_z:
+                targets.append(final_z)
+        return targets
+
     @staticmethod
     def _autotest_measurement_summary(settings: AutoTestSettings) -> str:
         if settings.measurement_flow:
@@ -7103,6 +7583,7 @@ class ProbeApp(tk.Tk):
                 "wait": "Pause",
                 "photo": "Photo",
                 "iv": "IV",
+                "wobb_test": "WobbTest",
                 "transfer": "Transfer",
                 "it": "IT",
                 "light_control": "Light",
@@ -7140,6 +7621,9 @@ class ProbeApp(tk.Tk):
             config = iv_sweep_config_from_params(params)
             self._run_autotest_iv_sweep(point, settings, config, session_dir)
             return
+        if step.type_id == "wobb_test":
+            self._run_autotest_wobb_test(point, settings, params, session_dir)
+            return
         self.result_queue.put(("autotest_status", f"{step.type_id} step placeholder at {point.name}."))
 
     def _execute_autotest_measurement_steps(self, point: AutoTestPoint, steps: tuple[str, ...], session_dir: Path | None, cv2_module) -> None:
@@ -7158,6 +7642,293 @@ class ProbeApp(tk.Tk):
         output_path = session_dir / "images" / f"{self._safe_autotest_name(point.name)}.png"
         cv2_module.imwrite(str(output_path), image)
         self.result_queue.put(("autotest_status", f"Photo saved for {point.name}: {output_path.name}"))
+
+    @staticmethod
+    def _normalize_wobb_test_mode(value: object) -> str:
+        normalized = str(value or "Z").strip().lower().replace("_", "-").replace(" ", "")
+        if normalized == "z":
+            return "z"
+        if normalized in {"z-xy", "zxy", "xy"}:
+            return "z-xy"
+        raise ValueError("WobbTest mode must be Z or Z-XY.")
+
+    def _run_autotest_wobb_test(self, point: AutoTestPoint, settings: AutoTestSettings, params: dict[str, str], session_dir: Path | None) -> None:
+        assert self.serial_client is not None
+        mode = self._normalize_wobb_test_mode(params.get("mode", "Z"))
+        mode_label = "Z-XY" if mode == "z-xy" else "Z"
+        bias_config = constant_voltage_current_config_from_params(params)
+        settle_s = max(0.0, float(params.get("settle_s", "0.05")))
+        best_current = str(params.get("best_current", "max_abs")).strip().lower()
+        summary = bias_config.summary()
+        self.result_queue.put(("wobb_test_started", point.name, mode_label, summary))
+        self.result_queue.put(("autotest_status", f"WobbTest {mode_label} started at {point.name}: {summary}"))
+        entries = self.serial_client.read_stable_xyz_positions()
+        base_x = self._axis_from_position_entries(entries, Axis.X)
+        base_y = self._axis_from_position_entries(entries, Axis.Y)
+        base_z = self._axis_from_position_entries(entries, Axis.Z)
+        records: list[dict[str, object]] = []
+        started_at = time.monotonic()
+        best = self._run_autotest_z_wobb_scan(point, settings, params, bias_config, settle_s, best_current, base_x, base_y, base_z, started_at, records)
+        if mode == "z-xy" and not self.autotest_stop_event.is_set():
+            entries = self.serial_client.read_stable_xyz_positions()
+            xy_base_x = self._axis_from_position_entries(entries, Axis.X)
+            xy_base_y = self._axis_from_position_entries(entries, Axis.Y)
+            xy_base_z = self._axis_from_position_entries(entries, Axis.Z)
+            xy_z_um = float(best["z_um"]) if best is not None and _finite_number(best.get("z_um")) else float(settings.z_offset_um)
+            self._run_autotest_xy_wobb_scan(point, settings, params, bias_config, settle_s, xy_base_x, xy_base_y, xy_base_z, started_at, records, z_um=xy_z_um)
+        output_path = None
+        if session_dir is not None:
+            output_path = session_dir / "wobb" / f"{self._safe_autotest_name(point.name)}_wobb.csv"
+            self._write_wobb_test_samples_csv(output_path, point, params, records)
+        suffix = f"; saved {Path(output_path).name}" if output_path else ""
+        if best is not None:
+            message = f"WobbTest completed at {point.name}: best Z {float(best['z_um']):.6g} um, I={float(best['score_current_a']):.6g} A{suffix}."
+        else:
+            message = f"WobbTest completed at {point.name}: {len(records)} sample(s){suffix}."
+        self.result_queue.put(("wobb_test_done", point.name, message))
+        self.result_queue.put(("autotest_status", message))
+
+    def _run_autotest_z_wobb_scan(
+        self,
+        point: AutoTestPoint,
+        settings: AutoTestSettings,
+        params: dict[str, str],
+        bias_config,
+        settle_s: float,
+        best_current: str,
+        base_x: int,
+        base_y: int,
+        base_z: int,
+        started_at: float,
+        records: list[dict[str, object]],
+    ) -> dict[str, object] | None:
+        z_um_per_pulse = self.probe_config.um_per_pulse("Z")
+        offsets = wobbtest_z_offsets_um(
+            float(params.get("z_lower_um", "-2")),
+            float(params.get("z_upper_um", "2")),
+            float(params.get("z_step_um", "0.5")),
+        )
+        current_z = int(base_z)
+        slow_speed = max(0, min(100, int(settings.z_slow_speed_percent)))
+        for position_index, offset_um in enumerate(offsets, start=1):
+            if self.autotest_stop_event.is_set():
+                return None
+            target_z = int(base_z) + int(round(float(offset_um) / z_um_per_pulse))
+            entries = self._autotest_move_z_absolute(current_z, target_z, slow_speed)
+            current_z = self._axis_from_position_entries(entries, Axis.Z)
+            z_um = float(settings.z_offset_um) + float(offset_um)
+            self.result_queue.put(("wobb_test_position", point.name, time.monotonic() - started_at, z_um))
+            if settle_s > 0 and self.autotest_stop_event.wait(settle_s):
+                return None
+            self._sample_wobb_current(
+                point,
+                bias_config,
+                records,
+                mode="z",
+                position_index=position_index,
+                position_total=len(offsets),
+                z_um=z_um,
+                z_offset_um=float(offset_um),
+                target_z=target_z,
+                started_at=started_at,
+            )
+        best = self._autotest_wobb_best_z_record(records, best_current)
+        if best is None:
+            return None
+        best_z = int(best["target_z_pulses"])
+        if best_z != current_z and not self.autotest_stop_event.is_set():
+            self.result_queue.put(("autotest_status", f"WobbTest moving to best Z {float(best['z_um']):.6g} um."))
+            self._autotest_move_z_absolute(current_z, best_z, slow_speed)
+        return best
+
+    def _run_autotest_xy_wobb_scan(
+        self,
+        point: AutoTestPoint,
+        settings: AutoTestSettings,
+        params: dict[str, str],
+        bias_config,
+        settle_s: float,
+        base_x: int,
+        base_y: int,
+        base_z: int,
+        started_at: float,
+        records: list[dict[str, object]],
+        z_um: float | None = None,
+    ) -> None:
+        offsets = wobbtest_xy_offsets_um(
+            float(params.get("xy_range_um", "2")),
+            float(params.get("xy_step_um", "1")),
+            params.get("xy_pattern", "square"),
+        )
+        x_um_per_pulse = self.probe_config.um_per_pulse("X")
+        y_um_per_pulse = self.probe_config.um_per_pulse("Y")
+        z_um = float(settings.z_offset_um if z_um is None else z_um)
+        for position_index, (dx_um, dy_um) in enumerate(offsets, start=1):
+            if self.autotest_stop_event.is_set():
+                return
+            target_x = int(base_x) + int(round(float(dx_um) / x_um_per_pulse))
+            target_y = int(base_y) + int(round(float(dy_um) / y_um_per_pulse))
+            self._move_absolute_stage_raw(target_x, target_y, int(base_z), source="autotest")
+            self.result_queue.put(("wobb_test_position", point.name, time.monotonic() - started_at, z_um))
+            if settle_s > 0 and self.autotest_stop_event.wait(settle_s):
+                return
+            self._sample_wobb_current(
+                point,
+                bias_config,
+                records,
+                mode="z-xy",
+                position_index=position_index,
+                position_total=len(offsets),
+                z_um=z_um,
+                z_offset_um=0.0,
+                target_z=int(base_z),
+                started_at=started_at,
+                dx_um=float(dx_um),
+                dy_um=float(dy_um),
+                target_x=target_x,
+                target_y=target_y,
+            )
+        if not self.autotest_stop_event.is_set():
+            self._move_absolute_stage_raw(int(base_x), int(base_y), int(base_z), source="autotest")
+
+    def _autotest_move_z_absolute(self, current_z: int, target_z: int, speed_percent: int):
+        assert self.serial_client is not None
+        delta = int(target_z) - int(current_z)
+        if delta:
+            self.serial_client.move_relative(axis=Axis.Z, reverse=delta < 0, pulses=abs(delta), speed_percent=speed_percent)
+            self.serial_client.wait_axis_reached(Axis.Z, timeout=self._axis_move_timeout(abs(delta), speed_percent))
+        entries = self.serial_client.read_stable_xyz_positions()
+        self.result_queue.put(("read_positions", entries, "autotest", {"Z": int(target_z)}))
+        return entries
+
+    def _sample_wobb_current(
+        self,
+        point: AutoTestPoint,
+        bias_config,
+        records: list[dict[str, object]],
+        *,
+        mode: str,
+        position_index: int,
+        position_total: int,
+        z_um: float,
+        z_offset_um: float,
+        target_z: int,
+        started_at: float,
+        dx_um: float = 0.0,
+        dy_um: float = 0.0,
+        target_x: int | None = None,
+        target_y: int | None = None,
+    ) -> None:
+        runner = Keithley2450IVRunner()
+
+        def handle_sample(sample: IVSweepSample) -> None:
+            payload = sample.to_dict()
+            payload.update(
+                {
+                    "point_name": point.name,
+                    "mode": mode,
+                    "position_index": position_index,
+                    "position_total": position_total,
+                    "z_um": float(z_um),
+                    "z_offset_um": float(z_offset_um),
+                    "target_z_pulses": int(target_z),
+                    "elapsed_total_s": time.monotonic() - started_at,
+                    "dx_um": float(dx_um),
+                    "dy_um": float(dy_um),
+                }
+            )
+            if target_x is not None:
+                payload["target_x_pulses"] = int(target_x)
+            if target_y is not None:
+                payload["target_y_pulses"] = int(target_y)
+            records.append(payload)
+            self.result_queue.put(("wobb_test_sample", point.name, payload))
+
+        runner.run_constant_voltage_current(
+            bias_config,
+            stop_requested=self.autotest_stop_event.is_set,
+            on_sample=handle_sample,
+        )
+
+    @staticmethod
+    def _autotest_wobb_best_z_record(records: list[dict[str, object]], mode: str) -> dict[str, object] | None:
+        grouped: dict[int, list[dict[str, object]]] = {}
+        for record in records:
+            if not _finite_number(record.get("current_a")) or not _finite_number(record.get("target_z_pulses")):
+                continue
+            grouped.setdefault(int(float(record["target_z_pulses"])), []).append(record)
+        if not grouped:
+            return None
+        normalized = str(mode or "max_abs").strip().lower()
+        best_record: dict[str, object] | None = None
+        best_score: float | None = None
+        for group in grouped.values():
+            currents = sorted(float(record["current_a"]) for record in group)
+            median = currents[len(currents) // 2] if len(currents) % 2 else (currents[len(currents) // 2 - 1] + currents[len(currents) // 2]) / 2.0
+            if normalized == "min":
+                score = -median
+            elif normalized == "min_abs":
+                score = -abs(median)
+            elif normalized == "max":
+                score = median
+            else:
+                score = abs(median)
+            candidate = dict(group[0])
+            candidate["score_current_a"] = median
+            if best_score is None or score > best_score:
+                best_score = score
+                best_record = candidate
+        return best_record
+
+    @staticmethod
+    def _write_wobb_test_samples_csv(output_path: Path, point: AutoTestPoint, params: dict[str, str], records: list[dict[str, object]]) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fields = [
+            "point_name",
+            "mode",
+            "position_index",
+            "position_total",
+            "elapsed_total_s",
+            "z_um",
+            "z_offset_um",
+            "target_z_pulses",
+            "dx_um",
+            "dy_um",
+            "target_x_pulses",
+            "target_y_pulses",
+            "index",
+            "total",
+            "elapsed_s",
+            "source_value",
+            "voltage_v",
+            "current_a",
+            "resistance_ohm",
+            "raw",
+        ]
+        with output_path.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            for record in records:
+                writer.writerow(record)
+        output_path.with_suffix(".json").write_text(
+            json.dumps(
+                {
+                    "format": "semi_auto_probe.autotest_result_metadata",
+                    "version": 1,
+                    "result_type": "wobb_test",
+                    "csv_file": output_path.name,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "device": {"name": point.name, "order": point.order, "row": point.row, "col": point.col},
+                    "coordinates": {"gds": {"u": point.u, "v": point.v}, "stage_um": {"x": point.stage_x_um, "y": point.stage_y_um}},
+                    "parameters": dict(params),
+                    "sample_count": len(records),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
     def _run_autotest_iv_sweep(self, point: AutoTestPoint, settings: AutoTestSettings, config: IVSweepConfig, session_dir: Path | None) -> None:
         self.result_queue.put(("iv_started", point.name, config, point.row, point.col, settings.rows, settings.cols, point.order == 1))
@@ -7186,28 +7957,6 @@ class ProbeApp(tk.Tk):
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with output_path.open("w", newline="", encoding="utf-8") as file:
             writer = csv.writer(file)
-            writer.writerow(["point", point.name])
-            writer.writerow(["resource", config.resource_name])
-            writer.writerow(["output_terminal", config.output_terminal])
-            writer.writerow(["sweep_mode", config.sweep_mode])
-            writer.writerow(["start", config.start])
-            writer.writerow(["stop", config.stop])
-            writer.writerow(["step", config.step])
-            writer.writerow(["bidirectional", config.bidirectional])
-            writer.writerow(["voltage_limit_v", config.voltage_limit_v])
-            writer.writerow(["current_limit_a", config.current_limit_a])
-            writer.writerow(["output_statistics", config.output_statistics])
-            writer.writerow(["resistance_method", config.resistance_method])
-            writer.writerow(["device_length_um", config.device_length_um])
-            writer.writerow(["device_width_um", config.device_width_um])
-            writer.writerow(["film_thickness_nm", config.film_thickness_nm])
-            writer.writerow([])
-            writer.writerow(["statistics"])
-            writer.writerow(["sample_count", statistics.sample_count])
-            writer.writerow(["resistance_ohm", "" if statistics.resistance_ohm is None else f"{statistics.resistance_ohm:.12g}"])
-            writer.writerow(["sheet_resistance_ohm_sq", "" if statistics.sheet_resistance_ohm_sq is None else f"{statistics.sheet_resistance_ohm_sq:.12g}"])
-            writer.writerow(["resistivity_ohm_cm", "" if statistics.resistivity_ohm_cm is None else f"{statistics.resistivity_ohm_cm:.12g}"])
-            writer.writerow([])
             writer.writerow(["index", "total", "elapsed_s", "source_value", "voltage_v", "current_a", "resistance_ohm", "raw"])
             for sample in samples:
                 writer.writerow(
@@ -7222,6 +7971,58 @@ class ProbeApp(tk.Tk):
                         sample.raw,
                     ]
                 )
+        metadata_path = output_path.with_suffix(".json")
+        metadata_path.write_text(
+            json.dumps(
+                ProbeApp._autotest_iv_result_metadata(output_path, point, config, statistics),
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _autotest_iv_result_metadata(output_path: Path, point: AutoTestPoint, config: IVSweepConfig, statistics: IVSweepStatistics) -> dict[str, object]:
+        return {
+            "format": "semi_auto_probe.autotest_result_metadata",
+            "version": 1,
+            "result_type": "iv_sweep",
+            "csv_file": output_path.name,
+            "json_file": output_path.with_suffix(".json").name,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "device": {
+                "name": point.name,
+                "order": point.order,
+                "row": point.row,
+                "col": point.col,
+            },
+            "coordinates": {
+                "gds": {"u": point.u, "v": point.v},
+                "stage_um": {"x": point.stage_x_um, "y": point.stage_y_um},
+                "fov_polygon_gds": [{"u": u, "v": v} for u, v in point.fov_polygon_gds],
+            },
+            "measurement": {
+                "resource": config.resource_name,
+                "output_terminal": config.output_terminal,
+                "sweep_mode": config.sweep_mode,
+                "start": config.start,
+                "stop": config.stop,
+                "step": config.step,
+                "bidirectional": config.bidirectional,
+                "voltage_limit_v": config.voltage_limit_v,
+                "current_limit_a": config.current_limit_a,
+                "source_delay_s": config.source_delay_s,
+                "nplc": config.nplc,
+                "output_statistics": config.output_statistics,
+                "resistance_method": config.resistance_method,
+                "device_length_um": config.device_length_um,
+                "device_width_um": config.device_width_um,
+                "film_thickness_nm": config.film_thickness_nm,
+                "output_off_after": config.output_off_after,
+            },
+            "statistics": statistics.to_dict(),
+        }
 
     @staticmethod
     def _safe_autotest_name(value: str) -> str:
@@ -8664,6 +9465,7 @@ class ProbeApp(tk.Tk):
         else:
             self.status_var.set(f"Available serial ports: {', '.join(ports)}")
             logger.info("Available serial ports: %s", ", ".join(ports))
+        self._update_serial_port_style()
 
     def connect_serial(self) -> bool:
         port = self.port_var.get().strip()
@@ -8680,10 +9482,12 @@ class ProbeApp(tk.Tk):
             self.status_var.set(f"Serial connection failed: {exc}")
             logger.error("Serial connection failed on %s: %s", port, exc)
             threading.Thread(target=self._refresh_ports_after_connect_failure, daemon=True).start()
+            self._update_serial_port_style()
             return False
 
         self.status_var.set(f"Connected to {port} at 115200,N,8,1.")
         logger.info("Connected to %s at 115200,N,8,1.", port)
+        self._update_serial_port_style()
         return True
 
     def connect_and_test_serial(self) -> None:
@@ -8704,6 +9508,7 @@ class ProbeApp(tk.Tk):
         self.serial_client = None
         self.status_var.set("Serial disconnected.")
         logger.info("Serial disconnected.")
+        self._update_serial_port_style()
 
     def run_comm_test(self) -> None:
         if not self.serial_client:
@@ -8733,11 +9538,24 @@ class ProbeApp(tk.Tk):
             self.iv_plot_window = IVPlotWindow(self, self.colors)
         return self.iv_plot_window
 
+    def _ensure_wobb_test_plot_window(self) -> WobbTestPlotWindow:
+        if self.wobb_test_plot_window is None:
+            self.wobb_test_plot_window = WobbTestPlotWindow(self, self.colors)
+            return self.wobb_test_plot_window
+        try:
+            if not self.wobb_test_plot_window.window.winfo_exists():
+                self.wobb_test_plot_window = WobbTestPlotWindow(self, self.colors)
+        except tk.TclError:
+            self.wobb_test_plot_window = WobbTestPlotWindow(self, self.colors)
+        return self.wobb_test_plot_window
+
     def _poll_result_queue(self) -> None:
         started_at = time.monotonic()
         processed = 0
+        max_events = AUTOTEST_RESULT_POLL_MAX_EVENTS if self.autotest_running else RESULT_POLL_MAX_EVENTS
+        max_seconds = AUTOTEST_RESULT_POLL_MAX_SECONDS if self.autotest_running else RESULT_POLL_MAX_SECONDS
         try:
-            while processed < RESULT_POLL_MAX_EVENTS and time.monotonic() - started_at < RESULT_POLL_MAX_SECONDS:
+            while processed < max_events and time.monotonic() - started_at < max_seconds:
                 result = self.result_queue.get_nowait()
                 processed += 1
                 if isinstance(result, Exception):
@@ -8764,7 +9582,12 @@ class ProbeApp(tk.Tk):
                     logger.warning("Communication test did not pass. %s %s Detail=%s", colorize_hex_frame(result.request_hex, "TX"), colorize_hex_frame(result.response_hex or "-", "RX"), result.message)
         except queue.Empty:
             pass
-        next_interval = 1 if not self.result_queue.empty() else RESULT_POLL_INTERVAL_MS
+        if self.result_queue.empty():
+            next_interval = RESULT_POLL_INTERVAL_MS
+        elif self.autotest_running:
+            next_interval = AUTOTEST_RESULT_POLL_INTERVAL_MS
+        else:
+            next_interval = 1
         self.after(next_interval, self._poll_result_queue)
 
     def _set_agent_status(self, message: str) -> None:
@@ -8779,17 +9602,31 @@ class ProbeApp(tk.Tk):
             expected_targets = rest[0] if rest else None
             self.position_read_pending = False
             record_history = self._record_hex_history_for_source(source)
+            quiet_position_update = source in {"autotest"}
             positions: dict[str, int] = {}
             for command, response, position in entries:
-                command_hex = hex_bytes(command)
-                response_hex = hex_bytes(response)
-                self.tx_var.set(command_hex)
-                self.rx_var.set(response_hex)
-                if record_history:
-                    self._append_hex_history("TX", command_hex)
-                    self._append_hex_history("RX", response_hex)
+                if not quiet_position_update:
+                    command_hex = hex_bytes(command)
+                    response_hex = hex_bytes(response)
+                    self.tx_var.set(command_hex)
+                    self.rx_var.set(response_hex)
+                    if record_history:
+                        self._append_hex_history("TX", command_hex)
+                        self._append_hex_history("RX", response_hex)
                 self._update_axis_position(position)
                 positions[position.axis_name] = self._logical_position_from_controller(position.axis, position.position)
+            if expected_targets:
+                mismatches = {
+                    axis: (expected, positions.get(axis))
+                    for axis, expected in expected_targets.items()
+                    if positions.get(axis) != expected
+                }
+                if mismatches:
+                    details = ", ".join(f"{axis} expected {expected} read {actual}" for axis, (expected, actual) in mismatches.items())
+                    self.status_var.set(f"Position mismatch after move: {details}")
+                    logger.warning("Position mismatch after %s move: %s.", source, details)
+            if quiet_position_update:
+                return
             self.status_var.set("Current position read completed.")
             if source == "autofocus":
                 self.autofocus_status_var.set("Moving, score sampling")
@@ -8799,6 +9636,8 @@ class ProbeApp(tk.Tk):
                 self.af_plane_status_var.set("Stage moved")
             elif source == "focusmap":
                 self.status_var.set("FocusMap Z position checked.")
+            elif source == "probe":
+                self.status_var.set("Probe Z position checked.")
             elif source == "imgstitch":
                 self.imgstitch_status_var.set("Stage moved")
                 self._set_agent_status("ImgStitch stage moved.")
@@ -8822,16 +9661,8 @@ class ProbeApp(tk.Tk):
                 self.status_var.set("X/Y/Z positions set to 0.")
             elif source == "go_zero":
                 self.status_var.set("Go Zero completed.")
-            if expected_targets:
-                mismatches = {
-                    axis: (expected, positions.get(axis))
-                    for axis, expected in expected_targets.items()
-                    if positions.get(axis) != expected
-                }
-                if mismatches:
-                    details = ", ".join(f"{axis} expected {expected} read {actual}" for axis, (expected, actual) in mismatches.items())
-                    self.status_var.set(f"Position mismatch after move: {details}")
-                    logger.warning("Position mismatch after %s move: %s.", source, details)
+            if self.current_page == "Main" and self.vision_panel is not None:
+                self.vision_panel.draw_overlay()
             logger.info(
                 "Position read: X=%s Y=%s Z=%s.",
                 positions.get("X", "-"),
@@ -8854,6 +9685,22 @@ class ProbeApp(tk.Tk):
                 self.status_var.set(f"FocusMap Z enabled; Z moved to mapped plane ({target_z}).")
             else:
                 self.status_var.set(f"FocusMap Z enabled; Z already matches mapped plane ({target_z}).")
+            return
+
+        if event_type == "probe_focus_unavailable":
+            self.status_var.set(self._focusmap_plane_missing_message())
+            return
+
+        if event_type == "probe_focus_target":
+            _, target_z = event
+            self._show_target_positions({"Z": int(target_z)})
+            return
+
+        if event_type == "probe_focus_done":
+            _, probe_down, target_z = event
+            self._set_probe_guard_state(bool(probe_down), announce=False)
+            label = "Contact at FocusZ" if probe_down else "Separate at FocusZ safe clearance"
+            self.status_var.set(f"Probe {label}: Z={int(target_z)}.")
             return
 
         if event_type == "focusmap_go_done":
@@ -9385,7 +10232,11 @@ class ProbeApp(tk.Tk):
             _, point_name, sample = event
             if isinstance(sample, dict):
                 self._ensure_iv_plot_window().add_sample(sample)
-                self.status_var.set(f"IV sample {sample.get('index')}/{sample.get('total')} at {point_name}.")
+                now = time.monotonic()
+                is_final_sample = str(sample.get("index")) == str(sample.get("total"))
+                if is_final_sample or now - self.last_iv_sample_status_at >= 0.2:
+                    self.status_var.set(f"IV sample {sample.get('index')}/{sample.get('total')} at {point_name}.")
+                    self.last_iv_sample_status_at = now
             return
 
         if event_type == "iv_done":
@@ -9408,12 +10259,46 @@ class ProbeApp(tk.Tk):
             logger.info(message)
             return
 
-        if event_type == "autotest_status":
-            _, message = event
+        if event_type == "wobb_test_started":
+            _, point_name, mode, summary = event
+            self._ensure_wobb_test_plot_window().start(str(point_name), str(mode), str(summary))
+            self.status_var.set(f"WobbTest started at {point_name}.")
+            return
+
+        if event_type == "wobb_test_position":
+            _, point_name, elapsed_s, z_um = event
+            self._ensure_wobb_test_plot_window().add_position(float(elapsed_s), float(z_um))
+            self.status_var.set(f"WobbTest position at {point_name}: Z {float(z_um):.6g} um.")
+            return
+
+        if event_type == "wobb_test_sample":
+            _, point_name, sample = event
+            if isinstance(sample, dict):
+                self._ensure_wobb_test_plot_window().add_sample(sample)
+                self.status_var.set(f"WobbTest sample {sample.get('index')}/{sample.get('total')} at {point_name}.")
+            return
+
+        if event_type == "wobb_test_done":
+            _, point_name, message = event
+            self._ensure_wobb_test_plot_window().finish(str(message))
             if self.autotest_panel is not None:
                 self.autotest_panel.set_status(str(message))
             self.status_var.set(str(message))
-            logger.info("AutoTest: %s", message)
+            logger.info("WobbTest completed at %s: %s", point_name, message)
+            return
+
+        if event_type == "autotest_status":
+            _, message = event
+            message_text = str(message)
+            if message_text.startswith("AutoTest Z wobble"):
+                now = time.monotonic()
+                if now - self.last_autotest_wobble_status_at < 0.12:
+                    return
+                self.last_autotest_wobble_status_at = now
+            if self.autotest_panel is not None:
+                self.autotest_panel.set_status(message_text)
+            self.status_var.set(message_text)
+            logger.info("AutoTest: %s", message_text)
             return
 
         if event_type == "motor_guard_status":
@@ -9471,6 +10356,8 @@ class ProbeApp(tk.Tk):
 
         if event_type == "motor_command":
             _, axis, action, command, source = event
+            if source == "autotest":
+                return
             command_hex = hex_bytes(command)
             self.tx_var.set(command_hex)
             if self._record_hex_history_for_source(source):
@@ -9490,6 +10377,8 @@ class ProbeApp(tk.Tk):
 
         if event_type == "axis_done":
             _, axis, response, source = event
+            if source == "autotest":
+                return
             response_hex = hex_bytes(response)
             self.rx_var.set(response_hex)
             if self._record_hex_history_for_source(source):
@@ -9506,6 +10395,8 @@ class ProbeApp(tk.Tk):
 
         if event_type == "cc_done":
             _, response, source = event
+            if source == "autotest":
+                return
             response_hex = hex_bytes(response)
             self.rx_var.set(response_hex)
             if self._record_hex_history_for_source(source):
@@ -9548,6 +10439,9 @@ class ProbeApp(tk.Tk):
             self.latest_camera_frame = None
             self.latest_stitch_frame = None
             self.latest_stitch_frame_captured_at = 0.0
+        self.latest_panel_preview_ppm = None
+        self.latest_panel_preview_captured_at = 0.0
+        self.latest_panel_preview_source_at = 0.0
         self.probe_config.camera_source = source
         self.camera_index_var.set(source)
         self.camera = UsbCamera(index=0, source=source, width=800, height=450, settings=self._camera_settings_from_config())
@@ -9607,6 +10501,15 @@ class ProbeApp(tk.Tk):
     def _should_update_imgstitch_preview(self) -> bool:
         return self.current_page == "ImgStitch" or self.imgstitch_running
 
+    def _serial_is_connected(self) -> bool:
+        return bool(self.serial_client is not None and getattr(self.serial_client, "is_open", False))
+
+    def _update_serial_port_style(self) -> None:
+        combo = getattr(self, "port_combo", None)
+        if combo is None:
+            return
+        combo.configure(style="SerialConnected.TCombobox" if self._serial_is_connected() else "SerialDisconnected.TCombobox")
+
     def _set_camera_index_error(self, is_error: bool) -> None:
         if hasattr(self, "camera_index_spinbox"):
             self.camera_index_spinbox.configure(style="Error.TCombobox" if is_error else "TCombobox")
@@ -9628,6 +10531,7 @@ class ProbeApp(tk.Tk):
             with self.camera_lock:
                 self.latest_stitch_frame = frame.image_bgr
                 self.latest_stitch_frame_captured_at = frame.captured_at
+            self._update_panel_preview_cache(frame.image_bgr, frame.captured_at)
             if (self.current_page == "FocusMap" or self.af_plane_running) and hasattr(self, "focusmap_realtime_canvas"):
                 self.focusmap_realtime_bgr = frame.image_bgr.copy()
                 self._draw_focusmap_realtime()

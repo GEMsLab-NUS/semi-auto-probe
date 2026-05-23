@@ -74,6 +74,15 @@ KLAYOUT_LAYER_PALETTE = (
 )
 
 
+@dataclass(frozen=True)
+class AuxiliaryPointOverlay:
+    point: tuple[float, float]
+    label: str = "Probe"
+    style: str = "cross"
+    color: str = "#f43f5e"
+    radius: int = 10
+
+
 class ToggleSwitch(tk.Canvas):
     def __init__(
         self,
@@ -558,6 +567,14 @@ class CanvasTransform:
         self.offset_x = float(width) / 2.0 - center_u * self.scale
         self.offset_y = float(height) / 2.0 + center_v * self.scale
 
+    def canvas_rect_to_gds_bounds(self, x1: float, y1: float, x2: float, y2: float) -> tuple[float, float, float, float]:
+        u1, v1 = self.canvas_to_gds(x1, y1)
+        u2, v2 = self.canvas_to_gds(x2, y2)
+        return min(u1, u2), min(v1, v2), max(u1, u2), max(v1, v2)
+
+    def fit_to_canvas_rect(self, x1: float, y1: float, x2: float, y2: float, width: int, height: int, padding: float = 32.0) -> None:
+        self.fit_to_bounds(self.canvas_rect_to_gds_bounds(x1, y1, x2, y2), width, height, padding=padding)
+
     def pan(self, dx: float, dy: float) -> None:
         self.offset_x += float(dx)
         self.offset_y += float(dy)
@@ -719,12 +736,16 @@ class GDSCanvasViewer:
         self.stage_center_gds: tuple[float, float] | None = None
         self.fov_polygon_gds: list[tuple[float, float]] | None = None
         self.matrix_fov_polygons_gds: list[MatrixOverlay] = []
+        self.auxiliary_points_gds: list[AuxiliaryPointOverlay] = []
         self.snap_grid_um = 1.0
         self.require_double_click_pick = False
         self.ignore_next_release = False
         self.drag_start: tuple[int, int, float, float] | None = None
         self.drag_last: tuple[int, int] | None = None
         self.dragging = False
+        self.zoom_drag_start: tuple[int, int] | None = None
+        self.zoom_drag_current: tuple[int, int] | None = None
+        self.zoom_dragging = False
         self.configure_job: str | None = None
         self.geometry_photo: tk.PhotoImage | None = None
         self.last_rendered_shape_count = 0
@@ -741,6 +762,10 @@ class GDSCanvasViewer:
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_button_release)
         self.canvas.bind("<Double-Button-1>", self._on_double_click)
+        self.canvas.bind("<ButtonPress-3>", self._on_right_button_press)
+        self.canvas.bind("<B3-Motion>", self._on_right_drag)
+        self.canvas.bind("<ButtonRelease-3>", self._on_right_button_release)
+        self.canvas.bind("<Double-Button-3>", self._on_right_double_click)
         self.draw_message("Load a GDS file to begin.")
 
     def set_model(self, model: GDSLayoutModel) -> None:
@@ -748,6 +773,7 @@ class GDSCanvasViewer:
         self.selected_gds = None
         self.stage_center_gds = None
         self.fov_polygon_gds = None
+        self.auxiliary_points_gds = []
         self.layer_order = list(model.layers)
         self.layer_visibility = {layer: False for layer in self.layer_order}
         self.fit_to_view()
@@ -772,6 +798,14 @@ class GDSCanvasViewer:
         self.transform.fit_to_bounds(self.model.bounds, width, height)
         self.redraw()
 
+    def fit_to_canvas_rect(self, x1: float, y1: float, x2: float, y2: float) -> None:
+        if self.model is None:
+            return
+        width = max(self.canvas.winfo_width(), 1)
+        height = max(self.canvas.winfo_height(), 1)
+        self.transform.fit_to_canvas_rect(x1, y1, x2, y2, width, height)
+        self.redraw()
+
     def set_selected_gds(self, point: tuple[float, float] | None) -> None:
         self.selected_gds = point
         self._draw_overlay_items()
@@ -784,6 +818,31 @@ class GDSCanvasViewer:
     def set_matrix_overlay(self, polygons_gds: list[MatrixOverlay]) -> None:
         self.matrix_fov_polygons_gds = polygons_gds
         self._draw_overlay_items()
+
+    def set_auxiliary_points(self, points_gds: list[AuxiliaryPointOverlay]) -> None:
+        self.auxiliary_points_gds = list(points_gds)
+        self._draw_overlay_items()
+
+    def viewport_bounds_gds(self) -> tuple[float, float, float, float] | None:
+        if self.model is None or self.transform.scale == 0:
+            return None
+        width = max(self.canvas.winfo_width(), 1)
+        height = max(self.canvas.winfo_height(), 1)
+        return self.transform.canvas_rect_to_gds_bounds(0, 0, width, height)
+
+    def viewport_status_text(self) -> str:
+        bounds = self.viewport_bounds_gds()
+        if bounds is None:
+            return "Viewport: -"
+        min_u, min_v, max_u, max_v = bounds
+        center_u = (min_u + max_u) / 2.0
+        center_v = (min_v + max_v) / 2.0
+        span_u = max_u - min_u
+        span_v = max_v - min_v
+        return (
+            f"Viewport center u, v: {center_u:.6g}, {center_v:.6g} | "
+            f"span {span_u:.6g} x {span_v:.6g} | scale {self.transform.scale:.6g} px/um"
+        )
 
     def draw_message(self, message: str) -> None:
         self.canvas.delete("all")
@@ -956,6 +1015,7 @@ class GDSCanvasViewer:
             self.canvas.delete("gds_overlay")
             self.canvas.delete("gds_matrix_overlay")
             self.canvas.delete("gds_selection")
+            self.canvas.delete("gds_zoom_box")
             for overlay_item in self.matrix_fov_polygons_gds:
                 polygon_gds, label, state = self._normalize_matrix_overlay_item(overlay_item)
                 if len(polygon_gds) < 3:
@@ -1023,10 +1083,12 @@ class GDSCanvasViewer:
                 )
             if self.stage_center_gds is not None:
                 self._draw_cross(self.stage_center_gds, "#86efac", "gds_overlay", radius=7)
+            self._draw_auxiliary_points()
             if self.selected_gds is not None:
                 self._draw_cross(self.selected_gds, "#ef4444", "gds_selection", radius=8)
             if self.cursor_gds is not None:
                 self._draw_cursor_crosshair(self.cursor_gds)
+            self._draw_zoom_box()
         except tk.TclError:
             return
 
@@ -1058,6 +1120,38 @@ class GDSCanvasViewer:
         self.canvas.create_line(x - radius, y, x + radius, y, fill=color, width=2, tags=tag)
         self.canvas.create_line(x, y - radius, x, y + radius, fill=color, width=2, tags=tag)
         self.canvas.create_oval(x - 3, y - 3, x + 3, y + 3, outline=color, width=1, tags=tag)
+
+    def _draw_auxiliary_points(self) -> None:
+        for overlay in self.auxiliary_points_gds:
+            point = overlay.point
+            x, y = self.transform.gds_to_canvas(*point)
+            radius = max(3, int(overlay.radius))
+            color = overlay.color or "#f43f5e"
+            style = str(overlay.style or "cross").strip().lower()
+            tag = "gds_overlay"
+            if style == "dot":
+                self.canvas.create_oval(x - radius / 2, y - radius / 2, x + radius / 2, y + radius / 2, fill=color, outline="#f8fafc", width=1, tags=tag)
+            elif style == "ring":
+                self.canvas.create_oval(x - radius, y - radius, x + radius, y + radius, outline=color, width=3, tags=tag)
+            elif style == "diamond":
+                self.canvas.create_polygon(x, y - radius, x + radius, y, x, y + radius, x - radius, y, fill="", outline=color, width=3, tags=tag)
+            elif style == "square":
+                self.canvas.create_rectangle(x - radius, y - radius, x + radius, y + radius, outline=color, width=3, tags=tag)
+            else:
+                self.canvas.create_oval(x - radius, y - radius, x + radius, y + radius, outline=color, width=2, tags=tag)
+                self.canvas.create_line(x - radius * 1.45, y, x + radius * 1.45, y, fill=color, width=2, tags=tag)
+                self.canvas.create_line(x, y - radius * 1.45, x, y + radius * 1.45, fill=color, width=2, tags=tag)
+            label = str(overlay.label or "").strip()
+            if label:
+                self.canvas.create_text(
+                    x + radius + 4,
+                    y - radius - 2,
+                    text=label,
+                    anchor="sw",
+                    fill=color,
+                    font=("Segoe UI Semibold", 9),
+                    tags=tag,
+                )
 
     def _draw_cursor_crosshair(self, point: tuple[float, float]) -> None:
         x, y = self.transform.gds_to_canvas(*point)
@@ -1158,6 +1252,58 @@ class GDSCanvasViewer:
             self.redraw()
         return "break"
 
+    def _on_right_button_press(self, event: tk.Event) -> str:
+        self.zoom_drag_start = (int(event.x), int(event.y))
+        self.zoom_drag_current = self.zoom_drag_start
+        self.zoom_dragging = False
+        self._draw_overlay_items()
+        return "break"
+
+    def _on_right_drag(self, event: tk.Event) -> str:
+        if self.zoom_drag_start is None:
+            return "break"
+        start_x, start_y = self.zoom_drag_start
+        self.zoom_drag_current = (int(event.x), int(event.y))
+        if abs(event.x - start_x) > 2 or abs(event.y - start_y) > 2:
+            self.zoom_dragging = True
+        self._draw_overlay_items()
+        return "break"
+
+    def _on_right_button_release(self, event: tk.Event) -> str:
+        start = self.zoom_drag_start
+        current = self.zoom_drag_current or (int(event.x), int(event.y))
+        was_dragging = self.zoom_dragging
+        self.zoom_drag_start = None
+        self.zoom_drag_current = None
+        self.zoom_dragging = False
+        if self.model is not None and start is not None and was_dragging:
+            x1, y1 = start
+            x2, y2 = current
+            if abs(x2 - x1) >= 6 and abs(y2 - y1) >= 6:
+                self.fit_to_canvas_rect(x1, y1, x2, y2)
+                return "break"
+        self._draw_overlay_items()
+        return "break"
+
+    def _on_right_double_click(self, _event: tk.Event) -> str:
+        self.zoom_drag_start = None
+        self.zoom_drag_current = None
+        self.zoom_dragging = False
+        self.fit_to_view()
+        return "break"
+
+    def _draw_zoom_box(self) -> None:
+        if self.zoom_drag_start is None or self.zoom_drag_current is None:
+            return
+        x1, y1 = self.zoom_drag_start
+        x2, y2 = self.zoom_drag_current
+        if abs(x2 - x1) <= 2 and abs(y2 - y1) <= 2:
+            return
+        left, right = sorted((x1, x2))
+        top, bottom = sorted((y1, y2))
+        self.canvas.create_rectangle(left, top, right, bottom, outline="#fbbf24", width=2, dash=(5, 3), tags="gds_zoom_box")
+        self.canvas.create_rectangle(left + 1, top + 1, right - 1, bottom - 1, outline="#020617", width=1, dash=(5, 3), tags="gds_zoom_box")
+
     def _on_double_click(self, event: tk.Event) -> str:
         if self.model is not None and not self.dragging:
             point = snap_gds_point(self.transform.canvas_to_gds(event.x, event.y), self.snap_grid_um)
@@ -1215,6 +1361,7 @@ class GDSStageMapperPanel:
         self.loader_poll_job: str | None = None
         self.microscope_poll_job: str | None = None
         self.microscope_photo: tk.PhotoImage | None = None
+        self.microscope_payload_key: tuple[object, ...] | None = None
 
         self.snap_grid_options = {
             "100 nm": 0.1,
@@ -1239,6 +1386,12 @@ class GDSStageMapperPanel:
         self.residual_threshold_var = tk.StringVar(value="5")
         self.current_stage_var = tk.StringVar(value="Current stage: -")
         self.current_gds_var = tk.StringVar(value="Current GDS: -")
+        self.assist_enabled_var = tk.BooleanVar(value=False)
+        self.assist_du_var = tk.StringVar(value="0")
+        self.assist_dv_var = tk.StringVar(value="0")
+        self.assist_style_var = tk.StringVar(value="cross")
+        self.assist_color_var = tk.StringVar(value="#f43f5e")
+        self.assist_label_var = tk.StringVar(value="Probe")
         self.motion_status_var = tk.StringVar(value="Idle")
         self.stage_jog_step_um_var = tk.StringVar(value="10")
         self.layout_jog_step_uv_var = tk.StringVar(value="1")
@@ -1314,7 +1467,7 @@ class GDSStageMapperPanel:
         controls_outer = ttk.Frame(pane, style="Panel.TFrame")
         controls_outer.columnconfigure(0, weight=1)
         controls_outer.rowconfigure(0, weight=1)
-        controls_canvas = tk.Canvas(controls_outer, bg=self.colors["surface"], highlightthickness=0, width=480)
+        controls_canvas = tk.Canvas(controls_outer, bg=self.colors["surface"], highlightthickness=0, width=410)
         scrollbar = ttk.Scrollbar(controls_outer, orient=tk.VERTICAL, command=controls_canvas.yview, style="Slim.Vertical.TScrollbar")
         controls_canvas.configure(yscrollcommand=scrollbar.set)
         controls_canvas.grid(row=0, column=0, sticky="nsew")
@@ -1323,6 +1476,8 @@ class GDSStageMapperPanel:
         controls_window = controls_canvas.create_window((0, 0), window=controls, anchor="nw")
         controls.bind("<Configure>", lambda event: controls_canvas.configure(scrollregion=controls_canvas.bbox("all")))
         controls_canvas.bind("<Configure>", lambda event: self._on_controls_canvas_configure(controls_canvas, controls_window, event.width))
+        controls_canvas.bind("<MouseWheel>", lambda event: self._scroll_controls_canvas(controls_canvas, event))
+        controls.bind("<MouseWheel>", lambda event: self._scroll_controls_canvas(controls_canvas, event))
         pane.add(controls_outer, weight=0)
 
         row = 0
@@ -1330,7 +1485,6 @@ class GDSStageMapperPanel:
         row = self._build_cursor_section(controls, row)
         row = self._build_calibration_section(controls, row)
         row = self._build_mapping_section(controls, row)
-        row = self._build_overlay_section(controls, row)
         self._build_motion_section(controls, row)
 
     def _section(self, parent: ttk.Frame, title: str, row: int) -> ttk.LabelFrame:
@@ -1419,6 +1573,13 @@ class GDSStageMapperPanel:
                 label.configure(wraplength=max(int(content_width * fraction), min_width))
             except tk.TclError:
                 pass
+
+    @staticmethod
+    def _scroll_controls_canvas(canvas: tk.Canvas, event: tk.Event) -> str:
+        delta = getattr(event, "delta", 0)
+        if delta:
+            canvas.yview_scroll(int(-delta / 120), "units")
+        return "break"
 
     def _build_microscope_preview(self, parent: ttk.Frame) -> None:
         preview = ttk.LabelFrame(parent, text="Microscope Live", padding=8)
@@ -1538,6 +1699,32 @@ class GDSStageMapperPanel:
         ttk.Label(actions, text="FocusZ", style="Panel.TLabel").grid(row=0, column=3, sticky="e", padx=(0, 5))
         ToggleSwitch(actions, self.use_focus_z_var, self.colors, command=self._on_focus_z_toggle).grid(row=0, column=4, sticky="e")
 
+    def _build_probe_assist_panel(self, parent: ttk.Frame, *, row: int) -> None:
+        assist = ttk.LabelFrame(parent, text="Probe Assist", padding=8)
+        assist.grid(row=row, column=0, sticky="ew", pady=(10, 0))
+        assist.columnconfigure((1, 3), weight=1)
+        ttk.Checkbutton(assist, text="Show", variable=self.assist_enabled_var, command=self._update_auxiliary_points).grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(assist, text="dU", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(7, 2), padx=(0, 4))
+        ttk.Entry(assist, textvariable=self.assist_du_var, width=7).grid(row=1, column=1, sticky="ew", pady=(7, 2), padx=(0, 6))
+        ttk.Label(assist, text="dV", style="Muted.TLabel").grid(row=1, column=2, sticky="w", pady=(7, 2), padx=(0, 4))
+        ttk.Entry(assist, textvariable=self.assist_dv_var, width=7).grid(row=1, column=3, sticky="ew", pady=(7, 2))
+        ttk.Label(assist, text="Style", style="Muted.TLabel").grid(row=2, column=0, sticky="w", pady=(5, 2), padx=(0, 4))
+        style = ttk.Combobox(assist, textvariable=self.assist_style_var, values=("cross", "ring", "dot", "diamond", "square"), state="readonly", width=8)
+        style.grid(row=2, column=1, sticky="ew", pady=(5, 2), padx=(0, 6))
+        ttk.Label(assist, text="Color", style="Muted.TLabel").grid(row=2, column=2, sticky="w", pady=(5, 2), padx=(0, 4))
+        color = ttk.Combobox(assist, textvariable=self.assist_color_var, values=("#f43f5e", "#38bdf8", "#f59e0b", "#34d399", "#e0f2fe"), width=9)
+        color.grid(row=2, column=3, sticky="ew", pady=(5, 2))
+        ttk.Label(assist, text="Label", style="Muted.TLabel").grid(row=3, column=0, sticky="w", pady=(5, 0), padx=(0, 4))
+        ttk.Entry(assist, textvariable=self.assist_label_var, width=12).grid(row=3, column=1, columnspan=3, sticky="ew", pady=(5, 0))
+        for variable in (
+            self.assist_du_var,
+            self.assist_dv_var,
+            self.assist_style_var,
+            self.assist_color_var,
+            self.assist_label_var,
+        ):
+            variable.trace_add("write", lambda *_args: self._update_auxiliary_points())
+
     def _build_coordinate_cell(self, parent: ttk.Frame, axis: str, row: int, column: int) -> None:
         cell = ttk.Frame(parent, style="Panel.TFrame")
         cell.grid(row=row, column=column, sticky="ew", padx=(0 if column == 0 else 4, 0 if axis in {"Z", "V"} else 4))
@@ -1571,12 +1758,14 @@ class GDSStageMapperPanel:
         self.coord_inputs[axis] = entry
 
     def _build_gds_file_section(self, parent: ttk.Frame, row: int) -> int:
-        section = self._section(parent, "GDS File", row)
+        section = self._section(parent, "GDS View", row)
         toolbar = ttk.Frame(section, style="Panel.TFrame")
         toolbar.grid(row=0, column=0, sticky="ew")
         toolbar.columnconfigure(2, weight=1)
         ttk.Button(toolbar, text="Load GDS", style="Accent.TButton", command=self.load_gds_dialog).grid(row=0, column=0, sticky="w", padx=(0, 6))
         ttk.Button(toolbar, text="Fit to View", command=self.viewer.fit_to_view).grid(row=0, column=1, sticky="w")
+        ttk.Label(toolbar, text="Overlay", style="Muted.TLabel").grid(row=0, column=3, sticky="e", padx=(8, 5))
+        ToggleSwitch(toolbar, self.overlay_enabled_var, self.colors, command=self._update_stage_overlay).grid(row=0, column=4, sticky="e")
         self._responsive_label(section, textvariable=self.load_status_var, style="Value.TLabel", padding=8).grid(row=1, column=0, sticky="ew", pady=(8, 0))
 
         top_row = ttk.Frame(section, style="Panel.TFrame")
@@ -1617,7 +1806,7 @@ class GDSStageMapperPanel:
 
     def _build_calibration_section(self, parent: ttk.Frame, row: int) -> int:
         section = self._collapsible_section(parent, "Calibration Points", row, f"{len(self.POINT_NAMES)} point affine fit")
-        headings = ("Pt", "GDSu", "GDSv", "Set GDS", "x um", "y um", "Set Stage")
+        headings = ("Pt", "GDSu", "GDSv", "Peak", "x", "y", "Stage")
         for col, heading in enumerate(headings):
             ttk.Label(section, text=heading, style="Muted.TLabel").grid(row=0, column=col, sticky="w", padx=(0, 5))
         for col in (1, 2, 4, 5):
@@ -1626,10 +1815,10 @@ class GDSStageMapperPanel:
         for row_index, name in enumerate(self.POINT_NAMES, start=1):
             ttk.Label(section, text=name, style="Panel.TLabel").grid(row=row_index, column=0, sticky="w", padx=(0, 5), pady=(5, 0))
             for col, key in ((1, "u"), (2, "v")):
-                ttk.Entry(section, textvariable=self.point_vars[name][key], width=6).grid(row=row_index, column=col, sticky="ew", padx=(0, 4), pady=(5, 0))
+                ttk.Entry(section, textvariable=self.point_vars[name][key], width=5).grid(row=row_index, column=col, sticky="ew", padx=(0, 4), pady=(5, 0))
             set_gds_button = tk.Button(
                 section,
-                text="Set GDS",
+                text="Peak",
                 command=lambda point=name: self._arm_gds_point_capture(point),
                 bg=self.colors["surface_3"],
                 fg=self.colors["text"],
@@ -1637,7 +1826,7 @@ class GDSStageMapperPanel:
                 activeforeground=self.colors["text"],
                 relief="flat",
                 bd=0,
-                padx=5,
+                padx=4,
                 pady=5,
                 font=("Segoe UI", 9),
                 cursor="hand2",
@@ -1645,9 +1834,39 @@ class GDSStageMapperPanel:
             set_gds_button.grid(row=row_index, column=3, sticky="ew", padx=(0, 4), pady=(5, 0))
             self.gds_point_buttons[name] = set_gds_button
             for col, key in ((4, "x_um"), (5, "y_um")):
-                ttk.Entry(section, textvariable=self.point_vars[name][key], width=6).grid(row=row_index, column=col, sticky="ew", padx=(0, 4), pady=(5, 0))
-            ttk.Button(section, text="Set Stage", command=lambda point=name: self._set_point_stage_from_current(point)).grid(row=row_index, column=6, sticky="ew", pady=(5, 0))
+                ttk.Entry(section, textvariable=self.point_vars[name][key], width=5).grid(row=row_index, column=col, sticky="ew", padx=(0, 4), pady=(5, 0))
+            stage_actions = ttk.Frame(section, style="Panel.TFrame")
+            stage_actions.grid(row=row_index, column=6, sticky="ew", pady=(5, 0))
+            stage_actions.columnconfigure((0, 1), weight=1, uniform=f"stage_actions_{name}")
+            self._calibration_icon_button(
+                stage_actions,
+                "\u2697",
+                lambda point=name: self._set_point_stage_from_current(point),
+            ).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+            self._calibration_icon_button(
+                stage_actions,
+                "\u26a1",
+                lambda point=name: self._move_to_calibration_stage_point(point),
+            ).grid(row=0, column=1, sticky="ew")
         return row + 1
+
+    def _calibration_icon_button(self, parent: tk.Widget, text: str, command: Callable[[], None]) -> tk.Button:
+        return tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=self.colors["surface_3"],
+            fg=self.colors["text"],
+            activebackground="#223144",
+            activeforeground=self.colors["text"],
+            relief="flat",
+            bd=0,
+            width=2,
+            padx=3,
+            pady=4,
+            font=("Segoe UI Symbol", 10, "bold"),
+            cursor="hand2",
+        )
 
     def _build_mapping_section(self, parent: ttk.Frame, row: int) -> int:
         section = self._section(parent, "Mapping", row)
@@ -1668,20 +1887,6 @@ class GDSStageMapperPanel:
         files.columnconfigure((0, 1), weight=1, uniform="cal_files")
         ttk.Button(files, text="Save Calibration", command=self.save_calibration_dialog).grid(row=0, column=0, sticky="ew", padx=(0, 4))
         ttk.Button(files, text="Load Calibration", command=self.load_calibration_dialog).grid(row=0, column=1, sticky="ew", padx=(4, 0))
-        return row + 1
-
-    def _build_overlay_section(self, parent: ttk.Frame, row: int) -> int:
-        section = self._section(parent, "Current Position Overlay", row)
-        toggle_row = ttk.Frame(section, style="Panel.TFrame")
-        toggle_row.grid(row=0, column=0, sticky="ew")
-        toggle_row.columnconfigure(0, weight=1)
-        ttk.Label(toggle_row, text="Enable overlay", style="Panel.TLabel").grid(row=0, column=0, sticky="w")
-        ToggleSwitch(toggle_row, self.overlay_enabled_var, self.colors, command=self._update_stage_overlay).grid(row=0, column=1, sticky="e")
-        status_row = ttk.Frame(section, style="Panel.TFrame")
-        status_row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        status_row.columnconfigure((0, 1), weight=1, uniform="overlay_status")
-        self._responsive_label(status_row, textvariable=self.current_stage_var, style="Value.TLabel", fraction=0.5, min_width=120, padding=7).grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self._responsive_label(status_row, textvariable=self.current_gds_var, style="Value.TLabel", fraction=0.5, min_width=120, padding=7).grid(row=0, column=1, sticky="ew", padx=(4, 0))
         return row + 1
 
     def _build_motion_section(self, parent: ttk.Frame, row: int) -> None:
@@ -1759,14 +1964,15 @@ class GDSStageMapperPanel:
         ttk.Label(self.layer_frame, text="Layers", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 4))
         grid = ttk.Frame(self.layer_frame, style="Panel.TFrame")
         grid.grid(row=1, column=0, sticky="ew")
-        for column in range(LAYER_TOGGLE_COLUMNS):
+        layer_columns = 3
+        for column in range(layer_columns):
             grid.columnconfigure(column, weight=1, uniform="layoutbond_layers")
         visible_layers = self.model.layers[:48]
         for index, layer in enumerate(visible_layers):
             variable = tk.BooleanVar(value=False)
             self.layer_vars[layer] = variable
             text = f"L{layer[0]} / D{layer[1]}"
-            grid_row, grid_column = layer_grid_position(index)
+            grid_row, grid_column = layer_grid_position(index, layer_columns)
             ttk.Checkbutton(
                 grid,
                 text=text,
@@ -1844,6 +2050,16 @@ class GDSStageMapperPanel:
         self.point_vars[point_name]["x_um"].set(f"{x_um:.12g}")
         self.point_vars[point_name]["y_um"].set(f"{y_um:.12g}")
         self.motion_status_var.set(f"{point_name} stage coordinate set from current position.")
+
+    def _move_to_calibration_stage_point(self, point_name: str) -> None:
+        try:
+            x_um = float(self.point_vars[point_name]["x_um"].get())
+            y_um = float(self.point_vars[point_name]["y_um"].get())
+        except ValueError:
+            self.motion_status_var.set(f"{point_name} needs numeric stage x/y before moving.")
+            return
+        self.motion_status_var.set(f"Move requested: {point_name} X {x_um:.6g} um, Y {y_um:.6g} um.")
+        self.move_to_stage_um(x_um, y_um)
 
     def fit_mapping_from_entries(self, *, autosave: bool = True) -> bool:
         try:
@@ -2296,6 +2512,10 @@ class GDSStageMapperPanel:
             return
         try:
             magnifier_text = ""
+            payload_key: tuple[object, ...] = (id(payload), bool(self.magnifier_enabled_var.get()), self.magnifier_scale_var.get(), self.magnifier_radius_var.get())
+            if payload_key == self.microscope_payload_key:
+                return
+            self.microscope_payload_key = payload_key
             if self.magnifier_enabled_var.get():
                 try:
                     magnification = float(self.magnifier_scale_var.get())
@@ -2325,6 +2545,7 @@ class GDSStageMapperPanel:
             self.stage_nav_status_var.set(f"Current XYZ: unavailable ({exc})")
         if self.mapper is None or not self.overlay_enabled_var.get():
             self.viewer.set_stage_overlay(None, None)
+            self._update_auxiliary_points()
             return
         try:
             x_um, y_um, _z_um = self._stage_position_xyz_um()
@@ -2344,11 +2565,39 @@ class GDSStageMapperPanel:
             self.current_stage_var.set(f"Current stage: unavailable ({exc})")
             self.current_gds_var.set("Current GDS: -")
             self.viewer.set_stage_overlay(None, None)
+            self.viewer.set_auxiliary_points([])
             return
 
         self.current_stage_var.set(f"Current stage x, y: {x_um:.6g} um, {y_um:.6g} um")
         self.current_gds_var.set(f"Current mapped GDS u, v: {center_gds[0]:.6g}, {center_gds[1]:.6g}")
         self.viewer.set_stage_overlay(center_gds, corners_gds)
+        self._update_auxiliary_points(center_gds)
+
+    def _update_auxiliary_points(self, center_gds: tuple[float, float] | None = None) -> None:
+        if not hasattr(self, "viewer") or not bool(self.assist_enabled_var.get()) or self.mapper is None:
+            if hasattr(self, "viewer"):
+                self.viewer.set_auxiliary_points([])
+            return
+        try:
+            if center_gds is None:
+                x_um, y_um, _z_um = self._stage_position_xyz_um()
+                center_gds = self.mapper.stage_to_gds(x_um, y_um)
+            du = float(self.assist_du_var.get())
+            dv = float(self.assist_dv_var.get())
+            if not math.isfinite(du) or not math.isfinite(dv):
+                raise ValueError
+            self.viewer.set_auxiliary_points(
+                [
+                    AuxiliaryPointOverlay(
+                        point=(center_gds[0] + du, center_gds[1] + dv),
+                        label=self.assist_label_var.get(),
+                        style=self.assist_style_var.get(),
+                        color=self.assist_color_var.get(),
+                    )
+                ]
+            )
+        except Exception:
+            self.viewer.set_auxiliary_points([])
 
     def save_calibration_dialog(self) -> None:
         path = filedialog.asksaveasfilename(

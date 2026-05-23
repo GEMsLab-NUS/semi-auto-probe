@@ -8,7 +8,7 @@ from pathlib import Path
 from tkinter import ttk
 from typing import Callable
 
-from .gds_stage_mapper import AffineCoordinateMapper, GDSCanvasViewer, GDSLayoutModel, MatrixOverlay
+from .gds_stage_mapper import AuxiliaryPointOverlay, AffineCoordinateMapper, GDSCanvasViewer, GDSLayoutModel, MatrixOverlay
 
 
 @dataclass(frozen=True)
@@ -191,6 +191,7 @@ class ImgMatrixPanel:
         self.pending_pick: str | None = None
         self.selected_gds: tuple[float, float] | None = None
         self.microscope_photo: tk.PhotoImage | None = None
+        self.microscope_payload_id: int | None = None
         self.status_poll_job: str | None = None
         self.preview_labels: list[ttk.Label] = []
         self.matrix_overlay_states: dict[tuple[int, int], str] = {}
@@ -208,6 +209,13 @@ class ImgMatrixPanel:
         self.selection_var = tk.StringVar(value="Selected: -")
         self.current_stage_var = tk.StringVar(value="Current stage: -")
         self.current_gds_var = tk.StringVar(value="Current GDS: -")
+        self.viewport_var = tk.StringVar(value="Viewport: -")
+        self.assist_enabled_var = tk.BooleanVar(value=False)
+        self.assist_du_var = tk.StringVar(value="0")
+        self.assist_dv_var = tk.StringVar(value="0")
+        self.assist_style_var = tk.StringVar(value="cross")
+        self.assist_color_var = tk.StringVar(value="#f43f5e")
+        self.assist_label_var = tk.StringVar(value="Probe")
         self.matrix_summary_var = tk.StringVar(value="Preview: set Origin, U/V vectors, rows and columns.")
         self.status_var = tk.StringVar(value="Idle")
         self.session_var = tk.StringVar(value="Session: -")
@@ -269,6 +277,37 @@ class ImgMatrixPanel:
         ttk.Label(selection, textvariable=self.selection_var, style="Value.TLabel", padding=6, wraplength=180).grid(row=1, column=0, sticky="ew", pady=(5, 0))
         ttk.Button(selection, text="Fit to View", command=lambda: self.viewer.fit_to_view()).grid(row=2, column=0, sticky="ew", pady=(8, 0))
 
+        viewport = ttk.LabelFrame(parent, text="GDS Viewport", padding=8)
+        viewport.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        viewport.columnconfigure(0, weight=1)
+        ttk.Label(viewport, textvariable=self.viewport_var, style="Value.TLabel", padding=6, wraplength=180).grid(row=0, column=0, sticky="ew")
+
+    def _build_probe_assist_panel(self, parent: ttk.Frame, *, row: int) -> None:
+        assist = ttk.LabelFrame(parent, text="Probe Assist", padding=8)
+        assist.grid(row=row, column=0, sticky="ew", pady=(10, 0))
+        assist.columnconfigure((1, 3), weight=1)
+        ttk.Checkbutton(assist, text="Show", variable=self.assist_enabled_var, command=self._update_auxiliary_points).grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(assist, text="dU", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(7, 2), padx=(0, 4))
+        ttk.Entry(assist, textvariable=self.assist_du_var, width=7).grid(row=1, column=1, sticky="ew", pady=(7, 2), padx=(0, 6))
+        ttk.Label(assist, text="dV", style="Muted.TLabel").grid(row=1, column=2, sticky="w", pady=(7, 2), padx=(0, 4))
+        ttk.Entry(assist, textvariable=self.assist_dv_var, width=7).grid(row=1, column=3, sticky="ew", pady=(7, 2))
+        ttk.Label(assist, text="Style", style="Muted.TLabel").grid(row=2, column=0, sticky="w", pady=(5, 2), padx=(0, 4))
+        style = ttk.Combobox(assist, textvariable=self.assist_style_var, values=("cross", "ring", "dot", "diamond", "square"), state="readonly", width=8)
+        style.grid(row=2, column=1, sticky="ew", pady=(5, 2), padx=(0, 6))
+        ttk.Label(assist, text="Color", style="Muted.TLabel").grid(row=2, column=2, sticky="w", pady=(5, 2), padx=(0, 4))
+        color = ttk.Combobox(assist, textvariable=self.assist_color_var, values=("#f43f5e", "#38bdf8", "#f59e0b", "#34d399", "#e0f2fe"), width=9)
+        color.grid(row=2, column=3, sticky="ew", pady=(5, 2))
+        ttk.Label(assist, text="Label", style="Muted.TLabel").grid(row=3, column=0, sticky="w", pady=(5, 0), padx=(0, 4))
+        ttk.Entry(assist, textvariable=self.assist_label_var, width=12).grid(row=3, column=1, columnspan=3, sticky="ew", pady=(5, 0))
+        for variable in (
+            self.assist_du_var,
+            self.assist_dv_var,
+            self.assist_style_var,
+            self.assist_color_var,
+            self.assist_label_var,
+        ):
+            variable.trace_add("write", lambda *_args: self._update_auxiliary_points())
+
     def _build_controls(self, parent: ttk.Frame) -> None:
         row = 0
         row = self._build_point_section(parent, row)
@@ -283,7 +322,7 @@ class ImgMatrixPanel:
         frame.columnconfigure(0, weight=1)
         labels: dict[str, tk.Label] = {}
         rows = (
-            ("Stage XY", (("stage_x", "X"), ("stage_y", "Y"))),
+            ("Stage XYZ", (("stage_x", "X"), ("stage_y", "Y"), ("stage_z", "Z"))),
             ("Layout UV", (("gds_u", "U"), ("gds_v", "V"))),
         )
         for row_index, (title, fields) in enumerate(rows):
@@ -643,21 +682,80 @@ class ImgMatrixPanel:
             self.current_stage_var.set(f"Current XYZ: {x_um:.6g}, {y_um:.6g}, {z_um:.6g} um")
             self._set_stage_metric("stage_x", f"{x_um:.3f}")
             self._set_stage_metric("stage_y", f"{y_um:.3f}")
+            self._set_stage_metric("stage_z", f"{z_um:.3f}")
+            if hasattr(self, "viewer"):
+                self.viewport_var.set(self.viewer.viewport_status_text())
             mapper = self.get_mapper()
             if mapper is None:
                 self.current_gds_var.set("Current GDS: bind LayoutMap first")
                 self._set_stage_metric("gds_u", "-", available=False)
                 self._set_stage_metric("gds_v", "-", available=False)
+                self.viewer.set_stage_overlay(None, None)
+                self.viewer.set_auxiliary_points([])
             else:
                 u, v = mapper.stage_to_gds(x_um, y_um)
                 self.current_gds_var.set(f"Current GDS u, v: {u:.6g}, {v:.6g}")
                 self._set_stage_metric("gds_u", f"{u:.3f}")
                 self._set_stage_metric("gds_v", f"{v:.3f}")
+                self._update_current_stage_overlay(mapper, x_um, y_um)
         except Exception as exc:
             self.current_stage_var.set(f"Current stage unavailable: {exc}")
             self.current_gds_var.set("Current GDS: -")
-            for key in ("stage_x", "stage_y", "gds_u", "gds_v"):
+            self.viewport_var.set("Viewport: -")
+            for key in ("stage_x", "stage_y", "stage_z", "gds_u", "gds_v"):
                 self._set_stage_metric(key, "-", available=False)
+            self.viewer.set_stage_overlay(None, None)
+            self.viewer.set_auxiliary_points([])
+
+    def _update_current_stage_overlay(self, mapper: AffineCoordinateMapper, x_um: float, y_um: float) -> None:
+        try:
+            width_um = float(self.fov_width_var.get())
+            height_um = float(self.fov_height_var.get())
+            if width_um <= 0 or height_um <= 0:
+                raise ValueError
+            center_gds = mapper.stage_to_gds(x_um, y_um)
+            corners_stage = [
+                (x_um - width_um / 2.0, y_um - height_um / 2.0),
+                (x_um + width_um / 2.0, y_um - height_um / 2.0),
+                (x_um + width_um / 2.0, y_um + height_um / 2.0),
+                (x_um - width_um / 2.0, y_um + height_um / 2.0),
+            ]
+            self.viewer.set_stage_overlay(center_gds, [mapper.stage_to_gds(x, y) for x, y in corners_stage])
+            self._update_auxiliary_points(center_gds)
+        except Exception:
+            self.viewer.set_stage_overlay(None, None)
+            self.viewer.set_auxiliary_points([])
+
+    def _update_auxiliary_points(self, center_gds: tuple[float, float] | None = None) -> None:
+        if not hasattr(self, "viewer") or not bool(self.assist_enabled_var.get()):
+            if hasattr(self, "viewer"):
+                self.viewer.set_auxiliary_points([])
+            return
+        mapper = self.get_mapper()
+        if mapper is None:
+            self.viewer.set_auxiliary_points([])
+            return
+        try:
+            if center_gds is None:
+                x_um, y_um, _z_um = self._stage_position_xyz_um()
+                center_gds = mapper.stage_to_gds(x_um, y_um)
+            du = float(self.assist_du_var.get())
+            dv = float(self.assist_dv_var.get())
+            if not math.isfinite(du) or not math.isfinite(dv):
+                raise ValueError
+            point = (center_gds[0] + du, center_gds[1] + dv)
+            self.viewer.set_auxiliary_points(
+                [
+                    AuxiliaryPointOverlay(
+                        point=point,
+                        label=self.assist_label_var.get(),
+                        style=self.assist_style_var.get(),
+                        color=self.assist_color_var.get(),
+                    )
+                ]
+            )
+        except Exception:
+            self.viewer.set_auxiliary_points([])
 
     def _update_microscope_preview(self) -> None:
         if self.get_microscope_preview is None:
@@ -669,6 +767,10 @@ class ImgMatrixPanel:
         if not payload:
             return
         try:
+            payload_id = id(payload)
+            if payload_id == self.microscope_payload_id:
+                return
+            self.microscope_payload_id = payload_id
             self.microscope_photo = tk.PhotoImage(data=payload, format="PPM")
             self.microscope_label.configure(image=self.microscope_photo, text="")
         except tk.TclError:

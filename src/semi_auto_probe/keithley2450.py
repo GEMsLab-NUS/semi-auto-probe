@@ -71,6 +71,48 @@ class IVSweepStatistics:
 
 
 @dataclass(frozen=True)
+class ConstantVoltageCurrentConfig:
+    resource_name: str = DEFAULT_KEITHLEY2450_RESOURCE
+    output_terminal: str = OUTPUT_TERMINAL_REAR
+    voltage_v: float = 0.1
+    current_limit_a: float = 1e-5
+    sample_count: int = 5
+    nplc: float = 10.0
+    output_off_after: bool = True
+
+    def normalized(self) -> "ConstantVoltageCurrentConfig":
+        output_terminal = normalize_output_terminal(self.output_terminal)
+        values = (self.voltage_v, self.current_limit_a, self.nplc)
+        if any(not math.isfinite(float(value)) for value in values):
+            raise ValueError("Constant voltage current parameters must be finite.")
+        if float(self.current_limit_a) <= 0:
+            raise ValueError("Constant voltage current limit must be positive.")
+        if float(self.nplc) <= 0 or float(self.nplc) > 25:
+            raise ValueError("Constant voltage NPLC must be in range 0..25.")
+        sample_count = int(float(self.sample_count))
+        if sample_count <= 0 or sample_count > 10000:
+            raise ValueError("Constant voltage sample count must be in range 1..10000.")
+        resource_name = str(self.resource_name or DEFAULT_KEITHLEY2450_RESOURCE).strip()
+        if not resource_name:
+            raise ValueError("Keithley VISA resource cannot be empty.")
+        return ConstantVoltageCurrentConfig(
+            resource_name=resource_name,
+            output_terminal=output_terminal,
+            voltage_v=float(self.voltage_v),
+            current_limit_a=float(self.current_limit_a),
+            sample_count=sample_count,
+            nplc=float(self.nplc),
+            output_off_after=bool(self.output_off_after),
+        )
+
+    def summary(self) -> str:
+        return (
+            f"{self.resource_name} | {self.output_terminal} terminal | "
+            f"V={self.voltage_v:g} V | Ilimit={self.current_limit_a:g} A | {self.sample_count} samples"
+        )
+
+
+@dataclass(frozen=True)
 class IVSweepConfig:
     resource_name: str = DEFAULT_KEITHLEY2450_RESOURCE
     output_terminal: str = OUTPUT_TERMINAL_REAR
@@ -252,6 +294,18 @@ def iv_sweep_config_from_params(params: dict[str, str]) -> IVSweepConfig:
     ).normalized()
 
 
+def constant_voltage_current_config_from_params(params: dict[str, str]) -> ConstantVoltageCurrentConfig:
+    return ConstantVoltageCurrentConfig(
+        resource_name=params.get("resource", params.get("resource_name", DEFAULT_KEITHLEY2450_RESOURCE)),
+        output_terminal=params.get("output_terminal", params.get("terminal", OUTPUT_TERMINAL_REAR)),
+        voltage_v=float(params.get("bias_v", params.get("voltage_v", params.get("voltage", 0.1)))),
+        current_limit_a=float(params.get("current_limit_a", params.get("limit_a", params.get("compliance_a", 1e-5)))),
+        sample_count=int(float(params.get("sample_count", params.get("samples", 5)))),
+        nplc=float(params.get("nplc", 10.0)),
+        output_off_after=parse_bool(params.get("output_off_after", "true"), default=True),
+    ).normalized()
+
+
 def calculate_iv_statistics(samples: list[IVSweepSample] | tuple[IVSweepSample, ...], config: IVSweepConfig) -> IVSweepStatistics:
     normalized = config.normalized()
     if not normalized.output_statistics:
@@ -384,6 +438,50 @@ class Keithley2450IVRunner:
                 self.instrument = None
         return samples
 
+    def run_constant_voltage_current(
+        self,
+        config: ConstantVoltageCurrentConfig,
+        *,
+        stop_requested: Callable[[], bool] | None = None,
+        on_sample: Callable[[IVSweepSample], None] | None = None,
+    ) -> list[IVSweepSample]:
+        normalized = config.normalized()
+        instrument = self.instrument or self._open_resource(normalized.resource_name)
+        self.instrument = instrument
+        samples: list[IVSweepSample] = []
+        started_at = time.monotonic()
+        try:
+            self._configure_constant_voltage_current(instrument, normalized)
+            instrument.write(":OUTP ON")
+            for index in range(1, normalized.sample_count + 1):
+                if stop_requested is not None and stop_requested():
+                    break
+                raw = instrument.query(":READ?")
+                sample = self._sample_from_reading(
+                    raw,
+                    index=index,
+                    total=normalized.sample_count,
+                    elapsed_s=time.monotonic() - started_at,
+                    source_value=normalized.voltage_v,
+                    sweep_mode=IV_SWEEP_MODE_VOLTAGE,
+                )
+                samples.append(sample)
+                if on_sample is not None:
+                    on_sample(sample)
+        finally:
+            if normalized.output_off_after:
+                try:
+                    instrument.write(":OUTP OFF")
+                except Exception:
+                    pass
+            if self._owns_instrument:
+                try:
+                    instrument.close()
+                except Exception:
+                    pass
+                self.instrument = None
+        return samples
+
     def _open_resource(self, resource_name: str) -> VisaInstrument:
         try:
             import pyvisa
@@ -413,6 +511,18 @@ class Keithley2450IVRunner:
             instrument.write(f":SENS:VOLT:PROT:LEV {config.voltage_limit_v:.12g}")
             instrument.write(":SENS:VOLT:RANG:AUTO 1")
             instrument.write(f":SENS:VOLT:NPLC {config.nplc:.12g}")
+
+    def _configure_constant_voltage_current(self, instrument: VisaInstrument, config: ConstantVoltageCurrentConfig) -> None:
+        instrument.write("*RST")
+        instrument.write(f":ROUT:TERM {'FRON' if config.output_terminal == OUTPUT_TERMINAL_FRONT else 'REAR'}")
+        instrument.write(":SOUR:FUNC:MODE VOLT")
+        instrument.write(":SOUR:VOLT:MODE FIX")
+        instrument.write(":SOUR:VOLT:RANG:AUTO 1")
+        instrument.write(f":SOUR:VOLT:LEV {config.voltage_v:.12g}")
+        instrument.write(':SENS:FUNC "CURR"')
+        instrument.write(f":SENS:CURR:PROT:LEV {config.current_limit_a:.12g}")
+        instrument.write(":SENS:CURR:RANG:AUTO 1")
+        instrument.write(f":SENS:CURR:NPLC {config.nplc:.12g}")
 
     def _set_source_value(self, instrument: VisaInstrument, sweep_mode: str, source_value: float) -> None:
         if sweep_mode == IV_SWEEP_MODE_VOLTAGE:

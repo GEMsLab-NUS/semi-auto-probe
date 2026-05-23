@@ -3,10 +3,12 @@ from __future__ import annotations
 import unittest
 
 from semi_auto_probe.keithley2450 import (
+    ConstantVoltageCurrentConfig,
     IVSweepConfig,
     IVSweepSample,
     Keithley2450IVRunner,
     calculate_iv_statistics,
+    constant_voltage_current_config_from_params,
     iv_sweep_config_from_params,
 )
 
@@ -84,6 +86,28 @@ class Keithley2450Tests(unittest.TestCase):
         self.assertIn(":OUTP OFF", instrument.commands)
         self.assertAlmostEqual(result[-1].voltage_v, 0.3)
         self.assertAlmostEqual(result[-1].current_a, 3e-6)
+
+    def test_runner_configures_constant_voltage_current_sampling(self) -> None:
+        instrument = FakeInstrument()
+        runner = Keithley2450IVRunner(instrument)
+
+        result = runner.run_constant_voltage_current(
+            ConstantVoltageCurrentConfig(voltage_v=0.1, current_limit_a=1e-5, sample_count=2),
+        )
+
+        self.assertEqual(len(result), 2)
+        self.assertIn(":SOUR:VOLT:LEV 0.1", instrument.commands)
+        self.assertIn(":SENS:CURR:PROT:LEV 1e-05", instrument.commands)
+        self.assertIn(":OUTP ON", instrument.commands)
+        self.assertAlmostEqual(result[0].voltage_v, 0.1)
+        self.assertAlmostEqual(result[0].current_a, 1e-6)
+
+    def test_constant_voltage_params_default_to_100mv_and_10ua(self) -> None:
+        config = constant_voltage_current_config_from_params({})
+
+        self.assertAlmostEqual(config.voltage_v, 0.1)
+        self.assertAlmostEqual(config.current_limit_a, 1e-5)
+        self.assertAlmostEqual(config.nplc, 10.0)
 
     def test_statistics_use_linear_iv_slope_and_geometry(self) -> None:
         samples = [

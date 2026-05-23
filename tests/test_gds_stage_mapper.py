@@ -132,6 +132,20 @@ class CanvasTransformTests(unittest.TestCase):
         _high_x, high_canvas_y = transform.gds_to_canvas(50.0, 45.0)
         self.assertLess(high_canvas_y, low_canvas_y)
 
+    def test_canvas_rect_fit_zooms_to_selected_gds_bounds(self) -> None:
+        transform = CanvasTransform()
+        transform.fit_to_bounds((0.0, 0.0, 100.0, 100.0), width=500, height=500, padding=0)
+        selected_bounds = transform.canvas_rect_to_gds_bounds(100.0, 100.0, 300.0, 300.0)
+
+        transform.fit_to_canvas_rect(100.0, 100.0, 300.0, 300.0, width=500, height=500, padding=0)
+
+        left, top = transform.gds_to_canvas(selected_bounds[0], selected_bounds[3])
+        right, bottom = transform.gds_to_canvas(selected_bounds[2], selected_bounds[1])
+        self.assertAlmostEqual(left, 0.0)
+        self.assertAlmostEqual(top, 0.0)
+        self.assertAlmostEqual(right, 500.0)
+        self.assertAlmostEqual(bottom, 500.0)
+
     def test_snap_gds_point_uses_grid_in_micrometers(self) -> None:
         self.assertEqual(snap_gds_point((1.26, -2.24), 0.1), (1.3, -2.2))
         self.assertEqual(snap_gds_point((12.6, 17.4), 5.0), (15.0, 15.0))

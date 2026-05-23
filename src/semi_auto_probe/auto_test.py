@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+import json
 import math
 import tkinter as tk
 from dataclasses import dataclass
-from tkinter import ttk
+from pathlib import Path
+from tkinter import filedialog, ttk
 from typing import Callable
 
-from .gds_stage_mapper import AffineCoordinateMapper, GDSCanvasViewer, GDSLayoutModel, MatrixOverlay
+from .gds_stage_mapper import AuxiliaryPointOverlay, AffineCoordinateMapper, GDSCanvasViewer, GDSLayoutModel, MatrixOverlay, ToggleSwitch
 from .img_matrix import fov_polygon_for_stage_target
+
+AUTOTEST_PREVIEW_INTERVAL_MS = 45
+AUTOTEST_OVERLAY_REDRAW_INTERVAL_MS = 90
+PROBE_ASSIST_PROBES: tuple[tuple[str, str, str], ...] = (
+    ("Drain", "#f43f5e", "square"),
+    ("Source", "#38bdf8", "diamond"),
+    ("Gate", "#34d399", "ring"),
+)
 
 
 @dataclass(frozen=True)
@@ -33,6 +43,9 @@ class AutoTestSettings:
     z_fast_speed_percent: int
     z_slow_speed_percent: int
     name_pattern: str
+    z_wobble_um: float = 0.0
+    z_wobble_cycles: int = 0
+    z_offset_um: float = 0.0
     measurement_steps: tuple[str, ...] = ()
     measurement_flow: tuple[AutoTestFlowStep, ...] = ()
 
@@ -50,6 +63,8 @@ class AutoTestSettings:
             self.z_up_fast_percent,
             self.z_fast_speed_percent,
             self.z_slow_speed_percent,
+            self.z_wobble_um,
+            self.z_offset_um,
         )
         if any(not math.isfinite(float(value)) for value in values):
             raise ValueError("AutoTest coordinates and dimensions must be finite.")
@@ -75,6 +90,13 @@ class AutoTestSettings:
             raise ValueError("AutoTest fast Z speed must be between 0 and 100 percent.")
         if z_slow_speed_percent < 0 or z_slow_speed_percent > 100:
             raise ValueError("AutoTest slow Z speed must be between 0 and 100 percent.")
+        z_wobble_um = float(self.z_wobble_um)
+        z_wobble_cycles = int(float(self.z_wobble_cycles))
+        z_offset_um = float(self.z_offset_um)
+        if z_wobble_um < 0:
+            raise ValueError("AutoTest Z wobble must be zero or positive.")
+        if z_wobble_cycles < 0:
+            raise ValueError("AutoTest Z wobble cycles must be zero or positive.")
         name_pattern = str(self.name_pattern).strip()
         if not name_pattern:
             raise ValueError("AutoTest point name pattern is required.")
@@ -94,6 +116,9 @@ class AutoTestSettings:
             z_fast_speed_percent=z_fast_speed_percent,
             z_slow_speed_percent=z_slow_speed_percent,
             name_pattern=name_pattern,
+            z_wobble_um=z_wobble_um,
+            z_wobble_cycles=z_wobble_cycles,
+            z_offset_um=z_offset_um,
             measurement_steps=tuple(str(step) for step in self.measurement_steps),
             measurement_flow=tuple(
                 AutoTestFlowStep(str(step.type_id), {str(key): str(value) for key, value in step.params.items()})
@@ -113,6 +138,15 @@ class AutoTestPoint:
     stage_x_um: float
     stage_y_um: float
     fov_polygon_gds: tuple[tuple[float, float], ...]
+
+
+@dataclass(frozen=True)
+class AutoTestPointSpec:
+    name: str
+    u: float
+    v: float
+    row: int = 0
+    col: int = 0
 
 
 @dataclass(frozen=True)
@@ -173,6 +207,29 @@ AUTOTEST_FLOW_DEFINITIONS: tuple[AutoTestFlowDefinition, ...] = (
             AutoTestFlowParam("device_width_um", "Width um", "0"),
             AutoTestFlowParam("film_thickness_nm", "Thickness nm", "0"),
             AutoTestFlowParam("output_off_after", "Output off after", "true"),
+        ),
+    ),
+    AutoTestFlowDefinition(
+        "wobb_test",
+        "WobbTest",
+        "Optimize contact by wobbing Z, optionally followed by XY.",
+        "#f97316",
+        (
+            AutoTestFlowParam("mode", "Mode", "Z"),
+            AutoTestFlowParam("resource", "VISA resource", "GPIB0::18::INSTR"),
+            AutoTestFlowParam("output_terminal", "Output terminal", "rear"),
+            AutoTestFlowParam("bias_v", "Bias V", "0.1"),
+            AutoTestFlowParam("current_limit_a", "Current limit A", "1e-5"),
+            AutoTestFlowParam("z_lower_um", "Z lower um", "-2"),
+            AutoTestFlowParam("z_upper_um", "Z upper um", "2"),
+            AutoTestFlowParam("z_step_um", "Z step um", "0.5"),
+            AutoTestFlowParam("xy_range_um", "XY range um", "2"),
+            AutoTestFlowParam("xy_step_um", "XY step um", "1"),
+            AutoTestFlowParam("xy_pattern", "XY pattern", "square"),
+            AutoTestFlowParam("settle_s", "Settle s", "0.05"),
+            AutoTestFlowParam("sample_count", "Samples", "5"),
+            AutoTestFlowParam("nplc", "NPLC", "10"),
+            AutoTestFlowParam("best_current", "Best current", "max_abs"),
         ),
     ),
     AutoTestFlowDefinition(
@@ -284,6 +341,72 @@ def measurement_flow_steps_from_cards(cards: tuple[AutoTestFlowCard, ...] | list
     )
 
 
+def contact_wobble_offsets_um(wobble_um: float, wobble_cycles: int, offset_um: float) -> tuple[float, ...]:
+    offsets: list[float] = []
+    wobble = max(0.0, float(wobble_um))
+    cycles = max(0, int(wobble_cycles))
+    for _cycle in range(cycles):
+        if wobble <= 0:
+            break
+        offsets.extend((wobble, -wobble, 0.0))
+    final_offset = float(offset_um)
+    if final_offset != 0.0 or (offsets and offsets[-1] != final_offset):
+        if not offsets or offsets[-1] != final_offset:
+            offsets.append(final_offset)
+    return tuple(offsets)
+
+
+def wobbtest_z_offsets_um(lower_um: float, upper_um: float, step_um: float) -> tuple[float, ...]:
+    lower = min(0.0, float(lower_um))
+    upper = max(0.0, float(upper_um))
+    step = abs(float(step_um))
+    if not all(math.isfinite(value) for value in (lower, upper, step)) or step <= 0:
+        raise ValueError("WobbTest Z step must be a positive finite number.")
+    negative_steps = int(math.floor(abs(lower) / step + 1e-9))
+    positive_steps = int(math.floor(abs(upper) / step + 1e-9))
+    offsets: list[float] = [0.0]
+    paired_steps = min(negative_steps, positive_steps)
+    for index in range(1, paired_steps + 1):
+        offsets.extend((index * step, -index * step))
+    if positive_steps > paired_steps:
+        offsets.extend(index * step for index in range(paired_steps + 1, positive_steps + 1))
+    if negative_steps > paired_steps:
+        offsets.extend(-index * step for index in range(paired_steps + 1, negative_steps + 1))
+    if upper > positive_steps * step + step * 1e-6:
+        offsets.append(upper)
+    if abs(lower) > negative_steps * step + step * 1e-6:
+        offsets.append(lower)
+    return tuple(dict.fromkeys(round(offset, 12) for offset in offsets))
+
+
+def wobbtest_xy_offsets_um(range_um: float, step_um: float, pattern: str) -> tuple[tuple[float, float], ...]:
+    radius = abs(float(range_um))
+    step = abs(float(step_um))
+    if not all(math.isfinite(value) for value in (radius, step)) or step <= 0:
+        raise ValueError("WobbTest XY step must be a positive finite number.")
+    if radius == 0:
+        return ((0.0, 0.0),)
+    normalized = str(pattern or "square").strip().lower()
+    if normalized == "corners":
+        return ((0.0, 0.0), (radius, radius), (-radius, radius), (-radius, -radius), (radius, -radius), (0.0, 0.0))
+    offsets: list[tuple[float, float]] = [(0.0, 0.0)]
+    rings = max(1, int(math.ceil(radius / step)))
+    for ring in range(1, rings + 1):
+        r = min(radius, ring * step)
+        offsets.extend(((r, 0.0), (r, r), (0.0, r), (-r, r), (-r, 0.0), (-r, -r), (0.0, -r), (r, -r)))
+        if normalized == "square":
+            break
+    offsets.append((0.0, 0.0))
+    seen: set[tuple[float, float]] = set()
+    unique: list[tuple[float, float]] = []
+    for dx, dy in offsets:
+        key = (round(dx, 12), round(dy, 12))
+        if key not in seen or key == (0.0, 0.0):
+            seen.add(key)
+            unique.append(key)
+    return tuple(unique)
+
+
 def generate_autotest_points(settings: AutoTestSettings, mapper: AffineCoordinateMapper) -> tuple[AutoTestPoint, ...]:
     normalized = settings.normalized()
     points: list[AutoTestPoint] = []
@@ -316,8 +439,185 @@ def generate_autotest_points(settings: AutoTestSettings, mapper: AffineCoordinat
     return tuple(points)
 
 
+def generate_autotest_points_from_specs(
+    specs: tuple[AutoTestPointSpec, ...] | list[AutoTestPointSpec],
+    settings: AutoTestSettings,
+    mapper: AffineCoordinateMapper,
+) -> tuple[AutoTestPoint, ...]:
+    normalized = settings.normalized()
+    points: list[AutoTestPoint] = []
+    for order, spec in enumerate(specs, start=1):
+        if not math.isfinite(float(spec.u)) or not math.isfinite(float(spec.v)):
+            raise ValueError("Imported AutoTest point coordinates must be finite.")
+        stage_x_um, stage_y_um = mapper.gds_to_stage(float(spec.u), float(spec.v))
+        name = str(spec.name).strip() or f"Point{order:03d}"
+        points.append(
+            AutoTestPoint(
+                row=int(spec.row),
+                col=int(spec.col),
+                order=order,
+                name=name,
+                u=float(spec.u),
+                v=float(spec.v),
+                stage_x_um=stage_x_um,
+                stage_y_um=stage_y_um,
+                fov_polygon_gds=fov_polygon_for_stage_target(
+                    mapper,
+                    stage_x_um,
+                    stage_y_um,
+                    normalized.fov_width_um,
+                    normalized.fov_height_um,
+                ),
+            )
+        )
+    return tuple(points)
+
+
+def autotest_point_specs_from_json_payload(payload: object) -> tuple[AutoTestPointSpec, ...]:
+    if isinstance(payload, list):
+        raw_points = payload
+    elif isinstance(payload, dict):
+        raw_points = payload.get("points")
+    else:
+        raise ValueError("AutoTest point list must be a JSON object or array.")
+    if not isinstance(raw_points, list):
+        raise ValueError("AutoTest point list JSON must contain a points array.")
+    specs: list[AutoTestPointSpec] = []
+    for index, item in enumerate(raw_points, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Point {index} must be an object.")
+        try:
+            u = float(item["u"])
+            v = float(item["v"])
+        except KeyError as exc:
+            raise ValueError(f"Point {index} is missing {exc.args[0]}.") from exc
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Point {index} must have numeric u/v coordinates.") from exc
+        if not math.isfinite(u) or not math.isfinite(v):
+            raise ValueError(f"Point {index} must have finite u/v coordinates.")
+        name = str(item.get("name") or f"Point{index:03d}").strip() or f"Point{index:03d}"
+        row = int(float(item.get("row", index - 1)))
+        col = int(float(item.get("col", 0)))
+        specs.append(AutoTestPointSpec(name=name, u=u, v=v, row=row, col=col))
+    if not specs:
+        raise ValueError("AutoTest point list is empty.")
+    return tuple(specs)
+
+
+def autotest_point_specs_payload(
+    specs: tuple[AutoTestPointSpec, ...] | list[AutoTestPointSpec],
+    *,
+    source: str = "manual",
+    generator: dict[str, object] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "format": "semi_auto_probe.autotest_point_list",
+        "version": 1,
+        "source": source,
+        "points": [
+            {
+                "name": spec.name,
+                "u": spec.u,
+                "v": spec.v,
+                "row": spec.row,
+                "col": spec.col,
+            }
+            for spec in specs
+        ],
+    }
+    if generator is not None:
+        payload["generator"] = generator
+    return payload
+
+
+def generate_nested_autotest_point_specs(
+    *,
+    origin_u: float,
+    origin_v: float,
+    inner_u_vector_u: float,
+    inner_u_vector_v: float,
+    inner_v_vector_u: float,
+    inner_v_vector_v: float,
+    inner_cols: int,
+    inner_rows: int,
+    outer_u_vector_u: float,
+    outer_u_vector_v: float,
+    outer_v_vector_u: float,
+    outer_v_vector_v: float,
+    outer_cols: int,
+    outer_rows: int,
+    name_pattern: str,
+) -> tuple[AutoTestPointSpec, ...]:
+    counts = (inner_cols, inner_rows, outer_cols, outer_rows)
+    if any(int(value) <= 0 for value in counts):
+        raise ValueError("Nested AutoTest array counts must be positive.")
+    values = (
+        origin_u,
+        origin_v,
+        inner_u_vector_u,
+        inner_u_vector_v,
+        inner_v_vector_u,
+        inner_v_vector_v,
+        outer_u_vector_u,
+        outer_u_vector_v,
+        outer_v_vector_u,
+        outer_v_vector_v,
+    )
+    if any(not math.isfinite(float(value)) for value in values):
+        raise ValueError("Nested AutoTest array coordinates must be finite.")
+    pattern = str(name_pattern).strip() or "Dev{bi}{bj}_{i}{j}"
+    specs: list[AutoTestPointSpec] = []
+    order = 1
+    for outer_row in range(int(outer_rows)):
+        for outer_col in range(int(outer_cols)):
+            block_u = float(origin_u) + outer_col * float(outer_u_vector_u) + outer_row * float(outer_v_vector_u)
+            block_v = float(origin_v) + outer_col * float(outer_u_vector_v) + outer_row * float(outer_v_vector_v)
+            for inner_row in range(int(inner_rows)):
+                for inner_col in range(int(inner_cols)):
+                    u = block_u + inner_col * float(inner_u_vector_u) + inner_row * float(inner_v_vector_u)
+                    v = block_v + inner_col * float(inner_u_vector_v) + inner_row * float(inner_v_vector_v)
+                    name = compile_nested_autotest_point_name(
+                        pattern,
+                        block_i_index=outer_col,
+                        block_j_index=outer_row,
+                        i_index=inner_col,
+                        j_index=inner_row,
+                        order=order,
+                    )
+                    specs.append(
+                        AutoTestPointSpec(
+                            name=name,
+                            u=u,
+                            v=v,
+                            row=outer_row * int(inner_rows) + inner_row,
+                            col=outer_col * int(inner_cols) + inner_col,
+                        )
+                    )
+                    order += 1
+    return tuple(specs)
+
+
 def compile_autotest_point_name(pattern: str, *, i_index: int, j_index: int) -> str:
     return str(pattern).replace("{i}", index_to_letters(i_index)).replace("{j}", str(j_index + 1))
+
+
+def compile_nested_autotest_point_name(
+    pattern: str,
+    *,
+    block_i_index: int,
+    block_j_index: int,
+    i_index: int,
+    j_index: int,
+    order: int,
+) -> str:
+    return (
+        str(pattern)
+        .replace("{bi}", index_to_letters(block_i_index))
+        .replace("{bj}", str(block_j_index + 1))
+        .replace("{i}", index_to_letters(i_index))
+        .replace("{j}", str(j_index + 1))
+        .replace("{n}", str(order))
+    )
 
 
 def index_to_letters(index: int) -> str:
@@ -405,6 +705,137 @@ class RoundedSplitSlider(tk.Canvas):
         )
 
 
+class RangeSlider(tk.Canvas):
+    def __init__(
+        self,
+        parent: tk.Widget,
+        lower_var: tk.StringVar,
+        upper_var: tk.StringVar,
+        colors: dict[str, str],
+        *,
+        minimum: float = -20.0,
+        maximum: float = 20.0,
+        step: float = 0.5,
+        command: Callable[[], None] | None = None,
+        height: int = 38,
+    ) -> None:
+        super().__init__(
+            parent,
+            height=height,
+            bg=colors["surface"],
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+        self.lower_var = lower_var
+        self.upper_var = upper_var
+        self.colors = colors
+        self.minimum = float(minimum)
+        self.maximum = float(maximum)
+        self.step = float(step)
+        self.command = command
+        self.active_thumb: str | None = None
+        self.bind("<Configure>", lambda _event: self._draw())
+        self.bind("<Button-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self._lower_trace = self.lower_var.trace_add("write", lambda *_args: self._draw())
+        self._upper_trace = self.upper_var.trace_add("write", lambda *_args: self._draw())
+        self.bind("<Destroy>", self._on_destroy)
+        self._draw()
+
+    def _on_destroy(self, event: tk.Event) -> None:
+        if event.widget is not self:
+            return
+        for variable, trace_name in ((self.lower_var, self._lower_trace), (self.upper_var, self._upper_trace)):
+            try:
+                variable.trace_remove("write", trace_name)
+            except tk.TclError:
+                pass
+
+    def _track_bounds(self) -> tuple[float, float]:
+        return 16.0, max(float(self.winfo_width()) - 16.0, 16.0)
+
+    def _values(self) -> tuple[float, float]:
+        try:
+            lower = float(self.lower_var.get())
+        except ValueError:
+            lower = self.minimum
+        try:
+            upper = float(self.upper_var.get())
+        except ValueError:
+            upper = self.maximum
+        lower = max(self.minimum, min(self.maximum, lower))
+        upper = max(self.minimum, min(self.maximum, upper))
+        if lower > upper:
+            lower, upper = upper, lower
+        return lower, upper
+
+    def _value_to_x(self, value: float) -> float:
+        x0, x1 = self._track_bounds()
+        span = max(self.maximum - self.minimum, 1e-9)
+        return x0 + (float(value) - self.minimum) / span * (x1 - x0)
+
+    def _x_to_value(self, x: float) -> float:
+        x0, x1 = self._track_bounds()
+        ratio = (min(max(float(x), x0), x1) - x0) / max(x1 - x0, 1e-9)
+        raw = self.minimum + ratio * (self.maximum - self.minimum)
+        snapped = round(raw / self.step) * self.step
+        return max(self.minimum, min(self.maximum, snapped))
+
+    def _on_press(self, event: tk.Event) -> str:
+        lower, upper = self._values()
+        lower_x = self._value_to_x(lower)
+        upper_x = self._value_to_x(upper)
+        self.active_thumb = "lower" if abs(event.x - lower_x) <= abs(event.x - upper_x) else "upper"
+        self._set_active_value(event.x)
+        return "break"
+
+    def _on_drag(self, event: tk.Event) -> str:
+        self._set_active_value(event.x)
+        return "break"
+
+    def _on_release(self, _event: tk.Event) -> str:
+        self.active_thumb = None
+        return "break"
+
+    def _set_active_value(self, x: float) -> None:
+        lower, upper = self._values()
+        value = self._x_to_value(x)
+        if self.active_thumb == "lower":
+            lower = min(value, upper)
+        else:
+            upper = max(value, lower)
+        self.lower_var.set(f"{lower:.6g}")
+        self.upper_var.set(f"{upper:.6g}")
+        if self.command is not None:
+            self.command()
+        self._draw()
+
+    def _draw(self) -> None:
+        try:
+            self.delete("all")
+        except tk.TclError:
+            return
+        width = max(self.winfo_width(), 1)
+        height = max(self.winfo_height(), 1)
+        x0, x1 = self._track_bounds()
+        y = height / 2.0
+        lower, upper = self._values()
+        lower_x = self._value_to_x(lower)
+        upper_x = self._value_to_x(upper)
+        self.create_line(x0, y, x1, y, fill="#223042", width=9, capstyle=tk.ROUND)
+        self.create_line(lower_x, y, upper_x, y, fill="#f97316", width=9, capstyle=tk.ROUND)
+        for value in (-20, -10, 0, 10, 20):
+            x = self._value_to_x(value)
+            self.create_line(x, y + 9, x, y + 13, fill=self.colors["muted"], width=1)
+            self.create_text(x, y + 20, text=str(value), fill=self.colors["muted"], font=("Segoe UI", 7), anchor="n")
+        for x, label, active in ((lower_x, f"{lower:g}", self.active_thumb == "lower"), (upper_x, f"{upper:g}", self.active_thumb == "upper")):
+            radius = 8 if active else 7
+            self.create_oval(x - radius, y - radius, x + radius, y + radius, fill="#fff7ed", outline="#fdba74", width=2)
+            self.create_text(x, y - 13, text=label, fill="#fed7aa", font=("Segoe UI Semibold", 8), anchor="s")
+
+
 class AutoTestPanel:
     def __init__(
         self,
@@ -418,10 +849,11 @@ class AutoTestPanel:
         get_microscope_preview: Callable[[], bytes | None] | None,
         fov_width_var: tk.StringVar,
         fov_height_var: tk.StringVar,
-        start_run: Callable[[AutoTestSettings], None],
+        start_run: Callable[[AutoTestSettings, tuple[AutoTestPoint, ...] | None], None],
         stop_run: Callable[[], None],
         set_status: Callable[[str], None] | None = None,
         on_overlay_changed: Callable[[list[MatrixOverlay]], None] | None = None,
+        on_probe_assist_changed: Callable[[], None] | None = None,
     ) -> None:
         self.colors = colors
         self.get_stage_position_um = get_stage_position_um
@@ -435,14 +867,21 @@ class AutoTestPanel:
         self.stop_run = stop_run
         self.set_app_status = set_status
         self.on_overlay_changed = on_overlay_changed
+        self.on_probe_assist_changed = on_probe_assist_changed
         self.model: GDSLayoutModel | None = None
         self.pending_pick: str | None = None
         self.selected_gds: tuple[float, float] | None = None
         self.microscope_photo: tk.PhotoImage | None = None
+        self.microscope_payload_id: int | None = None
         self.status_poll_job: str | None = None
+        self.microscope_poll_job: str | None = None
+        self.preview_redraw_job: str | None = None
+        self._preview_cache_key: tuple[object, ...] | None = None
+        self._preview_cache_points: tuple[AutoTestPoint, ...] | None = None
         self.point_overlay_states: dict[tuple[int, int], str] = {}
         self.last_overlay_items: list[MatrixOverlay] = []
         self.running = False
+        self.custom_point_specs: tuple[AutoTestPointSpec, ...] | None = None
 
         self.origin_u_var = tk.StringVar(value="")
         self.origin_v_var = tk.StringVar(value="")
@@ -453,10 +892,19 @@ class AutoTestPanel:
         self.rows_var = tk.StringVar(value="3")
         self.cols_var = tk.StringVar(value="3")
         self.z_down_margin_var = tk.StringVar(value="100")
-        self.z_up_fast_percent_var = tk.DoubleVar(value=80.0)
-        self.z_up_fast_percent_text_var = tk.StringVar(value="Fast 80% / slow 20%")
-        self.z_fast_speed_percent_var = tk.StringVar(value="80")
-        self.z_slow_speed_percent_var = tk.StringVar(value="20")
+        self.z_up_fast_percent_var = tk.DoubleVar(value=50.0)
+        self.z_up_fast_percent_text_var = tk.StringVar(value="Fast 50% / slow 50%")
+        self.z_fast_speed_percent_var = tk.StringVar(value="50")
+        self.z_slow_speed_percent_var = tk.StringVar(value="2")
+        self.z_wobble_um_var = tk.StringVar(value="0")
+        self.z_wobble_cycles_var = tk.StringVar(value="0")
+        self.z_offset_um_var = tk.StringVar(value="0")
+        self.approach_expanded_var = tk.BooleanVar(value=True)
+        self.approach_toggle_button: ttk.Button | None = None
+        self.approach_content_frame: ttk.Frame | None = None
+        self.z_split_expanded_var = tk.BooleanVar(value=False)
+        self.z_split_button: ttk.Button | None = None
+        self.z_split_content_frame: ttk.Frame | None = None
         self.name_pattern_var = tk.StringVar(value="Dev{i}{j}")
         self.measure_pause_var = tk.BooleanVar(value=False)
         self.measure_photo_var = tk.BooleanVar(value=False)
@@ -473,9 +921,16 @@ class AutoTestPanel:
         self.selection_var = tk.StringVar(value="Selected: -")
         self.current_stage_var = tk.StringVar(value="Current stage: -")
         self.current_gds_var = tk.StringVar(value="Current GDS: -")
+        self.viewport_var = tk.StringVar(value="Viewport: -")
+        self.probe_assist_enabled_var = tk.BooleanVar(value=False)
+        self.probe_assist_vars: dict[str, dict[str, tk.StringVar]] = {
+            name: {"du": tk.StringVar(value="0"), "dv": tk.StringVar(value="0")}
+            for name, _color, _style in PROBE_ASSIST_PROBES
+        }
         self.focusmap_status_var = tk.StringVar(value="FocusMap: checking")
         self.layoutmap_status_var = tk.StringVar(value="LayoutMap: checking")
         self.summary_var = tk.StringVar(value="Preview: set Origin, U/V vectors, rows and columns.")
+        self.point_source_var = tk.StringVar(value="Point source: Base array")
         self.measurement_var = tk.StringVar(value="Measurement flow: not configured")
         self.status_var = tk.StringVar(value="Idle")
 
@@ -485,6 +940,7 @@ class AutoTestPanel:
         self.frame.rowconfigure(0, weight=1)
         self._build_ui()
         self._schedule_status_poll()
+        self._schedule_microscope_preview_poll()
 
     def _build_ui(self) -> None:
         pane = ttk.PanedWindow(self.frame, orient=tk.HORIZONTAL)
@@ -555,12 +1011,13 @@ class AutoTestPanel:
         stage.columnconfigure(0, weight=1)
         self.stage_value_labels = self._build_stage_layout_grid(stage)
 
-        selection = ttk.LabelFrame(parent, text="GDS Pick", padding=8)
-        selection.grid(row=3, column=0, sticky="ew", pady=(10, 0))
-        selection.columnconfigure(0, weight=1)
-        ttk.Label(selection, textvariable=self.cursor_var, style="Value.TLabel", padding=6, wraplength=180).grid(row=0, column=0, sticky="ew")
-        ttk.Label(selection, textvariable=self.selection_var, style="Value.TLabel", padding=6, wraplength=180).grid(row=1, column=0, sticky="ew", pady=(5, 0))
-        ttk.Button(selection, text="Fit to View", command=lambda: self.viewer.fit_to_view()).grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self._build_probe_assist_panel(parent, row=3)
+
+        viewport = ttk.LabelFrame(parent, text="GDS Viewport", padding=8)
+        viewport.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        viewport.columnconfigure(0, weight=1)
+        ttk.Label(viewport, textvariable=self.viewport_var, style="Value.TLabel", padding=6, wraplength=180).grid(row=0, column=0, sticky="ew")
+        ttk.Button(viewport, text="Fit to View", command=lambda: self.viewer.fit_to_view()).grid(row=1, column=0, sticky="ew", pady=(6, 0))
 
     def _build_controls(self, parent: ttk.Frame) -> None:
         row = 0
@@ -573,51 +1030,78 @@ class AutoTestPanel:
     def _build_stage_layout_grid(self, parent: tk.Widget) -> dict[str, tk.Label]:
         frame = ttk.Frame(parent, style="Panel.TFrame")
         frame.grid(row=0, column=0, sticky="ew")
-        frame.columnconfigure(0, weight=1)
+        for column in range(5):
+            frame.columnconfigure(column, weight=1, uniform="autotest_stage_compact")
         labels: dict[str, tk.Label] = {}
-        rows = (
-            ("Stage XY", (("stage_x", "X"), ("stage_y", "Y"))),
-            ("Layout UV", (("gds_u", "U"), ("gds_v", "V"))),
+        fields = (
+            ("stage_x", "X"),
+            ("stage_y", "Y"),
+            ("stage_z", "Z"),
+            ("gds_u", "U"),
+            ("gds_v", "V"),
         )
-        for row_index, (title, fields) in enumerate(rows):
-            ttk.Label(frame, text=title, style="Muted.TLabel").grid(row=row_index * 2, column=0, sticky="w", pady=(0 if row_index == 0 else 7, 3))
-            row_frame = ttk.Frame(frame, style="Panel.TFrame")
-            row_frame.grid(row=row_index * 2 + 1, column=0, sticky="ew")
-            for column in range(len(fields)):
-                row_frame.columnconfigure(column, weight=1, uniform=f"autotest_stage_{row_index}")
-            for column_index, (key, label_text) in enumerate(fields):
-                tile = tk.Frame(
-                    row_frame,
-                    bg=self.colors["surface_2"],
-                    highlightthickness=1,
-                    highlightbackground=self.colors["border"],
-                    bd=0,
-                )
-                tile.grid(row=0, column=column_index, sticky="ew", padx=(0, 6 if column_index < len(fields) - 1 else 0))
-                tile.columnconfigure(0, weight=1)
-                tk.Label(
-                    tile,
-                    text=label_text,
-                    anchor="w",
-                    padx=9,
-                    pady=1,
-                    bg=self.colors["surface_2"],
-                    fg=self.colors["muted"],
-                    font=("Segoe UI", 8),
-                ).grid(row=0, column=0, sticky="ew", pady=(3, 0))
-                value = tk.Label(
-                    tile,
-                    text="-",
-                    anchor="e",
-                    padx=9,
-                    pady=1,
-                    bg=self.colors["surface_2"],
-                    fg=self.colors["accent"],
-                    font=("Cascadia Mono", 13, "bold"),
-                )
-                value.grid(row=1, column=0, sticky="ew", pady=(0, 4))
-                labels[key] = value
+        for column_index, (key, label_text) in enumerate(fields):
+            tile = tk.Frame(
+                frame,
+                bg=self.colors["surface_2"],
+                highlightthickness=1,
+                highlightbackground=self.colors["border"],
+                bd=0,
+            )
+            tile.grid(row=0, column=column_index, sticky="ew", padx=(0, 4 if column_index < len(fields) - 1 else 0))
+            tile.columnconfigure(0, weight=1)
+            tk.Label(
+                tile,
+                text=label_text,
+                anchor="w",
+                padx=6,
+                pady=0,
+                bg=self.colors["surface_2"],
+                fg=self.colors["muted"],
+                font=("Segoe UI", 7),
+            ).grid(row=0, column=0, sticky="ew", pady=(2, 0))
+            value = tk.Label(
+                tile,
+                text="-",
+                anchor="e",
+                padx=6,
+                pady=0,
+                bg=self.colors["surface_2"],
+                fg=self.colors["accent"],
+                font=("Cascadia Mono", 9, "bold"),
+            )
+            value.grid(row=1, column=0, sticky="ew", pady=(0, 3))
+            labels[key] = value
         return labels
+
+    def _build_probe_assist_panel(self, parent: ttk.Frame, *, row: int) -> None:
+        assist = ttk.LabelFrame(parent, text="Probe Assist", padding=8)
+        assist.grid(row=row, column=0, sticky="ew", pady=(10, 0))
+        assist.columnconfigure(1, weight=1)
+        assist.columnconfigure(2, weight=1)
+        header = ttk.Frame(assist, style="Panel.TFrame")
+        header.grid(row=0, column=0, columnspan=3, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="Show configured probes", style="Panel.TLabel").grid(row=0, column=0, sticky="w")
+        ToggleSwitch(header, self.probe_assist_enabled_var, self.colors, command=self._on_probe_assist_setting_changed).grid(row=0, column=1, sticky="e")
+
+        ttk.Label(assist, text="Probe", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 2), padx=(0, 6))
+        ttk.Label(assist, text="dU", style="Muted.TLabel").grid(row=1, column=1, sticky="w", pady=(8, 2), padx=(0, 6))
+        ttk.Label(assist, text="dV", style="Muted.TLabel").grid(row=1, column=2, sticky="w", pady=(8, 2))
+        for row_index, (name, color, _style) in enumerate(PROBE_ASSIST_PROBES, start=2):
+            label = tk.Label(
+                assist,
+                text=name,
+                bg=self.colors["surface"],
+                fg=color,
+                anchor="w",
+                font=("Segoe UI Semibold", 8),
+            )
+            label.grid(row=row_index, column=0, sticky="ew", padx=(0, 6), pady=(3, 0))
+            ttk.Entry(assist, textvariable=self.probe_assist_vars[name]["du"], width=7).grid(row=row_index, column=1, sticky="ew", padx=(0, 6), pady=(3, 0))
+            ttk.Entry(assist, textvariable=self.probe_assist_vars[name]["dv"], width=7).grid(row=row_index, column=2, sticky="ew", pady=(3, 0))
+            self.probe_assist_vars[name]["du"].trace_add("write", lambda *_args: self._on_probe_assist_setting_changed())
+            self.probe_assist_vars[name]["dv"].trace_add("write", lambda *_args: self._on_probe_assist_setting_changed())
 
     def _set_stage_metric(self, key: str, value: str, *, available: bool = True) -> None:
         label = getattr(self, "stage_value_labels", {}).get(key)
@@ -651,35 +1135,94 @@ class AutoTestPanel:
                 ttk.Label(section, text="-", style="Muted.TLabel").grid(row=index, column=4, sticky="ew", pady=(6, 0))
             else:
                 ttk.Spinbox(section, from_=1, to=500, increment=1, textvariable=count_var, width=7).grid(row=index, column=4, sticky="ew", pady=(6, 0))
-        ttk.Button(section, text="Previous Point", command=self.previous_point).grid(row=4, column=0, columnspan=5, sticky="ew", pady=(10, 0))
+        actions = ttk.Frame(section, style="Panel.TFrame")
+        actions.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(10, 0))
+        actions.columnconfigure((0, 1, 2), weight=1, uniform="autotest_point_actions")
+        ttk.Button(actions, text="Previous Points", command=self.previous_point).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(actions, text="Import List", command=self.import_point_list).grid(row=0, column=1, sticky="ew", padx=(4, 4))
+        ttk.Button(actions, text="Generate List", command=self.open_generate_list_dialog).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        ttk.Label(section, textvariable=self.point_source_var, style="Muted.TLabel").grid(row=5, column=0, columnspan=5, sticky="ew", pady=(6, 0))
         return row + 1
 
     def _build_approach_section(self, parent: ttk.Frame, row: int) -> int:
         section = self._section(parent, "Device Separate and Approach", row)
-        section.columnconfigure((1, 2, 3), weight=1, uniform="autotest_approach")
-        ttk.Label(section, text="Name pattern", style="Muted.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
-        ttk.Entry(section, textvariable=self.name_pattern_var, width=14).grid(row=1, column=0, columnspan=4, sticky="ew", pady=(3, 0))
+        section.columnconfigure(0, weight=1)
+        self.approach_toggle_button = ttk.Button(section, text="Collapse", command=self._toggle_approach_section)
+        self.approach_toggle_button.grid(row=0, column=0, sticky="ew")
+        self.approach_content_frame = ttk.Frame(section, style="Panel.TFrame")
+        self.approach_content_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        content = self.approach_content_frame
+        content.columnconfigure((0, 1, 2), weight=1, uniform="autotest_approach")
 
-        ttk.Label(section, text="Z down (um)", style="Muted.TLabel").grid(row=2, column=0, sticky="w", pady=(8, 2), padx=(0, 6))
-        ttk.Label(section, text="Fast speed", style="Muted.TLabel").grid(row=2, column=1, columnspan=2, sticky="w", pady=(8, 2), padx=(0, 6))
-        ttk.Label(section, text="Slow speed", style="Muted.TLabel").grid(row=2, column=3, sticky="w", pady=(8, 2), padx=(0, 6))
-        ttk.Entry(section, textvariable=self.z_down_margin_var, width=9).grid(row=3, column=0, sticky="ew", padx=(0, 6))
-        fast_frame = ttk.Frame(section, style="Panel.TFrame")
-        fast_frame.grid(row=3, column=1, columnspan=2, sticky="ew", padx=(0, 8))
+        ttk.Label(content, text="Name pattern", style="Muted.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Entry(content, textvariable=self.name_pattern_var, width=14).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(3, 0))
+
+        ttk.Label(content, text="Z down (um)", style="Muted.TLabel").grid(row=2, column=0, sticky="w", pady=(8, 2), padx=(0, 6))
+        ttk.Label(content, text="Fast speed", style="Muted.TLabel").grid(row=2, column=1, sticky="w", pady=(8, 2), padx=(0, 6))
+        ttk.Label(content, text="Slow speed", style="Muted.TLabel").grid(row=2, column=2, sticky="w", pady=(8, 2))
+        ttk.Entry(content, textvariable=self.z_down_margin_var, width=9).grid(row=3, column=0, sticky="ew", padx=(0, 6))
+        fast_frame = ttk.Frame(content, style="Panel.TFrame")
+        fast_frame.grid(row=3, column=1, sticky="ew", padx=(0, 6))
         fast_frame.columnconfigure(0, weight=1)
         ttk.Spinbox(fast_frame, from_=0, to=100, increment=1, textvariable=self.z_fast_speed_percent_var, width=7).grid(row=0, column=0, sticky="ew")
         ttk.Label(fast_frame, text="%", style="Muted.TLabel").grid(row=0, column=1, sticky="w", padx=(5, 0))
-        slow_frame = ttk.Frame(section, style="Panel.TFrame")
-        slow_frame.grid(row=3, column=3, sticky="ew")
+        slow_frame = ttk.Frame(content, style="Panel.TFrame")
+        slow_frame.grid(row=3, column=2, sticky="ew")
         slow_frame.columnconfigure(0, weight=1)
         ttk.Spinbox(slow_frame, from_=0, to=100, increment=1, textvariable=self.z_slow_speed_percent_var, width=7).grid(row=0, column=0, sticky="ew")
         ttk.Label(slow_frame, text="%", style="Muted.TLabel").grid(row=0, column=1, sticky="w", padx=(5, 0))
 
-        ttk.Label(section, text="Z up split", style="Muted.TLabel").grid(row=4, column=0, columnspan=4, sticky="w", pady=(8, 2))
-        RoundedSplitSlider(section, self.z_up_fast_percent_var, self.colors, command=self._on_z_up_split_changed).grid(row=5, column=0, columnspan=4, sticky="ew")
-        ttk.Label(section, textvariable=self.z_up_fast_percent_text_var, style="Value.TLabel", padding=6).grid(row=6, column=0, columnspan=4, sticky="ew", pady=(5, 0))
-        ttk.Button(section, text="Preview Points", command=self.redraw_preview).grid(row=7, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        ttk.Label(content, text="Wobb (um)", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=(8, 2), padx=(0, 6))
+        ttk.Label(content, text="Cycle", style="Muted.TLabel").grid(row=4, column=1, sticky="w", pady=(8, 2), padx=(0, 6))
+        ttk.Label(content, text="Offset (um)", style="Muted.TLabel").grid(row=4, column=2, sticky="w", pady=(8, 2))
+        ttk.Entry(content, textvariable=self.z_wobble_um_var, width=9).grid(row=5, column=0, sticky="ew", padx=(0, 6))
+        ttk.Spinbox(content, from_=0, to=1000, increment=1, textvariable=self.z_wobble_cycles_var, width=7).grid(row=5, column=1, sticky="ew", padx=(0, 6))
+        ttk.Entry(content, textvariable=self.z_offset_um_var, width=9).grid(row=5, column=2, sticky="ew")
+
+        self.z_split_button = ttk.Button(content, text="Z UP SPLIT >", command=self._toggle_z_split_section)
+        self.z_split_button.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        self.z_split_content_frame = ttk.Frame(content, style="Panel.TFrame")
+        self.z_split_content_frame.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        self.z_split_content_frame.columnconfigure(0, weight=1)
+        RoundedSplitSlider(self.z_split_content_frame, self.z_up_fast_percent_var, self.colors, command=self._on_z_up_split_changed).grid(row=0, column=0, sticky="ew")
+        ttk.Label(self.z_split_content_frame, textvariable=self.z_up_fast_percent_text_var, style="Value.TLabel", padding=6).grid(row=1, column=0, sticky="ew", pady=(5, 0))
+        self._update_z_split_section_visibility()
+
+        self.z_wobble_curve_canvas = tk.Canvas(content, height=92, bg="#05070a", highlightthickness=1, highlightbackground=self.colors["border"], bd=0)
+        self.z_wobble_curve_canvas.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        self.z_wobble_curve_canvas.bind("<Configure>", lambda _event: self._draw_z_wobble_curve())
+        ttk.Button(content, text="Preview Test Points", command=self.redraw_preview).grid(row=9, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        self._update_approach_section_visibility()
+        self._draw_z_wobble_curve()
         return row + 1
+
+    def _toggle_approach_section(self) -> None:
+        self.approach_expanded_var.set(not bool(self.approach_expanded_var.get()))
+        self._update_approach_section_visibility()
+
+    def _update_approach_section_visibility(self) -> None:
+        if self.approach_toggle_button is None or self.approach_content_frame is None:
+            return
+        expanded = bool(self.approach_expanded_var.get())
+        self.approach_toggle_button.configure(text="Collapse" if expanded else "Expand")
+        if expanded:
+            self.approach_content_frame.grid()
+        else:
+            self.approach_content_frame.grid_remove()
+
+    def _toggle_z_split_section(self) -> None:
+        self.z_split_expanded_var.set(not bool(self.z_split_expanded_var.get()))
+        self._update_z_split_section_visibility()
+
+    def _update_z_split_section_visibility(self) -> None:
+        if self.z_split_button is None or self.z_split_content_frame is None:
+            return
+        expanded = bool(self.z_split_expanded_var.get())
+        self.z_split_button.configure(text="Z UP SPLIT v" if expanded else "Z UP SPLIT >")
+        if expanded:
+            self.z_split_content_frame.grid()
+        else:
+            self.z_split_content_frame.grid_remove()
 
     def _build_measurement_section(self, parent: ttk.Frame, row: int) -> int:
         section = self._section(parent, "Measurement", row)
@@ -730,9 +1273,16 @@ class AutoTestPanel:
             self.z_down_margin_var,
             self.z_fast_speed_percent_var,
             self.z_slow_speed_percent_var,
+            self.z_wobble_um_var,
+            self.z_wobble_cycles_var,
+            self.z_offset_um_var,
             self.name_pattern_var,
         ):
-            variable.trace_add("write", lambda *_args: self.redraw_preview())
+            variable.trace_add("write", lambda *_args: self._on_preview_setting_changed())
+
+    def _on_preview_setting_changed(self) -> None:
+        self.redraw_preview()
+        self._draw_z_wobble_curve()
 
     def set_layout_context(
         self,
@@ -809,6 +1359,10 @@ class AutoTestPanel:
         self.status_var.set("Origin set from current mapped stage position.")
 
     def previous_point(self) -> None:
+        self.custom_point_specs = None
+        self._preview_cache_key = None
+        self._preview_cache_points = None
+        self.point_source_var.set("Point source: Base array")
         try:
             origin_u, origin_v = self._origin_from_ui()
             vi_u = float(self.u_vector_u_var.get())
@@ -819,6 +1373,212 @@ class AutoTestPanel:
         self.origin_u_var.set(f"{origin_u - vi_u:.12g}")
         self.origin_v_var.set(f"{origin_v - vi_v:.12g}")
         self.status_var.set("Origin shifted to previous vi point.")
+        self.redraw_preview()
+
+    def import_point_list(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Import AutoTest Point List",
+            filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+        )
+        if not path:
+            return
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            specs = autotest_point_specs_from_json_payload(payload)
+        except Exception as exc:
+            self.status_var.set(f"Import List failed: {exc}")
+            return
+        self._set_custom_point_specs(specs, f"Imported {len(specs)} point(s) from {Path(path).name}.")
+
+    def _set_custom_point_specs(self, specs: tuple[AutoTestPointSpec, ...], message: str) -> None:
+        self.custom_point_specs = tuple(specs)
+        self._preview_cache_key = None
+        self._preview_cache_points = None
+        self.point_source_var.set(f"Point source: {len(specs)} imported/generated point(s)")
+        self.status_var.set(message)
+        self.redraw_preview()
+
+    def open_generate_list_dialog(self) -> None:
+        existing = getattr(self, "_generate_list_dialog", None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            return
+        dialog = tk.Toplevel(self.frame)
+        dialog.title("Generate AutoTest Point List")
+        dialog.configure(bg=self.colors["bg"])
+        dialog.columnconfigure(0, weight=0)
+        dialog.columnconfigure(1, weight=1)
+        dialog.rowconfigure(0, weight=1)
+        self._generate_list_dialog = dialog
+
+        try:
+            origin_u_default, origin_v_default = self._origin_from_ui()
+        except ValueError:
+            origin_u_default, origin_v_default = 0.0, 0.0
+        variables = {
+            "origin_u": tk.StringVar(value=f"{origin_u_default:.12g}"),
+            "origin_v": tk.StringVar(value=f"{origin_v_default:.12g}"),
+            "inner_u_u": tk.StringVar(value=self.u_vector_u_var.get()),
+            "inner_u_v": tk.StringVar(value=self.u_vector_v_var.get()),
+            "inner_v_u": tk.StringVar(value=self.v_vector_u_var.get()),
+            "inner_v_v": tk.StringVar(value=self.v_vector_v_var.get()),
+            "inner_cols": tk.StringVar(value=self.cols_var.get()),
+            "inner_rows": tk.StringVar(value=self.rows_var.get()),
+            "outer_u_u": tk.StringVar(value="5000"),
+            "outer_u_v": tk.StringVar(value="0"),
+            "outer_v_u": tk.StringVar(value="0"),
+            "outer_v_v": tk.StringVar(value="5000"),
+            "outer_cols": tk.StringVar(value="2"),
+            "outer_rows": tk.StringVar(value="2"),
+            "name_pattern": tk.StringVar(value="Dev{bi}{bj}_{i}{j}"),
+        }
+        status_var = tk.StringVar(value="Configure nested arrays and preview point placement.")
+
+        form = ttk.Frame(dialog, style="Panel.TFrame", padding=12)
+        form.grid(row=0, column=0, sticky="nsew")
+        for column in range(4):
+            form.columnconfigure(column, weight=1 if column in (1, 3) else 0)
+
+        def add_pair(row_index: int, title: str, u_key: str, v_key: str) -> int:
+            ttk.Label(form, text=title, style="Muted.TLabel").grid(row=row_index, column=0, sticky="w", pady=(8 if row_index else 0, 2), padx=(0, 6))
+            ttk.Label(form, text="U", style="Muted.TLabel").grid(row=row_index, column=1, sticky="w", pady=(8 if row_index else 0, 2))
+            ttk.Label(form, text="V", style="Muted.TLabel").grid(row=row_index, column=3, sticky="w", pady=(8 if row_index else 0, 2))
+            ttk.Entry(form, textvariable=variables[u_key], width=9).grid(row=row_index + 1, column=1, sticky="ew", padx=(0, 8))
+            ttk.Entry(form, textvariable=variables[v_key], width=9).grid(row=row_index + 1, column=3, sticky="ew")
+            return row_index + 2
+
+        row_index = add_pair(0, "Origin", "origin_u", "origin_v")
+        row_index = add_pair(row_index, "Inner i", "inner_u_u", "inner_u_v")
+        row_index = add_pair(row_index, "Inner j", "inner_v_u", "inner_v_v")
+        ttk.Label(form, text="Inner cols / rows", style="Muted.TLabel").grid(row=row_index, column=0, sticky="w", pady=(8, 2), padx=(0, 6))
+        ttk.Entry(form, textvariable=variables["inner_cols"], width=7).grid(row=row_index, column=1, sticky="ew", pady=(8, 0), padx=(0, 8))
+        ttk.Entry(form, textvariable=variables["inner_rows"], width=7).grid(row=row_index, column=3, sticky="ew", pady=(8, 0))
+        row_index += 1
+        row_index = add_pair(row_index, "Outer i", "outer_u_u", "outer_u_v")
+        row_index = add_pair(row_index, "Outer j", "outer_v_u", "outer_v_v")
+        ttk.Label(form, text="Outer cols / rows", style="Muted.TLabel").grid(row=row_index, column=0, sticky="w", pady=(8, 2), padx=(0, 6))
+        ttk.Entry(form, textvariable=variables["outer_cols"], width=7).grid(row=row_index, column=1, sticky="ew", pady=(8, 0), padx=(0, 8))
+        ttk.Entry(form, textvariable=variables["outer_rows"], width=7).grid(row=row_index, column=3, sticky="ew", pady=(8, 0))
+        row_index += 1
+        ttk.Label(form, text="Name pattern", style="Muted.TLabel").grid(row=row_index, column=0, sticky="w", pady=(8, 2), padx=(0, 6))
+        ttk.Entry(form, textvariable=variables["name_pattern"], width=20).grid(row=row_index, column=1, columnspan=3, sticky="ew", pady=(8, 0))
+        row_index += 1
+
+        preview_frame = ttk.Frame(dialog, style="Panel.TFrame", padding=12)
+        preview_frame.grid(row=0, column=1, sticky="nsew")
+        preview_frame.columnconfigure(0, weight=1)
+        preview_frame.rowconfigure(0, weight=1)
+        preview_canvas = tk.Canvas(preview_frame, width=520, height=420, bg="#05070a", highlightthickness=1, highlightbackground=self.colors["border"])
+        preview_canvas.grid(row=0, column=0, sticky="nsew")
+        ttk.Label(preview_frame, textvariable=status_var, style="Muted.TLabel").grid(row=1, column=0, sticky="ew", pady=(8, 0))
+
+        def current_specs() -> tuple[AutoTestPointSpec, ...]:
+            return generate_nested_autotest_point_specs(
+                origin_u=float(variables["origin_u"].get()),
+                origin_v=float(variables["origin_v"].get()),
+                inner_u_vector_u=float(variables["inner_u_u"].get()),
+                inner_u_vector_v=float(variables["inner_u_v"].get()),
+                inner_v_vector_u=float(variables["inner_v_u"].get()),
+                inner_v_vector_v=float(variables["inner_v_v"].get()),
+                inner_cols=int(float(variables["inner_cols"].get())),
+                inner_rows=int(float(variables["inner_rows"].get())),
+                outer_u_vector_u=float(variables["outer_u_u"].get()),
+                outer_u_vector_v=float(variables["outer_u_v"].get()),
+                outer_v_vector_u=float(variables["outer_v_u"].get()),
+                outer_v_vector_v=float(variables["outer_v_v"].get()),
+                outer_cols=int(float(variables["outer_cols"].get())),
+                outer_rows=int(float(variables["outer_rows"].get())),
+                name_pattern=variables["name_pattern"].get(),
+            )
+
+        def generator_params() -> dict[str, object]:
+            return {key: variable.get() for key, variable in variables.items()}
+
+        def draw_preview(*_args: object) -> None:
+            preview_canvas.delete("all")
+            try:
+                specs = current_specs()
+            except Exception as exc:
+                status_var.set(f"Preview unavailable: {exc}")
+                return
+            width = max(preview_canvas.winfo_width(), 1)
+            height = max(preview_canvas.winfo_height(), 1)
+            min_u = min(spec.u for spec in specs)
+            max_u = max(spec.u for spec in specs)
+            min_v = min(spec.v for spec in specs)
+            max_v = max(spec.v for spec in specs)
+            span_u = max(max_u - min_u, 1e-9)
+            span_v = max(max_v - min_v, 1e-9)
+            scale = min((width - 48) / span_u, (height - 48) / span_v)
+            center_u = (min_u + max_u) / 2.0
+            center_v = (min_v + max_v) / 2.0
+            for spec in specs:
+                x = width / 2.0 + (spec.u - center_u) * scale
+                y = height / 2.0 - (spec.v - center_v) * scale
+                preview_canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill="#38bdf8", outline="#bae6fd")
+            status_var.set(f"Preview: {len(specs)} point(s). Tokens: {{bi}}, {{bj}}, {{i}}, {{j}}, {{n}}.")
+
+        def save_json() -> None:
+            try:
+                specs = current_specs()
+            except Exception as exc:
+                status_var.set(f"Save failed: {exc}")
+                return
+            path = filedialog.asksaveasfilename(
+                title="Save AutoTest Point List JSON",
+                defaultextension=".json",
+                filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+            )
+            if not path:
+                return
+            payload = autotest_point_specs_payload(specs, source="nested_generator", generator=generator_params())
+            Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            status_var.set(f"Saved {Path(path).name}.")
+
+        def save_list() -> None:
+            try:
+                specs = current_specs()
+            except Exception as exc:
+                status_var.set(f"Save failed: {exc}")
+                return
+            path = filedialog.asksaveasfilename(
+                title="Save AutoTest Point List",
+                defaultextension=".list",
+                filetypes=(("List files", "*.list"), ("All files", "*.*")),
+            )
+            if not path:
+                return
+            lines = ["name,u,v,row,col"]
+            lines.extend(f"{spec.name},{spec.u:.12g},{spec.v:.12g},{spec.row},{spec.col}" for spec in specs)
+            Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+            status_var.set(f"Saved {Path(path).name}.")
+
+        def direct_import() -> None:
+            try:
+                specs = current_specs()
+            except Exception as exc:
+                status_var.set(f"Import failed: {exc}")
+                return
+            autosave_dir = Path.cwd() / "autotest_session"
+            autosave_dir.mkdir(parents=True, exist_ok=True)
+            autosave_path = autosave_dir / "last_generated_point_list.json"
+            autosave_payload = autotest_point_specs_payload(specs, source="nested_generator", generator=generator_params())
+            autosave_path.write_text(json.dumps(autosave_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            self._set_custom_point_specs(specs, f"Generated and imported {len(specs)} AutoTest point(s); saved {autosave_path.name}.")
+            dialog.destroy()
+
+        footer = ttk.Frame(form, style="Panel.TFrame")
+        footer.grid(row=row_index, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        footer.columnconfigure((0, 1, 2), weight=1, uniform="generate_list_actions")
+        ttk.Button(footer, text="Save JSON", command=save_json).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(footer, text="Save List", command=save_list).grid(row=0, column=1, sticky="ew", padx=(4, 4))
+        ttk.Button(footer, text="Direct Import", style="Accent.TButton", command=direct_import).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+
+        for variable in variables.values():
+            variable.trace_add("write", draw_preview)
+        preview_canvas.bind("<Configure>", draw_preview)
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        draw_preview()
 
     def _origin_from_ui(self) -> tuple[float, float]:
         try:
@@ -844,6 +1604,9 @@ class AutoTestPanel:
                 z_fast_speed_percent=int(float(self.z_fast_speed_percent_var.get())),
                 z_slow_speed_percent=int(float(self.z_slow_speed_percent_var.get())),
                 name_pattern=self.name_pattern_var.get(),
+                z_wobble_um=float(self.z_wobble_um_var.get()),
+                z_wobble_cycles=int(float(self.z_wobble_cycles_var.get())),
+                z_offset_um=float(self.z_offset_um_var.get()),
                 measurement_steps=self.measurement_steps(),
                 measurement_flow=self.measurement_flow(),
             ).normalized()
@@ -860,7 +1623,7 @@ class AutoTestPanel:
             return
         try:
             settings = self.settings_from_ui()
-            points = generate_autotest_points(settings, mapper)
+            points = self._points_for_settings(settings, mapper)
         except Exception as exc:
             self._set_overlays([])
             self.summary_var.set(f"Preview unavailable: {exc}")
@@ -871,24 +1634,57 @@ class AutoTestPanel:
         ]
         self._set_overlays(overlays)
         last = points[-1]
+        source = "custom list" if self.custom_point_specs is not None else f"{settings.rows} x {settings.cols}"
         self.summary_var.set(
-            f"Preview: {settings.rows} x {settings.cols} = {len(points)} test point(s). "
-            f"Last {last.name} UV {last.u:.6g}, {last.v:.6g}; Z down {settings.z_down_margin_um:.6g} um."
+            f"Preview: {source} = {len(points)} test point(s). "
+            f"Last {last.name} UV {last.u:.6g}, {last.v:.6g}; "
+            f"Z down {settings.z_down_margin_um:.6g} um, Wobb {settings.z_wobble_um:.6g} um x {settings.z_wobble_cycles}, Offset {settings.z_offset_um:.6g} um."
         )
+
+    def _points_for_settings(self, settings: AutoTestSettings, mapper: AffineCoordinateMapper) -> tuple[AutoTestPoint, ...]:
+        key = (
+            id(mapper),
+            settings.origin_u,
+            settings.origin_v,
+            settings.u_vector_u,
+            settings.u_vector_v,
+            settings.v_vector_u,
+            settings.v_vector_v,
+            settings.rows,
+            settings.cols,
+            settings.fov_width_um,
+            settings.fov_height_um,
+            settings.name_pattern,
+            self.custom_point_specs,
+        )
+        if self._preview_cache_key == key and self._preview_cache_points is not None:
+            return self._preview_cache_points
+        if self.custom_point_specs is not None:
+            points = generate_autotest_points_from_specs(self.custom_point_specs, settings, mapper)
+        else:
+            points = generate_autotest_points(settings, mapper)
+        self._preview_cache_key = key
+        self._preview_cache_points = points
+        return points
 
     def _start_run(self) -> None:
         if not self._prerequisites_ready():
             self.status_var.set("AutoTest requires both FocusMap and LayoutMap.")
             self._update_prerequisite_status()
             return
+        mapper = self.get_mapper()
+        if mapper is None:
+            self.status_var.set("Bind LayoutMap mapping before running AutoTest.")
+            return
         try:
             settings = self.settings_from_ui()
+            points = self._points_for_settings(settings, mapper)
         except Exception as exc:
             self.status_var.set(str(exc))
             return
-        self.point_overlay_states = {(row, col): "pending" for row in range(settings.rows) for col in range(settings.cols)}
+        self.point_overlay_states = {(point.row, point.col): "pending" for point in points}
         self.redraw_preview()
-        self.start_run(settings)
+        self.start_run(settings, points)
 
     def set_running(self, running: bool) -> None:
         self.running = running
@@ -899,7 +1695,7 @@ class AutoTestPanel:
         self.status_var.set(f"{message} ({current}/{total})")
         if row is not None and col is not None and state is not None:
             self.point_overlay_states[(row, col)] = state
-            self.redraw_preview()
+            self._schedule_preview_redraw()
 
     def set_status(self, message: str) -> None:
         self.status_var.set(message)
@@ -916,10 +1712,28 @@ class AutoTestPanel:
         try:
             self._update_prerequisite_status()
             self._update_status_panel()
-            self._update_microscope_preview()
             self.status_poll_job = self.frame.after(300, self._schedule_status_poll)
         except tk.TclError:
             return
+
+    def _schedule_microscope_preview_poll(self) -> None:
+        try:
+            self._update_microscope_preview()
+            self.microscope_poll_job = self.frame.after(AUTOTEST_PREVIEW_INTERVAL_MS, self._schedule_microscope_preview_poll)
+        except tk.TclError:
+            return
+
+    def _schedule_preview_redraw(self) -> None:
+        if self.preview_redraw_job is not None:
+            return
+        try:
+            self.preview_redraw_job = self.frame.after(AUTOTEST_OVERLAY_REDRAW_INTERVAL_MS, self._run_scheduled_preview_redraw)
+        except tk.TclError:
+            self.preview_redraw_job = None
+
+    def _run_scheduled_preview_redraw(self) -> None:
+        self.preview_redraw_job = None
+        self.redraw_preview()
 
     def _prerequisites_ready(self) -> bool:
         return self.get_focusmap_ready() and self.get_layoutmap_ready()
@@ -967,27 +1781,153 @@ class AutoTestPanel:
         self._update_z_up_split_text()
         self.redraw_preview()
 
+    def _draw_z_wobble_curve(self) -> None:
+        canvas = getattr(self, "z_wobble_curve_canvas", None)
+        if canvas is None:
+            return
+        try:
+            canvas.delete("all")
+            width = max(canvas.winfo_width(), 1)
+            height = max(canvas.winfo_height(), 1)
+            canvas.create_rectangle(0, 0, width, height, fill="#05070a", outline="")
+            wobble_um = float(self.z_wobble_um_var.get() or 0)
+            cycles = int(float(self.z_wobble_cycles_var.get() or 0))
+            offset_um = float(self.z_offset_um_var.get() or 0)
+            offsets = list(contact_wobble_offsets_um(wobble_um, cycles, offset_um))
+        except Exception:
+            try:
+                canvas.create_text(10, 12, text="Wobb curve unavailable", anchor="nw", fill=self.colors["muted"], font=("Segoe UI", 8), tags="wobb_curve")
+            except tk.TclError:
+                pass
+            return
+        if not offsets:
+            offsets = [0.0]
+        values = [0.0, *offsets]
+        max_abs = max(1e-9, max(abs(value) for value in values))
+        left = 28
+        right = width - 12
+        top = 14
+        bottom = height - 20
+        zero_y = (top + bottom) / 2.0
+        canvas.create_line(left, zero_y, right, zero_y, fill="#334155", width=1, dash=(3, 4))
+        canvas.create_text(left, 5, text="contact wobb time-Z", anchor="nw", fill=self.colors["muted"], font=("Segoe UI", 8))
+        points = []
+        denominator = max(len(values) - 1, 1)
+        for index, value in enumerate(values):
+            x = left + (right - left) * index / denominator
+            y = zero_y - (float(value) / max_abs) * (bottom - top) / 2.0
+            points.append((x, y))
+        if len(points) >= 2:
+            coords: list[float] = []
+            for x, y in points:
+                coords.extend((x, y))
+            canvas.create_line(coords, fill="#38bdf8", width=2)
+        for x, y in points:
+            canvas.create_oval(x - 2.5, y - 2.5, x + 2.5, y + 2.5, fill="#f8fafc", outline="#38bdf8")
+        canvas.create_text(left, bottom + 2, text=f"{min(values):.3g}..{max(values):.3g} um", anchor="sw", fill=self.colors["muted"], font=("Segoe UI", 8))
+
     def _update_status_panel(self) -> None:
         try:
             x_um, y_um, z_um = self._stage_position_xyz_um()
             self.current_stage_var.set(f"Current XYZ: {x_um:.6g}, {y_um:.6g}, {z_um:.6g} um")
             self._set_stage_metric("stage_x", f"{x_um:.3f}")
             self._set_stage_metric("stage_y", f"{y_um:.3f}")
+            self._set_stage_metric("stage_z", f"{z_um:.3f}")
+            if hasattr(self, "viewer"):
+                self.viewport_var.set(self.viewer.viewport_status_text())
             mapper = self.get_mapper()
             if mapper is None:
                 self.current_gds_var.set("Current GDS: bind LayoutMap first")
                 self._set_stage_metric("gds_u", "-", available=False)
                 self._set_stage_metric("gds_v", "-", available=False)
+                self.viewer.set_stage_overlay(None, None)
+                self.viewer.set_auxiliary_points([])
             else:
                 u, v = mapper.stage_to_gds(x_um, y_um)
                 self.current_gds_var.set(f"Current GDS u, v: {u:.6g}, {v:.6g}")
                 self._set_stage_metric("gds_u", f"{u:.3f}")
                 self._set_stage_metric("gds_v", f"{v:.3f}")
+                self._update_current_stage_overlay(mapper, x_um, y_um)
         except Exception as exc:
             self.current_stage_var.set(f"Current stage unavailable: {exc}")
             self.current_gds_var.set("Current GDS: -")
-            for key in ("stage_x", "stage_y", "gds_u", "gds_v"):
+            self.viewport_var.set("Viewport: -")
+            for key in ("stage_x", "stage_y", "stage_z", "gds_u", "gds_v"):
                 self._set_stage_metric(key, "-", available=False)
+            self.viewer.set_stage_overlay(None, None)
+            self.viewer.set_auxiliary_points([])
+
+    def _update_current_stage_overlay(self, mapper: AffineCoordinateMapper, x_um: float, y_um: float) -> None:
+        try:
+            width_um = float(self.fov_width_var.get())
+            height_um = float(self.fov_height_var.get())
+            if width_um <= 0 or height_um <= 0:
+                raise ValueError
+            center_gds = mapper.stage_to_gds(x_um, y_um)
+            corners_stage = [
+                (x_um - width_um / 2.0, y_um - height_um / 2.0),
+                (x_um + width_um / 2.0, y_um - height_um / 2.0),
+                (x_um + width_um / 2.0, y_um + height_um / 2.0),
+                (x_um - width_um / 2.0, y_um + height_um / 2.0),
+            ]
+            self.viewer.set_stage_overlay(center_gds, [mapper.stage_to_gds(x, y) for x, y in corners_stage])
+            self._update_auxiliary_points(center_gds)
+        except Exception:
+            self.viewer.set_stage_overlay(None, None)
+            self.viewer.set_auxiliary_points([])
+
+    def _on_probe_assist_setting_changed(self) -> None:
+        self._update_auxiliary_points()
+        if self.on_probe_assist_changed is not None:
+            self.on_probe_assist_changed()
+
+    def probe_assist_enabled(self) -> bool:
+        return bool(self.probe_assist_enabled_var.get())
+
+    def probe_assist_specs(self) -> tuple[dict[str, object], ...]:
+        specs: list[dict[str, object]] = []
+        for name, color, style in PROBE_ASSIST_PROBES:
+            variables = self.probe_assist_vars[name]
+            du = float(variables["du"].get() or 0.0)
+            dv = float(variables["dv"].get() or 0.0)
+            if not math.isfinite(du) or not math.isfinite(dv):
+                raise ValueError(f"{name} Probe dU/dV must be finite.")
+            specs.append({"label": name, "du": du, "dv": dv, "color": color, "style": style})
+        return tuple(specs)
+
+    def probe_assist_overlays_for_center(self, center_gds: tuple[float, float]) -> list[AuxiliaryPointOverlay]:
+        if not self.probe_assist_enabled():
+            return []
+        overlays: list[AuxiliaryPointOverlay] = []
+        for spec in self.probe_assist_specs():
+            du = float(spec["du"])
+            dv = float(spec["dv"])
+            overlays.append(
+                AuxiliaryPointOverlay(
+                    point=(float(center_gds[0]) + du, float(center_gds[1]) + dv),
+                    label=str(spec["label"]),
+                    style=str(spec["style"]),
+                    color=str(spec["color"]),
+                )
+            )
+        return overlays
+
+    def _update_auxiliary_points(self, center_gds: tuple[float, float] | None = None) -> None:
+        if not hasattr(self, "viewer") or not self.probe_assist_enabled():
+            if hasattr(self, "viewer"):
+                self.viewer.set_auxiliary_points([])
+            return
+        mapper = self.get_mapper()
+        if mapper is None:
+            self.viewer.set_auxiliary_points([])
+            return
+        try:
+            if center_gds is None:
+                x_um, y_um, _z_um = self._stage_position_xyz_um()
+                center_gds = mapper.stage_to_gds(x_um, y_um)
+            self.viewer.set_auxiliary_points(self.probe_assist_overlays_for_center(center_gds))
+        except Exception:
+            self.viewer.set_auxiliary_points([])
 
     def _update_microscope_preview(self) -> None:
         if self.get_microscope_preview is None:
@@ -999,6 +1939,10 @@ class AutoTestPanel:
         if not payload:
             return
         try:
+            payload_id = id(payload)
+            if payload_id == self.microscope_payload_id:
+                return
+            self.microscope_payload_id = payload_id
             self.microscope_photo = tk.PhotoImage(data=payload, format="PPM")
             self.microscope_label.configure(image=self.microscope_photo, text="")
         except tk.TclError:
@@ -1372,9 +2316,16 @@ class AutoTestPanel:
     def _flow_card_height_for_card(self, card: AutoTestFlowCard) -> int:
         if not card.expanded:
             return self._flow_card_height(False)
+        if card.type_id == "wobb_test":
+            return int((468 if self._wobb_card_mode_is_zxy(card) else 366) * self._flow_zoom)
         definition = autotest_flow_definitions_by_type()[card.type_id]
         rows = max(1, math.ceil(len(definition.parameters) / 2))
         return int((116 + rows * 38) * self._flow_zoom)
+
+    @staticmethod
+    def _wobb_card_mode_is_zxy(card: AutoTestFlowCard) -> bool:
+        value = str(card.params.get("mode", "Z")).strip().lower().replace("_", "-")
+        return value in {"z-xy", "zxy", "xy"}
 
     def _flow_card_gap(self) -> int:
         return int(18 * self._flow_zoom)
@@ -1665,6 +2616,9 @@ class AutoTestPanel:
         frame.bind("<Double-Button-1>", lambda _event, card_id=card.card_id: self._toggle_flow_card(card_id))
 
     def _build_flow_card_params(self, frame: tk.Frame, card: AutoTestFlowCard, definition: AutoTestFlowDefinition) -> None:
+        if card.type_id == "wobb_test":
+            self._build_wobb_test_flow_card_params(frame, card, definition)
+            return
         params = tk.Frame(frame, bg=self.colors["surface"], padx=10, pady=4)
         params.grid(row=2, column=1, columnspan=4, sticky="nsew")
         params.columnconfigure(1, weight=1)
@@ -1704,6 +2658,118 @@ class AutoTestPanel:
                 )
                 entry.grid(row=row, column=column + 1, sticky="ew", pady=3)
 
+    def _flow_card_param_var(self, card: AutoTestFlowCard, key: str, default: str) -> tk.StringVar:
+        var = self._flow_entry_vars.get((card.card_id, key))
+        if var is None:
+            var = tk.StringVar(value=card.params.get(key, default))
+            self._flow_entry_vars[(card.card_id, key)] = var
+            var.trace_add("write", lambda *_args, target=card, param_key=key, value_var=var: self._set_flow_card_param(target, param_key, value_var.get()))
+        return var
+
+    def _build_wobb_test_flow_card_params(self, frame: tk.Frame, card: AutoTestFlowCard, definition: AutoTestFlowDefinition) -> None:
+        defaults = {param.key: param.default for param in definition.parameters}
+        params = tk.Frame(frame, bg=self.colors["surface"], padx=10, pady=2)
+        params.grid(row=2, column=1, columnspan=4, sticky="nsew")
+        params.columnconfigure(0, weight=1)
+
+        def group(title: str, row: int) -> tk.LabelFrame:
+            section = tk.LabelFrame(
+                params,
+                text=title,
+                bg=self.colors["surface"],
+                fg=self.colors["muted"],
+                bd=0,
+                highlightthickness=1,
+                highlightbackground=self.colors["border"],
+                padx=8,
+                pady=5,
+                font=("Segoe UI Semibold", 8),
+            )
+            section.grid(row=row, column=0, sticky="ew", pady=(0, 7))
+            return section
+
+        def entry(parent: tk.Widget, key: str, row: int, column: int, *, width: int = 9, padx: tuple[int, int] = (0, 6)) -> tk.Entry:
+            var = self._flow_card_param_var(card, key, defaults.get(key, ""))
+            widget = tk.Entry(
+                parent,
+                textvariable=var,
+                bg=self.colors["input"],
+                fg=self.colors["text"],
+                insertbackground=self.colors["accent"],
+                relief="flat",
+                highlightthickness=1,
+                highlightbackground=self.colors["border"],
+                highlightcolor=self.colors["border_focus"],
+                font=("Cascadia Mono", 9),
+                width=width,
+            )
+            widget.grid(row=row, column=column, sticky="ew", padx=padx, pady=(2, 0))
+            return widget
+
+        def combo(parent: tk.Widget, key: str, values: tuple[str, ...], row: int, column: int, *, width: int = 10, padx: tuple[int, int] = (0, 6)) -> ttk.Combobox:
+            var = self._flow_card_param_var(card, key, defaults.get(key, ""))
+            widget = ttk.Combobox(parent, textvariable=var, values=values, state="readonly", width=width)
+            widget.grid(row=row, column=column, sticky="ew", padx=padx, pady=(2, 0))
+            return widget
+
+        mode_group = group("Mode", 0)
+        mode_group.columnconfigure(1, weight=1)
+        ttk.Label(mode_group, text="Wobb mode", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        combo(mode_group, "mode", ("Z", "Z-XY"), 0, 1, width=12, padx=(0, 0))
+
+        z_group = group("Z Range", 1)
+        z_group.columnconfigure((0, 1), weight=1, uniform=f"wobb_z_{card.card_id}")
+        lower_var = self._flow_card_param_var(card, "z_lower_um", defaults["z_lower_um"])
+        upper_var = self._flow_card_param_var(card, "z_upper_um", defaults["z_upper_um"])
+        range_text = tk.StringVar()
+
+        def update_range_text(*_args) -> None:
+            range_text.set(f"Lower {lower_var.get()} um    Upper {upper_var.get()} um")
+
+        lower_var.trace_add("write", update_range_text)
+        upper_var.trace_add("write", update_range_text)
+        update_range_text()
+        ttk.Label(z_group, textvariable=range_text, style="Muted.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+        RangeSlider(z_group, lower_var, upper_var, self.colors, minimum=-20, maximum=20, step=0.5).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 4))
+        ttk.Label(z_group, text="Step", style="Muted.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 6))
+        ttk.Label(z_group, text="Settle s", style="Muted.TLabel").grid(row=2, column=1, sticky="w")
+        combo(z_group, "z_step_um", ("0.5", "1", "2", "4"), 3, 0, width=8)
+        entry(z_group, "settle_s", 3, 1, width=8, padx=(0, 0))
+
+        row_index = 2
+        if self._wobb_card_mode_is_zxy(card):
+            xy_group = group("XY Wobb", row_index)
+            xy_group.columnconfigure((0, 1, 2), weight=1, uniform=f"wobb_xy_{card.card_id}")
+            ttk.Label(xy_group, text="Range um", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 6))
+            ttk.Label(xy_group, text="Step um", style="Muted.TLabel").grid(row=0, column=1, sticky="w", padx=(0, 6))
+            ttk.Label(xy_group, text="Pattern", style="Muted.TLabel").grid(row=0, column=2, sticky="w")
+            entry(xy_group, "xy_range_um", 1, 0)
+            entry(xy_group, "xy_step_um", 1, 1)
+            combo(xy_group, "xy_pattern", ("square", "corners", "spiral"), 1, 2, width=9, padx=(0, 0))
+            row_index += 1
+
+        electrical = group("Electrical Sampling", row_index)
+        electrical.columnconfigure((0, 1, 2), weight=1, uniform=f"wobb_electrical_{card.card_id}")
+        labels = (
+            ("resource", "VISA"),
+            ("output_terminal", "Terminal"),
+            ("bias_v", "Bias V"),
+            ("current_limit_a", "Limit A"),
+            ("sample_count", "Samples"),
+            ("nplc", "NPLC"),
+            ("best_current", "Best"),
+        )
+        for index, (key, label) in enumerate(labels):
+            row = (index // 3) * 2
+            column = index % 3
+            ttk.Label(electrical, text=label, style="Muted.TLabel").grid(row=row, column=column, sticky="w", padx=(0, 6), pady=(0 if row == 0 else 6, 0))
+            if key == "output_terminal":
+                combo(electrical, key, ("rear", "front"), row + 1, column)
+            elif key == "best_current":
+                combo(electrical, key, ("max_abs", "max", "min_abs", "min"), row + 1, column, width=9)
+            else:
+                entry(electrical, key, row + 1, column, width=10, padx=(0, 6 if column < 2 else 0))
+
     @staticmethod
     def _flow_param_choices(key: str) -> tuple[str, ...]:
         choices = {
@@ -1713,14 +2779,32 @@ class AutoTestPanel:
             "output_statistics": ("true", "false"),
             "resistance_method": ("linear_fit", "median_ratio"),
             "output_off_after": ("true", "false"),
+            "mode": ("Z", "Z-XY"),
+            "z_step_um": ("0.5", "1", "2", "4"),
+            "xy_pattern": ("square", "corners", "spiral"),
+            "best_current": ("max_abs", "max", "min_abs", "min"),
         }
         return choices.get(key, ())
 
     def _set_flow_card_param(self, card: AutoTestFlowCard, key: str, value: str) -> None:
         card.params[key] = value
         self._update_measurement_summary()
+        if card.type_id == "wobb_test" and key == "mode":
+            self._flow_editor_status_var.set(f"WobbTest mode: {value}.")
+            self._redraw_flow_workspace(animate=True)
 
     def _flow_card_param_summary(self, card: AutoTestFlowCard) -> str:
+        if card.type_id == "wobb_test":
+            mode = "Z-XY" if self._wobb_card_mode_is_zxy(card) else "Z"
+            lower = card.params.get("z_lower_um", "-2")
+            upper = card.params.get("z_upper_um", "2")
+            step = card.params.get("z_step_um", "0.5")
+            samples = card.params.get("sample_count", "5")
+            nplc = card.params.get("nplc", "10")
+            parts = [f"Mode: {mode}", f"Z {lower}..{upper} um step {step}", f"{samples} samples @ NPLC {nplc}"]
+            if mode == "Z-XY":
+                parts.append(f"XY +/-{card.params.get('xy_range_um', '2')} um")
+            return " | ".join(parts)
         definition = autotest_flow_definitions_by_type()[card.type_id]
         parts = []
         for param in definition.parameters[:2]:

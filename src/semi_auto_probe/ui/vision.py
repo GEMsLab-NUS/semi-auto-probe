@@ -14,11 +14,15 @@ class VisionPanel:
         get_um_per_px: Callable[[], float | None],
         move_point_to_center: Callable[[float, float, int, int], None],
         get_centering_preview: Callable[[float, float, int, int], str],
+        get_gds_overlay_polygons: Callable[[int, int], list[list[tuple[float, float]]]] | None = None,
+        get_probe_assist_points: Callable[[int, int], list[tuple[float, float, str, str]]] | None = None,
     ) -> None:
         self.colors = colors
         self.get_um_per_px = get_um_per_px
         self.move_point_to_center = move_point_to_center
         self.get_centering_preview = get_centering_preview
+        self.get_gds_overlay_polygons = get_gds_overlay_polygons
+        self.get_probe_assist_points = get_probe_assist_points
         self.photo: tk.PhotoImage | None = None
         self.source_image_bgr = None
         self.canvas_image_id: int | None = None
@@ -31,6 +35,13 @@ class VisionPanel:
         self.tool_var = tk.StringVar(value="idle")
         self.status_var = tk.StringVar(value="Select a vision tool.")
         self.cross_enabled = False
+        self.gds_overlay_enabled = False
+        self.probe_assist_enabled = False
+        self.probe_assist_points: list[tuple[float, float]] = []
+        self.probe_assist_labels: list[str] = []
+        self.probe_assist_colors: list[str] = []
+        self.probe_assist_fixed = False
+        self.probe_assist_drag_index: int | None = None
         self.tool_buttons: dict[str, tk.Button] = {}
         self.measure_points: list[tuple[float, float]] = []
         self.polygon_closed = False
@@ -56,6 +67,8 @@ class VisionPanel:
         self.canvas.grid(row=1, column=0, sticky="nsew")
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind("<Button-1>", self._on_canvas_click)
+        self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
         self.canvas.bind("<Double-Button-1>", self._on_canvas_double_click)
         self.canvas.bind("<Button-3>", self._on_canvas_right_click)
         self.canvas.bind("<Motion>", self._on_canvas_motion)
@@ -64,36 +77,53 @@ class VisionPanel:
     def _build_toolbar(self, parent: ttk.Frame) -> None:
         toolbar = ttk.Frame(parent, style="Panel.TFrame")
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        toolbar.columnconfigure(6, weight=1)
+        toolbar.columnconfigure(4, weight=1)
 
         tools = (
-            ("cross", "Center +"),
             ("point_distance", "Point-Point"),
             ("line_distance", "Point-Line"),
             ("polygon_area", "Polygon Area"),
         )
         for column, (tool, label) in enumerate(tools):
-            button = tk.Button(
-                toolbar,
-                text=label,
-                command=lambda name=tool: self.set_tool(name),
-                bg=self.colors["surface_3"],
-                fg=self.colors["text"],
-                activebackground="#223144",
-                activeforeground=self.colors["text"],
-                relief="flat",
-                bd=0,
-                padx=10,
-                pady=6,
-                font=("Segoe UI", 9),
-                cursor="hand2",
-            )
+            button = self._toolbar_button(toolbar, label, lambda name=tool: self.set_tool(name))
             button.grid(row=0, column=column, sticky="w", padx=(0, 6))
             self.tool_buttons[tool] = button
 
-        ttk.Button(toolbar, text="Clear", command=self.clear_measurement).grid(row=0, column=4, sticky="w", padx=(4, 8))
-        ttk.Label(toolbar, textvariable=self.status_var, style="Muted.TLabel", wraplength=360).grid(row=0, column=5, columnspan=2, sticky="ew")
+        ttk.Button(toolbar, text="Clear", command=self.clear_measurement).grid(row=0, column=3, sticky="w", padx=(4, 8))
+        ttk.Label(toolbar, textvariable=self.status_var, style="Muted.TLabel", wraplength=360).grid(row=0, column=4, sticky="ew", padx=(0, 8))
+
+        right_tools = ttk.Frame(toolbar, style="Panel.TFrame")
+        right_tools.grid(row=0, column=5, sticky="e")
+        for column, (tool, label, command) in enumerate(
+            (
+                ("cross", "+", lambda: self.set_tool("cross")),
+                ("gds_overlay", "GDS Overlay", self.toggle_gds_overlay),
+                ("probe_assist", "Probe Assist", self.toggle_probe_assist),
+            )
+        ):
+            button = self._toolbar_button(right_tools, label, command)
+            button.grid(row=0, column=column, sticky="e", padx=(0 if column == 0 else 6, 0))
+            self.tool_buttons[tool] = button
         self._refresh_tool_buttons()
+
+    def _toolbar_button(self, parent: tk.Widget, text: str, command: Callable[[], None], *, width: int | None = None) -> tk.Button:
+        options = {
+            "text": text,
+            "command": command,
+            "bg": self.colors["surface_3"],
+            "fg": self.colors["text"],
+            "activebackground": "#223144",
+            "activeforeground": self.colors["text"],
+            "relief": "flat",
+            "bd": 0,
+            "padx": 10,
+            "pady": 6,
+            "font": ("Segoe UI", 9),
+            "cursor": "hand2",
+        }
+        if width is not None:
+            options["width"] = width
+        return tk.Button(parent, **options)
 
     def set_tool(self, tool: str) -> None:
         if tool == "cross":
@@ -112,6 +142,45 @@ class VisionPanel:
         self._refresh_tool_buttons()
         self._refresh_canvas_cursor()
         self._clear_move_hover()
+        self.draw_overlay()
+
+    def toggle_gds_overlay(self) -> None:
+        self.gds_overlay_enabled = not self.gds_overlay_enabled
+        if not self.gds_overlay_enabled:
+            self.status_var.set("GDS overlay disabled.")
+        elif self.get_gds_overlay_polygons is None:
+            self.status_var.set("GDS overlay unavailable.")
+        elif self.image_width <= 0 or self.image_height <= 0:
+            self.status_var.set("GDS overlay enabled; waiting for live image.")
+        else:
+            try:
+                polygons = self.get_gds_overlay_polygons(self.image_width, self.image_height)
+            except Exception as exc:
+                self.status_var.set(str(exc))
+            else:
+                if polygons:
+                    self.status_var.set("GDS overlay enabled.")
+                else:
+                    self.status_var.set("GDS overlay enabled; no visible GDS geometry in the current view.")
+        self._refresh_tool_buttons()
+        self.draw_overlay()
+
+    def toggle_probe_assist(self) -> None:
+        self.probe_assist_enabled = not self.probe_assist_enabled
+        if self.probe_assist_enabled:
+            configured = self._refresh_configured_probe_assist_points(update_status=False)
+            if configured:
+                self.status_var.set("Probe Assist enabled from AutoTest Probe settings.")
+            elif self.image_width > 0 and self.image_height > 0 and not self.probe_assist_points:
+                self._initialize_probe_assist_points()
+                self.status_var.set("Probe Assist enabled. Drag the red boxes to set assist points.")
+            else:
+                self.status_var.set("Probe Assist enabled; waiting for live image.")
+        else:
+            self.probe_assist_drag_index = None
+            self.status_var.set("Probe Assist disabled.")
+        self._refresh_tool_buttons()
+        self._refresh_canvas_cursor()
         self.draw_overlay()
 
     def set_image(self, photo: tk.PhotoImage) -> None:
@@ -238,9 +307,14 @@ class VisionPanel:
             if self.cross_enabled:
                 cx = left + width / 2.0
                 cy = top + height / 2.0
-                self.canvas.create_line(cx, top, cx, bottom, fill="#34d399", width=1, dash=(6, 4), tags="vision_overlay")
-                self.canvas.create_line(left, cy, right, cy, fill="#34d399", width=1, dash=(6, 4), tags="vision_overlay")
-                self.canvas.create_oval(cx - 5, cy - 5, cx + 5, cy + 5, outline="#d1fae5", width=1, tags="vision_overlay")
+                self.canvas.create_oval(cx - 15, cy - 15, cx + 15, cy + 15, outline="#ef4444", width=2, tags="vision_overlay")
+                self.canvas.create_line(cx - 10, cy, cx + 10, cy, fill="#ef4444", width=2, tags="vision_overlay")
+                self.canvas.create_line(cx, cy - 10, cx, cy + 10, fill="#ef4444", width=2, tags="vision_overlay")
+
+            self._draw_gds_overlay()
+            if self.probe_assist_enabled:
+                self._refresh_configured_probe_assist_points(update_status=False)
+            self._draw_probe_assist_points()
 
             canvas_points = [self._image_to_canvas_point(point) for point in self.measure_points]
             tool = self.tool_var.get()
@@ -268,7 +342,14 @@ class VisionPanel:
     def _refresh_tool_buttons(self) -> None:
         active_tool = self.tool_var.get()
         for tool, button in self.tool_buttons.items():
-            is_active = self.cross_enabled if tool == "cross" else active_tool == tool
+            if tool == "cross":
+                is_active = self.cross_enabled
+            elif tool == "gds_overlay":
+                is_active = self.gds_overlay_enabled
+            elif tool == "probe_assist":
+                is_active = self.probe_assist_enabled
+            else:
+                is_active = active_tool == tool
             button.configure(
                 bg="#0f3b2d" if is_active else self.colors["surface_3"],
                 fg="#d1fae5" if is_active else self.colors["text"],
@@ -276,9 +357,110 @@ class VisionPanel:
                 highlightbackground="#2dd4bf" if is_active else self.colors["border"],
             )
 
+    def _draw_gds_overlay(self) -> None:
+        if not self.gds_overlay_enabled or self.get_gds_overlay_polygons is None:
+            return
+        try:
+            polygons = self.get_gds_overlay_polygons(self.image_width, self.image_height)
+        except Exception:
+            return
+        for polygon in polygons:
+            if len(polygon) < 3:
+                continue
+            canvas_points = [self._image_to_canvas_point(point) for point in polygon]
+            flat_points = [coord for point in canvas_points for coord in point]
+            self.canvas.create_polygon(
+                *flat_points,
+                fill="#38bdf8",
+                stipple="gray25",
+                outline="#bae6fd",
+                width=1,
+                tags="vision_overlay",
+            )
+
+    def _initialize_probe_assist_points(self) -> None:
+        center_x = float(self.image_width) / 2.0
+        center_y = float(self.image_height) / 2.0
+        offset = max(35.0, min(float(self.image_width) * 0.16, 120.0))
+        self.probe_assist_points = [
+            (max(0.0, center_x - offset), center_y),
+            (min(float(self.image_width), center_x + offset), center_y),
+        ]
+        self.probe_assist_labels = ["P1", "P2"]
+        self.probe_assist_colors = ["#ef4444", "#ef4444"]
+        self.probe_assist_fixed = False
+
+    def _refresh_configured_probe_assist_points(self, *, update_status: bool) -> bool:
+        if self.get_probe_assist_points is None or self.image_width <= 0 or self.image_height <= 0:
+            return False
+        try:
+            points = self.get_probe_assist_points(self.image_width, self.image_height)
+        except Exception as exc:
+            if update_status:
+                self.status_var.set(str(exc))
+            return False
+        if not points:
+            if self.probe_assist_fixed:
+                self.probe_assist_points = []
+                self.probe_assist_labels = []
+                self.probe_assist_colors = []
+                self.probe_assist_fixed = False
+            return False
+        self.probe_assist_points = [(float(point[0]), float(point[1])) for point in points]
+        self.probe_assist_labels = [str(point[2]) for point in points]
+        self.probe_assist_colors = [str(point[3]) for point in points]
+        self.probe_assist_fixed = True
+        self.probe_assist_drag_index = None
+        return True
+
+    def _draw_probe_assist_points(self) -> None:
+        if not self.probe_assist_enabled:
+            return
+        if self.image_width <= 0 or self.image_height <= 0:
+            return
+        if not self.probe_assist_points and not self.probe_assist_fixed:
+            self._initialize_probe_assist_points()
+        half_size = 15.0
+        cross_size = 9.0
+        for index, point in enumerate(self.probe_assist_points):
+            color = self.probe_assist_colors[index] if index < len(self.probe_assist_colors) else "#ef4444"
+            label = self.probe_assist_labels[index] if index < len(self.probe_assist_labels) else f"P{index + 1}"
+            cx, cy = self._image_to_canvas_point(point)
+            self.canvas.create_rectangle(
+                cx - half_size,
+                cy - half_size,
+                cx + half_size,
+                cy + half_size,
+                outline=color,
+                width=2,
+                tags="vision_overlay",
+            )
+            self.canvas.create_line(cx - cross_size, cy, cx + cross_size, cy, fill=color, width=2, tags="vision_overlay")
+            self.canvas.create_line(cx, cy - cross_size, cx, cy + cross_size, fill=color, width=2, tags="vision_overlay")
+            self.canvas.create_text(cx + half_size + 4, cy - half_size, text=label, fill=color, anchor="nw", font=("Segoe UI Semibold", 9), tags="vision_overlay")
+
+    def _probe_assist_hit_index(self, canvas_x: float, canvas_y: float) -> int | None:
+        if not self.probe_assist_enabled or self.image_bounds is None:
+            return None
+        hit_radius = 18.0
+        for index, point in enumerate(self.probe_assist_points):
+            cx, cy = self._image_to_canvas_point(point)
+            if abs(canvas_x - cx) <= hit_radius and abs(canvas_y - cy) <= hit_radius:
+                return index
+        return None
+
     def _refresh_canvas_cursor(self) -> None:
         try:
-            self.canvas.configure(cursor="tcross" if self._move_center_active() else "crosshair")
+            assist_hit = None
+            if self.hover_canvas_point is not None:
+                assist_hit = self._probe_assist_hit_index(*self.hover_canvas_point)
+            if self.probe_assist_drag_index is not None or (assist_hit is not None and not self.probe_assist_fixed):
+                cursor = "fleur"
+            elif self._move_center_active():
+                cursor = "tcross"
+            else:
+                cursor = "crosshair"
+            self.canvas.configure(cursor=cursor)
         except tk.TclError:
             return
 
@@ -327,6 +509,17 @@ class VisionPanel:
         self.draw_overlay()
 
     def _on_canvas_click(self, event: tk.Event) -> str | None:
+        if self.probe_assist_enabled:
+            hit_index = self._probe_assist_hit_index(event.x, event.y)
+            if hit_index is not None:
+                if self.probe_assist_fixed:
+                    self.status_var.set("Probe Assist positions are controlled by AutoTest Probe settings.")
+                    return "break"
+                self.probe_assist_drag_index = hit_index
+                self.status_var.set(f"Dragging Probe Assist point {hit_index + 1}.")
+                self._refresh_canvas_cursor()
+                return "break"
+
         if self.shift_down:
             point = self._canvas_to_image_point(event.x, event.y)
             if point is not None and self.image_width > 0 and self.image_height > 0:
@@ -368,6 +561,25 @@ class VisionPanel:
         self.draw_overlay()
         return "break"
 
+    def _on_canvas_drag(self, event: tk.Event) -> str | None:
+        if self.probe_assist_drag_index is None:
+            return None
+        point = self._canvas_to_clamped_image_point(event.x, event.y)
+        if point is not None:
+            self.probe_assist_points[self.probe_assist_drag_index] = point
+            self.draw_overlay()
+        return "break"
+
+    def _on_canvas_release(self, _event: tk.Event) -> str | None:
+        if self.probe_assist_drag_index is None:
+            return None
+        index = self.probe_assist_drag_index
+        self.probe_assist_drag_index = None
+        self.status_var.set(f"Probe Assist point {index + 1} set.")
+        self._refresh_canvas_cursor()
+        self.draw_overlay()
+        return "break"
+
     def _on_canvas_double_click(self, event: tk.Event) -> str | None:
         if self.shift_down:
             return "break"
@@ -384,6 +596,13 @@ class VisionPanel:
 
     def _on_canvas_motion(self, event: tk.Event) -> None:
         self.hover_canvas_point = (float(event.x), float(event.y))
+        if self.probe_assist_enabled and self._probe_assist_hit_index(event.x, event.y) is not None:
+            if self.probe_assist_fixed:
+                self.status_var.set("Probe Assist positions are controlled by AutoTest Probe settings.")
+            else:
+                self.status_var.set("Drag a Probe Assist point to reposition it.")
+            self._refresh_canvas_cursor()
+            return
         if self._canvas_to_image_point(event.x, event.y, update_status=False) is None:
             self._clear_move_hover()
             return
@@ -410,6 +629,16 @@ class VisionPanel:
             return None
         image_x = (canvas_x - left) / self.display_scale_x
         image_y = (canvas_y - top) / self.display_scale_y
+        return max(0.0, min(float(self.image_width), image_x)), max(0.0, min(float(self.image_height), image_y))
+
+    def _canvas_to_clamped_image_point(self, canvas_x: float, canvas_y: float) -> tuple[float, float] | None:
+        if self.image_bounds is None:
+            return None
+        left, top, right, bottom = self.image_bounds
+        clamped_x = max(left, min(right, float(canvas_x)))
+        clamped_y = max(top, min(bottom, float(canvas_y)))
+        image_x = (clamped_x - left) / self.display_scale_x
+        image_y = (clamped_y - top) / self.display_scale_y
         return max(0.0, min(float(self.image_width), image_x)), max(0.0, min(float(self.image_height), image_y))
 
     def _image_to_canvas_point(self, point: tuple[float, float]) -> tuple[float, float]:

@@ -291,6 +291,7 @@ class EdgeTracePanel:
         self.status_poll_job: str | None = None
         self.microscope_poll_job: str | None = None
         self.microscope_photo: tk.PhotoImage | None = None
+        self.microscope_payload_id: int | None = None
 
         self.cursor_var = tk.StringVar(value="Cursor u, v: -")
         self.selection_var = tk.StringVar(value="Selected: -")
@@ -308,6 +309,8 @@ class EdgeTracePanel:
             "10 um": 10.0,
         }
         self.snap_grid_var = tk.StringVar(value="1 um")
+        self.peak_range_expanded_var = tk.BooleanVar(value=True)
+        self.trace_parameter_expanded_var = tk.BooleanVar(value=True)
 
         self.min_u_var = tk.StringVar(value="")
         self.min_v_var = tk.StringVar(value="")
@@ -521,7 +524,7 @@ class EdgeTracePanel:
         return row + 1
 
     def _build_range_section(self, parent: ttk.Frame, row: int) -> int:
-        section = self._section(parent, "Peak Range", row)
+        section = self._collapsible_section(parent, "Peak Range", row, self.peak_range_expanded_var)
         for column in range(2):
             section.columnconfigure(column, weight=1, uniform="edge_trace_range")
         snap_row = ttk.Frame(section, style="Panel.TFrame")
@@ -553,7 +556,7 @@ class EdgeTracePanel:
         return row + 1
 
     def _build_path_section(self, parent: ttk.Frame, row: int) -> int:
-        section = self._section(parent, "Trace Parameter", row)
+        section = self._collapsible_section(parent, "Trace Parameter", row, self.trace_parameter_expanded_var)
         for column in range(2):
             section.columnconfigure(column, weight=1, uniform="edge_trace_path")
         fields = (
@@ -573,17 +576,17 @@ class EdgeTracePanel:
         section = self._section(parent, "Execution", row)
         section.columnconfigure((0, 1), weight=1, uniform="edge_trace_exec")
         ttk.Label(section, textvariable=self.execution_step_var, style="Value.TLabel", padding=7, wraplength=300).grid(row=0, column=0, columnspan=2, sticky="ew")
-        self.safe_button = ttk.Button(section, text="1. Move Safe Z", style="Accent.TButton", command=lambda: self._run_action(EDGE_TRACE_ACTION_SAFE), state="disabled")
+        self.safe_button = ttk.Button(section, text="\u25b2 1. Move Safe Z", style="Accent.TButton", command=lambda: self._run_action(EDGE_TRACE_ACTION_SAFE), state="disabled")
         self.safe_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        self.start_button = ttk.Button(section, text="2. Move Start", command=lambda: self._run_action(EDGE_TRACE_ACTION_START), state="disabled")
+        self.start_button = ttk.Button(section, text="\u25ce 2. Move Start", command=lambda: self._run_action(EDGE_TRACE_ACTION_START), state="disabled")
         self.start_button.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        self.contact_button = ttk.Button(section, text="3. Contact", command=lambda: self._run_action(EDGE_TRACE_ACTION_CONTACT), state="disabled")
+        self.contact_button = ttk.Button(section, text="\u25bc 3. Contact", command=lambda: self._run_action(EDGE_TRACE_ACTION_CONTACT), state="disabled")
         self.contact_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        self.segment_button = ttk.Button(section, text="Run Segment", style="Accent.TButton", command=lambda: self._run_action(EDGE_TRACE_ACTION_SEGMENT), state="disabled")
+        self.segment_button = ttk.Button(section, text="\u27a4 Run Segment", style="Accent.TButton", command=lambda: self._run_action(EDGE_TRACE_ACTION_SEGMENT), state="disabled")
         self.segment_button.grid(row=4, column=0, sticky="ew", padx=(0, 5), pady=(10, 0))
-        self.auto_button = ttk.Button(section, text="Auto Run", command=lambda: self._run_action(EDGE_TRACE_ACTION_AUTO), state="disabled")
+        self.auto_button = ttk.Button(section, text="\u26a1 Auto Run", command=lambda: self._run_action(EDGE_TRACE_ACTION_AUTO), state="disabled")
         self.auto_button.grid(row=4, column=1, sticky="ew", padx=(5, 0), pady=(10, 0))
-        self.stop_button = ttk.Button(section, text="Stop", command=self.stop_run, state="disabled")
+        self.stop_button = ttk.Button(section, text="\u25a0 Stop", command=self.stop_run, state="disabled")
         self.stop_button.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         ttk.Label(section, textvariable=self.status_var, style="Status.TLabel", padding=8, wraplength=320).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         return row + 1
@@ -593,6 +596,60 @@ class EdgeTracePanel:
         section.grid(row=row, column=0, sticky="ew", pady=(0, 10))
         section.columnconfigure(0, weight=1)
         return section
+
+    def _collapsible_section(self, parent: ttk.Frame, title: str, row: int, expanded_var: tk.BooleanVar) -> ttk.Frame:
+        outer = ttk.Frame(parent, style="Panel.TFrame")
+        outer.grid(row=row, column=0, sticky="ew", pady=(0, 10))
+        outer.columnconfigure(0, weight=1)
+
+        header = tk.Frame(
+            outer,
+            bg=self.colors["surface_2"],
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
+            cursor="hand2",
+        )
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(1, weight=1)
+        indicator = tk.Label(
+            header,
+            text="v" if expanded_var.get() else ">",
+            bg=self.colors["surface_2"],
+            fg=self.colors["accent"],
+            width=2,
+            font=("Segoe UI", 10, "bold"),
+        )
+        indicator.grid(row=0, column=0, sticky="w", padx=(8, 4), pady=8)
+        title_label = tk.Label(
+            header,
+            text=title.upper(),
+            bg=self.colors["surface_2"],
+            fg=self.colors["text"],
+            font=("Segoe UI", 9, "bold"),
+            anchor="w",
+        )
+        title_label.grid(row=0, column=1, sticky="ew", pady=8)
+        content = ttk.Frame(outer, style="Panel.TFrame", padding=(10, 8, 10, 10))
+        content.grid(row=1, column=0, sticky="ew")
+        content.columnconfigure(0, weight=1)
+
+        def apply_visibility() -> None:
+            if expanded_var.get():
+                content.grid()
+                indicator.configure(text="v")
+            else:
+                content.grid_remove()
+                indicator.configure(text=">")
+
+        def toggle(_event: tk.Event | None = None) -> str:
+            expanded_var.set(not bool(expanded_var.get()))
+            apply_visibility()
+            return "break"
+
+        for widget in (header, indicator, title_label):
+            widget.bind("<Button-1>", toggle)
+        apply_visibility()
+        return content
 
     def sync_from_layoutmap(self) -> None:
         model, layer_visibility = self.get_layout_context()
@@ -983,6 +1040,10 @@ class EdgeTracePanel:
         if not payload:
             return
         try:
+            payload_id = id(payload)
+            if payload_id == self.microscope_payload_id:
+                return
+            self.microscope_payload_id = payload_id
             self.microscope_photo = tk.PhotoImage(data=payload, format="PPM")
             self.microscope_label.configure(image=self.microscope_photo, text="")
         except tk.TclError:
