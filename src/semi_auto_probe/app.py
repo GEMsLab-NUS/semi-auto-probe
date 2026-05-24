@@ -7361,31 +7361,22 @@ class ProbeApp(tk.Tk):
                 timeout_seconds=0.25,
                 move_label=move_label,
             )
+        if self.edge_trace_stop_event.is_set():
+            return self.serial_client.read_stable_xyz_positions()
 
-        fast_pulses = int(round(total_pulses * 0.8))
-        slow_pulses = total_pulses - fast_pulses
-        reverse = delta < 0
-        current_target = int(current_z)
-        entries: list[tuple[bytes, bytes, AxisPosition]] = []
-        for pulses, profile in (
-            (fast_pulses, MOTOR_SPEED_PROFILE_FAST),
-            (slow_pulses, MOTOR_SPEED_PROFILE_SAFE),
-        ):
-            if pulses <= 0 or self.edge_trace_stop_event.is_set():
-                continue
-            speed_percent = self._motion_speed_percent(profile)
-            command = self.serial_client.move_relative(axis=Axis.Z, reverse=reverse, pulses=pulses, speed_percent=speed_percent)
-            self.result_queue.put(("motor_command", "Z", f"edge_trace {move_label} {profile}", command, "edge_trace"))
-            reached = self.serial_client.wait_axis_reached(Axis.Z, timeout=self._axis_move_timeout(pulses, speed_percent))
-            self.result_queue.put(("axis_done", "Z", reached, "edge_trace"))
-            current_target += -pulses if reverse else pulses
-            entries = self._edge_trace_wait_for_target_positions(
-                {"Z": current_target},
-                ("Z",),
-                timeout_seconds=self._axis_move_timeout(pulses, speed_percent),
-                move_label=f"{move_label} {profile}",
-            )
-        return entries or self.serial_client.read_stable_xyz_positions()
+        speed_percent = self._motion_speed_percent(MOTOR_SPEED_PROFILE_SAFE)
+        controller_delta = self._controller_delta_from_logical_delta("Z", delta)
+        pulses = abs(controller_delta)
+        command = self.serial_client.move_relative(axis=Axis.Z, reverse=controller_delta < 0, pulses=pulses, speed_percent=speed_percent)
+        self.result_queue.put(("motor_command", "Z", f"edge_trace {move_label} {MOTOR_SPEED_PROFILE_SAFE}", command, "edge_trace"))
+        reached = self.serial_client.wait_axis_reached(Axis.Z, timeout=self._axis_move_timeout(pulses, speed_percent))
+        self.result_queue.put(("axis_done", "Z", reached, "edge_trace"))
+        return self._edge_trace_wait_for_target_positions(
+            {"Z": int(target_z)},
+            ("Z",),
+            timeout_seconds=self._axis_move_timeout(pulses, speed_percent),
+            move_label=f"{move_label} {MOTOR_SPEED_PROFILE_SAFE}",
+        )
 
     def _edge_trace_lower_current_to_safe_z(self, entries: list[tuple[bytes, bytes, AxisPosition]], plan: EdgeTracePlan):
         current_x = self._axis_from_position_entries(entries, Axis.X)
@@ -7459,14 +7450,8 @@ class ProbeApp(tk.Tk):
             deltas = ", ".join(f"d{axis}={delta}" for axis, delta in plan.deltas.items() if delta)
             targets = ", ".join(f"{axis}={plan.target_pulses[axis]}" for axis in sorted(plan.target_pulses))
             self.result_queue.put(("edge_trace_status", f"{move_label}: {deltas} pulse(s), target {targets}."))
-        if self._probe_down_guard_enabled() and any(axis in plan.deltas and plan.deltas[axis] for axis in ("X", "Y")):
-            return self._move_absolute_stage(
-                plan.target_pulses["X"],
-                plan.target_pulses["Y"],
-                plan.target_pulses["Z"],
-                source="edge_trace",
-                expected_targets=plan.target_pulses,
-            )
+        # EdgeTrace owns the safe-Z/start/contact sequence; do not route it
+        # through the generic probe-down guard, which rewrites travel Z.
         axis_params = {}
         for axis_name, delta in plan.deltas.items():
             if delta == 0:

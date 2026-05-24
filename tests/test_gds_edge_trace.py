@@ -7,7 +7,9 @@ from unittest import mock
 
 from semi_auto_probe.af_plane import SamplePlaneModel, clear_sample_plane_model, set_sample_plane_model
 from semi_auto_probe.app import ProbeApp
+from semi_auto_probe.config import MOTOR_SPEED_PROFILE_FAST, MOTOR_SPEED_PROFILE_SAFE
 from semi_auto_probe.edge_trace_panel import (
+    EDGE_TRACE_ACTION_AUTO,
     EDGE_TRACE_ACTION_CONTACT,
     EDGE_TRACE_ACTION_SAFE,
     EDGE_TRACE_ACTION_START,
@@ -157,6 +159,14 @@ class DummyVar:
         return self.value
 
 
+class DummyBool:
+    def __init__(self, value: bool) -> None:
+        self.value = value
+
+    def get(self) -> bool:
+        return self.value
+
+
 class DummyEdgeTracePanel:
     def __init__(self) -> None:
         self.status = ""
@@ -186,14 +196,22 @@ class DummyMapperPanel:
 
 
 class DummyProbeConfig:
-    def __init__(self, *, acceleration_units: int = 10) -> None:
+    def __init__(
+        self,
+        *,
+        acceleration_units: int = 10,
+        motor_axis_polarity: dict[str, int] | None = None,
+        speed_by_profile: dict[str, int] | None = None,
+    ) -> None:
         self.acceleration_units = acceleration_units
+        self.motor_axis_polarity = motor_axis_polarity or {"X": 1, "Y": 1, "Z": 1}
+        self.speed_by_profile = dict(speed_by_profile or {})
 
     def um_per_pulse(self, _axis: str) -> float:
         return 1.0
 
-    def motor_speed_percent(self, _profile: str | None = None) -> int:
-        return 100
+    def motor_speed_percent(self, profile: str | None = None) -> int:
+        return self.speed_by_profile.get(profile or MOTOR_SPEED_PROFILE_FAST, 100)
 
     def cc_acceleration_units(self) -> int:
         return self.acceleration_units
@@ -204,6 +222,7 @@ class FakeEdgeTraceSerial:
         self.positions = {Axis.X: x, Axis.Y: y, Axis.Z: z}
         self.moves: list[dict[Axis, tuple[bool, int, int, int]]] = []
         self.relative_moves: list[tuple[Axis, bool, int, int]] = []
+        self.clear_position_calls: list[Axis] = []
         self.frozen_move_indices = set(frozen_move_indices or set())
 
     def read_stable_xyz_positions(self):
@@ -230,6 +249,10 @@ class FakeEdgeTraceSerial:
 
     def wait_axis_reached(self, axis: Axis, timeout: float = 5.0):
         return b"reached"
+
+    def clear_position(self, axis: Axis):
+        self.clear_position_calls.append(axis)
+        return b"clear"
 
 
 class EdgeTraceAppBridgeTests(unittest.TestCase):
@@ -351,6 +374,105 @@ class EdgeTraceAppBridgeTests(unittest.TestCase):
         self.assertEqual(second_move[Axis.X][3], 17)
         self.assertEqual(second_move[Axis.Y][3], 17)
 
+    def test_start_action_bypasses_probe_guard_and_stays_at_travel_z(self) -> None:
+        mapper = EdgeTracePlannerTests().mapper()
+        model = model_for([rectangle(0, 0, 10, 10)])
+        plan = build_edge_trace_plan(
+            model,
+            (1, 0),
+            (-1, -1, 11, 11),
+            max_step_um=100,
+            min_segment_um=0,
+            lift_height_um=5,
+            mapper=mapper,
+            focus_z_at_stage_um=lambda _x, _y: 100.0,
+            current_gds=(0, 0),
+        )
+        set_sample_plane_model(
+            SamplePlaneModel(
+                enabled=True,
+                type="plane",
+                a=0.0,
+                b=0.0,
+                c=100.0,
+                rms_residual=0.0,
+                pv_residual=0.0,
+                max_abs_residual=0.0,
+                tilt_x_deg=0.0,
+                tilt_y_deg=0.0,
+                valid_points=3,
+                failed_points=0,
+            )
+        )
+        app = self._app_shell(mapper)
+        app.probe_down_var = DummyBool(True)
+        app.serial_client = FakeEdgeTraceSerial(x=100, y=100, z=120)
+        app.probe_config = DummyProbeConfig()
+        app.current_position_values = {"X": 100, "Y": 100, "Z": 120}
+        app.result_queue = queue.Queue()
+        app._gds_mapper_focus_z_um = lambda _x, _y: 100.0
+
+        ProbeApp._edge_trace_action_worker(app, plan, EDGE_TRACE_ACTION_SAFE, 0)
+        ProbeApp._edge_trace_action_worker(app, plan, EDGE_TRACE_ACTION_START, 0)
+
+        self.assertEqual(app.serial_client.positions[Axis.Z], 95)
+        self.assertFalse(any(move[0] in {Axis.X, Axis.Y} for move in app.serial_client.relative_moves))
+
+    def test_auto_multi_segment_uses_edge_trace_waits_without_coordinate_reset(self) -> None:
+        mapper = EdgeTracePlannerTests().mapper()
+        model = model_for([rectangle(0, 0, 10, 10), rectangle(100, 0, 110, 10)])
+        plan = build_edge_trace_plan(
+            model,
+            (1, 0),
+            (-1, -1, 111, 11),
+            max_step_um=100,
+            min_segment_um=0,
+            lift_height_um=5,
+            mapper=mapper,
+            focus_z_at_stage_um=lambda _x, _y: 100.0,
+            current_gds=(0, 0),
+        )
+        self.assertGreaterEqual(len(plan.polylines), 2)
+        set_sample_plane_model(
+            SamplePlaneModel(
+                enabled=True,
+                type="plane",
+                a=0.0,
+                b=0.0,
+                c=100.0,
+                rms_residual=0.0,
+                pv_residual=0.0,
+                max_abs_residual=0.0,
+                tilt_x_deg=0.0,
+                tilt_y_deg=0.0,
+                valid_points=3,
+                failed_points=0,
+            )
+        )
+        start = plan.polylines[0].start
+        app = self._app_shell(mapper)
+        app.probe_down_var = DummyBool(True)
+        app.serial_client = FakeEdgeTraceSerial(
+            x=int(round(start.stage_x_um or 0)),
+            y=int(round(start.stage_y_um or 0)),
+            z=100,
+        )
+        app.probe_config = DummyProbeConfig()
+        app.current_position_values = {
+            "X": int(round(start.stage_x_um or 0)),
+            "Y": int(round(start.stage_y_um or 0)),
+            "Z": 100,
+        }
+        app.result_queue = queue.Queue()
+        app._gds_mapper_focus_z_um = lambda _x, _y: 100.0
+
+        ProbeApp._edge_trace_action_worker(app, plan, EDGE_TRACE_ACTION_AUTO, 0)
+
+        self.assertFalse(any(move[0] in {Axis.X, Axis.Y} for move in app.serial_client.relative_moves))
+        self.assertEqual(app.serial_client.clear_position_calls, [])
+        events = list(app.result_queue.queue)
+        self.assertFalse(any(event[0] == "edge_trace_error" for event in events))
+
     def test_contact_uses_fa_relative_z_and_b5_wait_not_cc(self) -> None:
         mapper = EdgeTracePlannerTests().mapper()
         model = model_for([rectangle(0, 0, 10, 10)])
@@ -381,6 +503,36 @@ class EdgeTraceAppBridgeTests(unittest.TestCase):
         events = list(app.result_queue.queue)
         self.assertTrue(any(event[0] == "axis_done" for event in events))
         self.assertTrue(any(event[0] == "edge_trace_action_done" and event[1] == EDGE_TRACE_ACTION_CONTACT for event in events))
+
+    def test_contact_z_move_applies_axis_polarity_and_safe_speed(self) -> None:
+        mapper = EdgeTracePlannerTests().mapper()
+        model = model_for([rectangle(0, 0, 10, 10)])
+        plan = build_edge_trace_plan(
+            model,
+            (1, 0),
+            (-1, -1, 11, 11),
+            max_step_um=100,
+            min_segment_um=0,
+            lift_height_um=5,
+            mapper=mapper,
+            focus_z_at_stage_um=lambda _x, _y: 100.0,
+            current_gds=(0, 0),
+        )
+        app = self._app_shell(mapper)
+        app.serial_client = FakeEdgeTraceSerial(x=0, y=0, z=-95)
+        app.probe_config = DummyProbeConfig(
+            motor_axis_polarity={"X": 1, "Y": 1, "Z": -1},
+            speed_by_profile={MOTOR_SPEED_PROFILE_FAST: 80, MOTOR_SPEED_PROFILE_SAFE: 12},
+        )
+        app.current_position_values = {"X": 0, "Y": 0, "Z": 95}
+        app.result_queue = queue.Queue()
+
+        ProbeApp._edge_trace_action_worker(app, plan, EDGE_TRACE_ACTION_CONTACT, 0)
+
+        self.assertEqual(app.serial_client.relative_moves, [(Axis.Z, True, 5, 12)])
+        self.assertEqual(app.serial_client.positions[Axis.Z], -100)
+        events = list(app.result_queue.queue)
+        self.assertFalse(any(event[0] == "edge_trace_error" for event in events))
 
     def test_worker_aborts_before_contact_if_travel_target_is_not_verified(self) -> None:
         mapper = EdgeTracePlannerTests().mapper()
