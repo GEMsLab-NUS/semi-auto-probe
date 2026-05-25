@@ -79,6 +79,24 @@ class VisionCenterMoveTests(unittest.TestCase):
         self.assertEqual(plan["target_positions"], {"X": 115, "Y": 190})
         self.assertEqual(preview, plan["preview_text"])
 
+    def test_image_centering_uses_resolution_scaled_calibration(self) -> None:
+        app = self.make_app_shell()
+        app.probe_config.camera_resolution_width = "1296"
+        app.probe_config.set_calibration(10, 2.0, 0.5)
+        app.probe_config.camera_resolution_width = "648"
+        app.probe_config.validate()
+
+        plan = app._image_centering_cc_plan(
+            point_x=354,
+            point_y=243,
+            image_width=648,
+            image_height=486,
+            um_per_px=app.probe_config.current_um_per_px(),
+        )
+
+        self.assertEqual(plan["signed_pulses"], {"X": 30, "Y": 0})
+        self.assertEqual(plan["target_positions"], {"X": 130})
+
     def test_cc_plan_uses_configured_speed_and_acceleration(self) -> None:
         app = self.make_app_shell()
         app.probe_config.cc_speed_percent = 60

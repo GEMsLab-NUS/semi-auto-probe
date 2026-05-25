@@ -14,9 +14,9 @@ from .img_matrix import fov_polygon_for_stage_target
 AUTOTEST_PREVIEW_INTERVAL_MS = 45
 AUTOTEST_OVERLAY_REDRAW_INTERVAL_MS = 90
 PROBE_ASSIST_PROBES: tuple[tuple[str, str, str, str, str], ...] = (
-    ("圆", "#34d399", "ring", "100", "0"),
-    ("Low", "#38bdf8", "square", "-100", "0"),
-    ("山", "#f43f5e", "diamond", "0", "100"),
+    ("Source", "#34d399", "ring", "100", "0"),
+    ("Drain", "#38bdf8", "square", "-100", "0"),
+    ("Gate", "#f43f5e", "diamond", "0", "100"),
 )
 WOBBTEST_FLOW_CARD_HEIGHT_Z = 464
 WOBBTEST_FLOW_CARD_HEIGHT_ZXY = 544
@@ -205,9 +205,6 @@ AUTOTEST_FLOW_DEFINITIONS: tuple[AutoTestFlowDefinition, ...] = (
             AutoTestFlowParam("nplc", "NPLC", "1"),
             AutoTestFlowParam("output_statistics", "Output stats", "true"),
             AutoTestFlowParam("resistance_method", "Resistance method", "linear_fit"),
-            AutoTestFlowParam("device_length_um", "Length um", "0"),
-            AutoTestFlowParam("device_width_um", "Width um", "0"),
-            AutoTestFlowParam("film_thickness_nm", "Thickness nm", "0"),
             AutoTestFlowParam("output_off_after", "Output off after", "true"),
         ),
     ),
@@ -235,15 +232,61 @@ AUTOTEST_FLOW_DEFINITIONS: tuple[AutoTestFlowDefinition, ...] = (
         ),
     ),
     AutoTestFlowDefinition(
-        "transfer",
-        "Transfer Test",
-        "Run a transfer sweep placeholder.",
+        "b1500_transfer",
+        "B1500 Transfer",
+        "Run Keysight B1500 FET transfer curves with configurable Drain/Gate SMUs.",
         "#a78bfa",
         (
-            AutoTestFlowParam("gate_start_v", "Gate start V", "-1"),
-            AutoTestFlowParam("gate_stop_v", "Gate stop V", "1"),
-            AutoTestFlowParam("gate_step_v", "Gate step V", "0.05"),
-            AutoTestFlowParam("drain_v", "Drain V", "0.1"),
+            AutoTestFlowParam("resource", "VISA resource", "GPIB0::17::INSTR"),
+            AutoTestFlowParam("device_name", "Device name", "{point}"),
+            AutoTestFlowParam("experiment", "Experiment", "Transfer"),
+            AutoTestFlowParam("sample", "Sample", "device_under_test"),
+            AutoTestFlowParam("drain_smu", "Drain SMU", "smu3"),
+            AutoTestFlowParam("gate_smu", "Gate SMU", "smu4"),
+            AutoTestFlowParam("sweep_start_v", "Vg start V", "-40"),
+            AutoTestFlowParam("sweep_end_v", "Vg end V", "40"),
+            AutoTestFlowParam("sweep_points", "Vg points", "201"),
+            AutoTestFlowParam("bias_values_v", "Vd list V", "0:5:1"),
+            AutoTestFlowParam("drain_current_compliance_a", "Id compliance A", "1e-5"),
+            AutoTestFlowParam("gate_current_compliance_a", "Ig compliance A", "1e-9"),
+            AutoTestFlowParam("measure_gate_leak", "Measure Ig", "true"),
+            AutoTestFlowParam("abort_on_compliance", "Abort on compliance", "false"),
+            AutoTestFlowParam("staircase_nplc", "Staircase NPLC", "10"),
+            AutoTestFlowParam("step_delay_s", "Step delay s", "0.02"),
+            AutoTestFlowParam("pre_settle_s", "Pre-settle s", "1.0"),
+            AutoTestFlowParam("post_sweep_pause_s", "Post pause s", "1.0"),
+            AutoTestFlowParam("measurement_adc", "Measurement ADC", "high_speed"),
+            AutoTestFlowParam("autozero", "Autozero", "false"),
+            AutoTestFlowParam("save_mode", "Save mode", "both"),
+        ),
+    ),
+    AutoTestFlowDefinition(
+        "b1500_output",
+        "B1500 Output",
+        "Run Keysight B1500 FET output curves with configurable Drain/Gate SMUs.",
+        "#c084fc",
+        (
+            AutoTestFlowParam("resource", "VISA resource", "GPIB0::17::INSTR"),
+            AutoTestFlowParam("device_name", "Device name", "{point}"),
+            AutoTestFlowParam("experiment", "Experiment", "Output"),
+            AutoTestFlowParam("sample", "Sample", "device_under_test"),
+            AutoTestFlowParam("drain_smu", "Drain SMU", "smu3"),
+            AutoTestFlowParam("gate_smu", "Gate SMU", "smu4"),
+            AutoTestFlowParam("sweep_start_v", "Vd start V", "0"),
+            AutoTestFlowParam("sweep_end_v", "Vd end V", "10"),
+            AutoTestFlowParam("sweep_points", "Vd points", "201"),
+            AutoTestFlowParam("bias_values_v", "Vg list V", "-25:25:5"),
+            AutoTestFlowParam("drain_current_compliance_a", "Id compliance A", "1e-5"),
+            AutoTestFlowParam("gate_current_compliance_a", "Ig compliance A", "1e-8"),
+            AutoTestFlowParam("measure_gate_leak", "Measure Ig", "true"),
+            AutoTestFlowParam("abort_on_compliance", "Abort on compliance", "false"),
+            AutoTestFlowParam("staircase_nplc", "Staircase NPLC", "10"),
+            AutoTestFlowParam("step_delay_s", "Step delay s", "0.01"),
+            AutoTestFlowParam("pre_settle_s", "Pre-settle s", "0.2"),
+            AutoTestFlowParam("post_sweep_pause_s", "Post pause s", "0.2"),
+            AutoTestFlowParam("measurement_adc", "Measurement ADC", "high_speed"),
+            AutoTestFlowParam("autozero", "Autozero", "false"),
+            AutoTestFlowParam("save_mode", "Save mode", "both"),
         ),
     ),
     AutoTestFlowDefinition(
@@ -2321,6 +2364,8 @@ class AutoTestPanel:
         if card.type_id == "wobb_test":
             height = WOBBTEST_FLOW_CARD_HEIGHT_ZXY if self._wobb_card_mode_is_zxy(card) else WOBBTEST_FLOW_CARD_HEIGHT_Z
             return int(height * self._flow_zoom)
+        if card.type_id in {"b1500_transfer", "b1500_output"}:
+            return int(585 * self._flow_zoom)
         definition = autotest_flow_definitions_by_type()[card.type_id]
         rows = max(1, math.ceil(len(definition.parameters) / 2))
         return int((116 + rows * 38) * self._flow_zoom)
@@ -2622,6 +2667,9 @@ class AutoTestPanel:
         if card.type_id == "wobb_test":
             self._build_wobb_test_flow_card_params(frame, card, definition)
             return
+        if card.type_id in {"b1500_transfer", "b1500_output"}:
+            self._build_b1500_flow_card_params(frame, card, definition)
+            return
         params = tk.Frame(frame, bg=self.colors["surface"], padx=10, pady=4)
         params.grid(row=2, column=1, columnspan=4, sticky="nsew")
         params.columnconfigure(1, weight=1)
@@ -2773,6 +2821,120 @@ class AutoTestPanel:
             else:
                 entry(electrical, key, row + 1, column, width=10, padx=(0, 6 if column < 2 else 0))
 
+    def _build_b1500_flow_card_params(self, frame: tk.Frame, card: AutoTestFlowCard, definition: AutoTestFlowDefinition) -> None:
+        defaults = {param.key: param.default for param in definition.parameters}
+        params = tk.Frame(frame, bg=self.colors["surface"], padx=10, pady=2)
+        params.grid(row=2, column=1, columnspan=4, sticky="nsew")
+        params.columnconfigure(0, weight=1)
+
+        def group(title: str, row: int) -> tk.LabelFrame:
+            section = tk.LabelFrame(
+                params,
+                text=title,
+                bg=self.colors["surface"],
+                fg=self.colors["muted"],
+                bd=0,
+                highlightthickness=1,
+                highlightbackground=self.colors["border"],
+                padx=8,
+                pady=5,
+                font=("Segoe UI Semibold", 8),
+            )
+            section.grid(row=row, column=0, sticky="ew", pady=(0, 7))
+            return section
+
+        def entry(parent: tk.Widget, key: str, row: int, column: int, *, width: int = 10, padx: tuple[int, int] = (0, 6)) -> tk.Entry:
+            var = self._flow_card_param_var(card, key, defaults.get(key, ""))
+            widget = tk.Entry(
+                parent,
+                textvariable=var,
+                bg=self.colors["input"],
+                fg=self.colors["text"],
+                insertbackground=self.colors["accent"],
+                relief="flat",
+                highlightthickness=1,
+                highlightbackground=self.colors["border"],
+                highlightcolor=self.colors["border_focus"],
+                font=("Cascadia Mono", 9),
+                width=width,
+            )
+            widget.grid(row=row, column=column, sticky="ew", padx=padx, pady=(2, 0))
+            return widget
+
+        def combo(parent: tk.Widget, key: str, values: tuple[str, ...], row: int, column: int, *, width: int = 10, padx: tuple[int, int] = (0, 6)) -> ttk.Combobox:
+            var = self._flow_card_param_var(card, key, defaults.get(key, ""))
+            widget = ttk.Combobox(parent, textvariable=var, values=values, state="readonly", width=width)
+            widget.grid(row=row, column=column, sticky="ew", padx=padx, pady=(2, 0))
+            return widget
+
+        identity = group("Instrument and Data", 0)
+        identity.columnconfigure((0, 1, 2, 3), weight=1, uniform=f"b1500_identity_{card.card_id}")
+        for column, (key, label) in enumerate((("resource", "VISA"), ("device_name", "Device"), ("experiment", "Experiment"), ("sample", "Sample"))):
+            ttk.Label(identity, text=label, style="Muted.TLabel").grid(row=0, column=column, sticky="w", padx=(0, 6))
+            entry(identity, key, 1, column, width=13, padx=(0, 6 if column < 3 else 0))
+
+        mapping = group("SMU Mapping", 1)
+        mapping.columnconfigure((0, 1), weight=1, uniform=f"b1500_mapping_{card.card_id}")
+        ttk.Label(mapping, text="Drain", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Label(mapping, text="Gate", style="Muted.TLabel").grid(row=0, column=1, sticky="w")
+        combo(mapping, "drain_smu", ("smu1", "smu2", "smu3", "smu4"), 1, 0, width=8)
+        combo(mapping, "gate_smu", ("smu1", "smu2", "smu3", "smu4"), 1, 1, width=8, padx=(0, 0))
+
+        sweep = group("Sweep", 2)
+        sweep.columnconfigure((0, 1, 2, 3), weight=1, uniform=f"b1500_sweep_{card.card_id}")
+        axis_label = "Vg" if card.type_id == "b1500_transfer" else "Vd"
+        bias_label = "Vd list" if card.type_id == "b1500_transfer" else "Vg list"
+        for column, (key, label) in enumerate(
+            (
+                ("sweep_start_v", f"{axis_label} start V"),
+                ("sweep_end_v", f"{axis_label} end V"),
+                ("sweep_points", f"{axis_label} points"),
+                ("bias_values_v", f"{bias_label} V"),
+            )
+        ):
+            ttk.Label(sweep, text=label, style="Muted.TLabel").grid(row=0, column=column, sticky="w", padx=(0, 6))
+            entry(sweep, key, 1, column, width=12, padx=(0, 6 if column < 3 else 0))
+
+        protection = group("Compliance and Acquisition", 3)
+        protection.columnconfigure((0, 1, 2, 3, 4), weight=1, uniform=f"b1500_protect_{card.card_id}")
+        for column, (key, label) in enumerate(
+            (
+                ("drain_current_compliance_a", "Id comp A"),
+                ("gate_current_compliance_a", "Ig comp A"),
+                ("measure_gate_leak", "Measure Ig"),
+                ("abort_on_compliance", "Abort comp"),
+                ("staircase_nplc", "Stair NPLC"),
+            )
+        ):
+            ttk.Label(protection, text=label, style="Muted.TLabel").grid(row=0, column=column, sticky="w", padx=(0, 6))
+            if key in {"measure_gate_leak", "abort_on_compliance"}:
+                combo(protection, key, ("true", "false"), 1, column, width=8, padx=(0, 6 if column < 4 else 0))
+            else:
+                entry(protection, key, 1, column, width=10, padx=(0, 6 if column < 4 else 0))
+
+        timing = group("Timing and Output", 4)
+        timing.columnconfigure((0, 1, 2, 3), weight=1, uniform=f"b1500_timing_{card.card_id}")
+        fields = (
+            ("step_delay_s", "Step delay s"),
+            ("pre_settle_s", "Pre-settle s"),
+            ("post_sweep_pause_s", "Post pause s"),
+            ("save_mode", "Save mode"),
+            ("measurement_adc", "ADC"),
+            ("autozero", "Autozero"),
+        )
+        for index, (key, label) in enumerate(fields):
+            row = (index // 4) * 2
+            column = index % 4
+            ttk.Label(timing, text=label, style="Muted.TLabel").grid(row=row, column=column, sticky="w", padx=(0, 6), pady=(0 if row == 0 else 6, 0))
+            if key == "save_mode":
+                combo(timing, key, ("both", "long", "wide", "per_curve"), row + 1, column, width=10, padx=(0, 6 if column < 3 else 0))
+            elif key == "measurement_adc":
+                combo(timing, key, ("high_resolution", "high_speed"), row + 1, column, width=15, padx=(0, 6 if column < 3 else 0))
+            elif key == "autozero":
+                combo(timing, key, ("false", "true"), row + 1, column, width=8, padx=(0, 6 if column < 3 else 0))
+            else:
+                entry(timing, key, row + 1, column, width=10, padx=(0, 6 if column < 3 else 0))
+
     @staticmethod
     def _flow_param_choices(key: str) -> tuple[str, ...]:
         choices = {
@@ -2786,6 +2948,13 @@ class AutoTestPanel:
             "z_step_um": ("0.5", "1", "2", "4"),
             "xy_pattern": ("square", "corners", "spiral"),
             "best_current": ("max_abs", "max", "min_abs", "min"),
+            "measure_gate_leak": ("true", "false"),
+            "abort_on_compliance": ("false", "true"),
+            "autozero": ("false", "true"),
+            "save_mode": ("both", "long", "wide", "per_curve"),
+            "drain_smu": ("smu1", "smu2", "smu3", "smu4"),
+            "gate_smu": ("smu1", "smu2", "smu3", "smu4"),
+            "measurement_adc": ("high_resolution", "high_speed"),
         }
         return choices.get(key, ())
 
@@ -2808,6 +2977,17 @@ class AutoTestPanel:
             if mode == "Z-XY":
                 parts.append(f"XY +/-{card.params.get('xy_range_um', '2')} um")
             return " | ".join(parts)
+        if card.type_id in {"b1500_transfer", "b1500_output"}:
+            axis = "Vg" if card.type_id == "b1500_transfer" else "Vd"
+            bias = "Vd" if card.type_id == "b1500_transfer" else "Vg"
+            return (
+                f"{card.params.get('resource', 'GPIB0::17::INSTR')} | "
+                f"D={card.params.get('drain_smu', 'smu3').upper()} G={card.params.get('gate_smu', 'smu4').upper()} | "
+                f"{axis} {card.params.get('sweep_start_v', '0')}..{card.params.get('sweep_end_v', '0')} V, "
+                f"{card.params.get('sweep_points', '201')} pts | "
+                f"{bias}: {card.params.get('bias_values_v', '')} | "
+                f"NPLC {card.params.get('staircase_nplc', '10')}"
+            )
         definition = autotest_flow_definitions_by_type()[card.type_id]
         parts = []
         for param in definition.parameters[:2]:

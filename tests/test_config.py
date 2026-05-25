@@ -85,6 +85,20 @@ class ProbeConfigTest(unittest.TestCase):
         config.eyepiece = 2.0
         self.assertIsNone(config.current_um_per_px())
 
+    def test_calibration_scales_with_camera_resolution(self) -> None:
+        config = ProbeConfig(camera_resolution_width="1296")
+        config.set_calibration(10, 2.0, 0.5)
+
+        self.assertAlmostEqual(config.current_um_per_px(), 0.5)
+
+        config.camera_resolution_width = "648"
+        config.validate()
+        self.assertAlmostEqual(config.current_um_per_px(), 1.0)
+
+        config.camera_resolution_width = "2592"
+        config.validate()
+        self.assertAlmostEqual(config.current_um_per_px(), 0.25)
+
     def test_derives_missing_calibrations_from_20x_1_5x_without_overwrite(self) -> None:
         config = ProbeConfig()
         config.set_calibration(20, 1.5, 0.42)
@@ -156,6 +170,7 @@ class ProbeConfigTest(unittest.TestCase):
             self.assertAlmostEqual(loaded.layoutbond_fov_width_um, 320.0)
             self.assertAlmostEqual(loaded.layoutbond_fov_height_um, 240.0)
             self.assertAlmostEqual(loaded.current_um_per_px(), 1.25)
+            self.assertEqual(loaded.calibration_resolution_widths[calibration_key(5, 2.5)], "1296")
 
     def test_motor_axis_polarity_rejects_invalid_values(self) -> None:
         with self.assertRaises(ValueError):

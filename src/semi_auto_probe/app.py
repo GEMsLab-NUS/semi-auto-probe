@@ -50,6 +50,7 @@ from .auto_test import (
     wobbtest_xy_offsets_um,
     wobbtest_z_offsets_um,
 )
+from .b1500 import B1500_TEST_OUTPUT, B1500_TEST_TRANSFER, B1500SweepConfig, KeysightB1500Runner, b1500_config_from_params
 from .camera import CameraSettings, UsbCamera, camera_source_choices, normalize_camera_source
 from .camera_stage_transform import (
     image_delta_px_to_stage_delta_um,
@@ -65,6 +66,9 @@ from .config import (
     AUTOFOCUS_PEAK_MODEL_PSEUDO_VOIGT,
     CAMERA_CONTROL_MODE_LABELS,
     CAMERA_CONTROL_MODES,
+    CAMERA_FRAME_RATE_OPTIONS,
+    CAMERA_RESOLUTION_LABELS,
+    CAMERA_RESOLUTION_WIDTHS,
     DEFAULT_AGENT_BASE_URL,
     DEFAULT_AGENT_MODEL,
     DEFAULT_AGENT_TIMEOUT_SECONDS,
@@ -86,9 +90,12 @@ from .config import (
     load_probe_config,
     normalize_autofocus_peak_model,
     normalize_camera_control_mode,
+    normalize_camera_resolution_width,
+    normalize_camera_target_fps,
     parse_jog_step_levels_text,
     pulses_from_um,
     save_probe_config,
+    camera_resolution_dimensions,
 )
 from .edge_trace_panel import (
     EDGE_TRACE_ACTION_AUTO,
@@ -147,6 +154,8 @@ AUTOTEST_RESULT_POLL_INTERVAL_MS = 8
 AUTOTEST_RESULT_POLL_MAX_EVENTS = 12
 AUTOTEST_RESULT_POLL_MAX_SECONDS = 0.004
 PANEL_PREVIEW_MIN_INTERVAL_SECONDS = 1.0 / 24.0
+AUTOFOCUS_PREVIEW_MAX_WIDTH = 640
+AUTOFOCUS_PREVIEW_MAX_HEIGHT = 360
 REALTIME_POSITION_UI_INTERVAL_SECONDS = 0.05
 IV_PLOT_MIN_DRAW_INTERVAL_SECONDS = 0.12
 AUTOFOCUS_POST_SETTLE_DISCARD_FRAMES = 2
@@ -359,10 +368,7 @@ class IVPlotWindow:
     def add_statistics(self, row: int, col: int, statistics: dict[str, object]) -> None:
         value = None
         label = "Resistance (ohm)"
-        if _finite_number(statistics.get("resistivity_ohm_cm")):
-            value = float(statistics["resistivity_ohm_cm"])
-            label = "Resistivity (ohm cm)"
-        elif _finite_number(statistics.get("resistance_ohm")):
+        if _finite_number(statistics.get("resistance_ohm")):
             value = float(statistics["resistance_ohm"])
         if value is None:
             return
@@ -545,6 +551,165 @@ class WobbTestPlotWindow:
         self.canvas.draw_idle()
 
 
+class B1500PlotWindow:
+    def __init__(self, parent: tk.Tk, colors: dict[str, str]) -> None:
+        self.parent = parent
+        self.colors = colors
+        self.curves: list[dict[str, object]] = []
+        self.test_type = B1500_TEST_OUTPUT
+        self.window = tk.Toplevel(parent)
+        self.window.title("B1500 FET Curves")
+        self.window.geometry("900x620")
+        self.window.configure(bg=colors["bg"])
+        self.window.protocol("WM_DELETE_WINDOW", self.hide)
+
+        header = ttk.Frame(self.window, style="App.TFrame", padding=(14, 12, 14, 8))
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        self.title_var = tk.StringVar(value="B1500 curves")
+        self.status_var = tk.StringVar(value="Waiting")
+        ttk.Label(header, textvariable=self.title_var, style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header, textvariable=self.status_var, style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(3, 0))
+
+        plot_frame = ttk.Frame(self.window, style="Panel.TFrame", padding=8)
+        plot_frame.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        plot_frame.columnconfigure(0, weight=1)
+        plot_frame.rowconfigure(0, weight=1)
+        self.window.columnconfigure(0, weight=1)
+        self.window.rowconfigure(1, weight=1)
+
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.figure import Figure
+
+        self.figure = Figure(figsize=(8.4, 5.2), dpi=100, facecolor=colors["surface"])
+        self.axes = self.figure.add_subplot(111)
+        self.gate_axes = self.axes.twinx()
+        self._style_axes(self.axes)
+        self._style_axes(self.gate_axes)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
+        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self._draw()
+
+    def _style_axes(self, axes) -> None:
+        axes.set_facecolor(self.colors["surface_2"])
+        axes.tick_params(colors=self.colors["muted"])
+        axes.grid(True, color=self.colors["border"], alpha=0.34)
+        for spine in axes.spines.values():
+            spine.set_color(self.colors["border"])
+
+    def hide(self) -> None:
+        self.window.withdraw()
+
+    def show(self) -> None:
+        self.window.deiconify()
+        self.window.lift()
+
+    def start(self, point_name: str, config: B1500SweepConfig) -> None:
+        self.curves.clear()
+        self.test_type = config.test_type
+        label = "Transfer" if config.test_type == B1500_TEST_TRANSFER else "Output"
+        self.title_var.set(f"B1500 {label}: {point_name}")
+        self.status_var.set(config.summary())
+        self._draw()
+        self.show()
+
+    def add_curve(self, payload: dict[str, object]) -> None:
+        x_values = self._float_series(payload.get("x"))
+        id_values = self._float_series(payload.get("id"))
+        ig_values = self._float_series(payload.get("ig"))
+        if not x_values or len(x_values) != len(id_values):
+            return
+        if ig_values and len(ig_values) != len(x_values):
+            ig_values = []
+        self.curves.append(
+            {
+                "bias_v": float(payload.get("bias_v", 0.0)),
+                "x": x_values,
+                "id": id_values,
+                "ig": ig_values,
+            }
+        )
+        self.status_var.set(f"Curve {payload.get('curve_index')}/{payload.get('curve_total')} | bias={float(payload.get('bias_v', 0.0)):.6g} V")
+        self._draw()
+        self.show()
+
+    def finish(self, message: str) -> None:
+        self.status_var.set(message)
+        self._draw()
+        self.show()
+
+    @staticmethod
+    def _float_series(value: object) -> list[float]:
+        if value is None:
+            return []
+        try:
+            return [float(item) for item in value]  # type: ignore[operator]
+        except (TypeError, ValueError):
+            return []
+
+    def _curve_color(self, index: int, total: int):
+        cmap_name = "plasma" if self.test_type == B1500_TEST_TRANSFER else "viridis"
+        try:
+            from matplotlib import colormaps
+
+            cmap = colormaps[cmap_name]
+        except Exception:
+            from matplotlib import cm
+
+            cmap = cm.get_cmap(cmap_name)
+        if total <= 1:
+            return cmap(0.62)
+        return cmap(0.12 + 0.78 * index / max(1, total - 1))
+
+    def _draw(self) -> None:
+        self.axes.clear()
+        self.gate_axes.clear()
+        self._style_axes(self.axes)
+        self._style_axes(self.gate_axes)
+        is_transfer = self.test_type == B1500_TEST_TRANSFER
+        x_label = "Vg (V)" if is_transfer else "Vd (V)"
+        bias_label = "Vd" if is_transfer else "Vg"
+        title = "Transfer: Id-Vg" if is_transfer else "Output: Id-Vd"
+        self.axes.set_title(title, color=self.colors["text"])
+        self.axes.set_xlabel(x_label, color=self.colors["text"])
+        self.axes.set_ylabel("Id (A)", color=self.colors["text"])
+        self.gate_axes.set_ylabel("Ig (A)" if is_transfer else "|Ig| (A)", color="#94a3b8")
+        self.gate_axes.tick_params(colors="#94a3b8")
+
+        if not self.curves:
+            self.axes.text(0.5, 0.5, "No B1500 curves", ha="center", va="center", color=self.colors["muted"], transform=self.axes.transAxes)
+            self.gate_axes.set_yticks([])
+            self.canvas.draw_idle()
+            return
+
+        total = len(self.curves)
+        has_gate = any(curve.get("ig") for curve in self.curves)
+        for index, curve in enumerate(self.curves):
+            color = self._curve_color(index, total)
+            x_values = curve["x"]
+            id_values = curve["id"]
+            bias = float(curve["bias_v"])
+            self.axes.plot(x_values, id_values, color=color, linewidth=1.8, label=f"{bias_label}={bias:+.3g} V")
+            ig_values = curve.get("ig")
+            if ig_values:
+                gate_values = ig_values if is_transfer else [abs(float(value)) for value in ig_values]
+                self.gate_axes.plot(x_values, gate_values, color=color, linewidth=1.0, linestyle="--", alpha=0.55)
+
+        if is_transfer:
+            self.axes.set_yscale("symlog", linthresh=1e-12)
+        if has_gate:
+            if is_transfer:
+                self.gate_axes.set_yscale("symlog", linthresh=1e-12)
+            else:
+                self.gate_axes.set_yscale("log")
+        else:
+            self.gate_axes.set_yticks([])
+            self.gate_axes.set_ylabel("")
+        self.axes.legend(loc="best", frameon=False, fontsize=8, labelcolor=self.colors["text"])
+        self.figure.tight_layout()
+        self.canvas.draw_idle()
+
+
 def _finite_number(value: object) -> bool:
     try:
         return math.isfinite(float(value))
@@ -574,6 +739,7 @@ class ProbeApp(tk.Tk):
         self.autotest_panel: AutoTestPanel | None = None
         self.iv_plot_window: IVPlotWindow | None = None
         self.wobb_test_plot_window: WobbTestPlotWindow | None = None
+        self.b1500_plot_window: B1500PlotWindow | None = None
         self.edge_trace_panel: EdgeTracePanel | None = None
         self.agent_panel: AgentPanel | None = None
         self.agent_function_spec_path = Path.cwd() / "docs" / "agent-function-spec.md"
@@ -691,6 +857,8 @@ class ProbeApp(tk.Tk):
         self.imgstitch_camera_image: tk.PhotoImage | None = None
         self.imgstitch_preview_image: tk.PhotoImage | None = None
         self.imgstitch_preview_bgr = None
+        self.imgstitch_full_image_bgr = None
+        self.imgstitch_last_output_path: Path | None = None
         self.imgstitch_preview_scale = 1.0
         self.imgstitch_preview_pan = [0.0, 0.0]
         self.imgstitch_preview_drag_start: tuple[int, int, float, float] | None = None
@@ -826,6 +994,8 @@ class ProbeApp(tk.Tk):
         self.camera_exposure_var = tk.StringVar(value=f"{self.probe_config.camera_exposure:g}")
         self.camera_gain_mode_var = tk.StringVar(value=self._camera_control_mode_label(self.probe_config.camera_gain_mode))
         self.camera_gain_var = tk.StringVar(value=f"{self.probe_config.camera_gain:g}")
+        self.camera_resolution_var = tk.StringVar(value=self._camera_resolution_label(self.probe_config.camera_resolution_width))
+        self.camera_target_fps_var = tk.StringVar(value=str(self.probe_config.camera_target_fps))
         self.cc_accel_time_var = tk.StringVar(value=f"{self.probe_config.cc_accel_time_s:g}")
         self.autofocus_settle_ms_var = tk.StringVar(value=str(self.probe_config.autofocus_settle_ms))
         self.autofocus_sample_count_var = tk.StringVar(value=str(self.probe_config.autofocus_sample_count))
@@ -2613,6 +2783,7 @@ class ProbeApp(tk.Tk):
         sample_panel.rowconfigure(0, weight=1)
         self.autofocus_video_label = ttk.Label(sample_panel, anchor="center", text="Camera preview", style="Video.TLabel")
         self.autofocus_video_label.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        self.autofocus_video_label.configure(width=1)
         self.z_score_canvas = tk.Canvas(sample_panel, bg=self.colors["surface_2"], highlightthickness=0)
         self.z_score_canvas.grid(row=0, column=1, sticky="nsew")
         self.z_score_canvas.bind("<Configure>", lambda _event: self._draw_autofocus_z_score())
@@ -3167,8 +3338,9 @@ class ProbeApp(tk.Tk):
         recompose_button = ttk.Button(control_panel, text="Apply and Recalculate", command=self.recompose_imgstitch_session)
         recompose_button.grid(row=row + 2, column=1, sticky="ew", pady=(8, 0), padx=(5, 0))
         self.imgstitch_recompose_button = recompose_button
-        ttk.Button(control_panel, text="Stop", style="Danger.TButton", command=self.stop_imgstitch).grid(row=row + 3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        ttk.Label(control_panel, textvariable=self.imgstitch_status_var, style="Status.TLabel", wraplength=300, padding=8).grid(row=row + 4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(control_panel, text="Save Full Image", command=self.save_imgstitch_full_image).grid(row=row + 3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(control_panel, text="Stop", style="Danger.TButton", command=self.stop_imgstitch).grid(row=row + 4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(control_panel, textvariable=self.imgstitch_status_var, style="Status.TLabel", wraplength=300, padding=8).grid(row=row + 5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.imgstitch_mode_widgets["XY Stitch"].extend([plane_check, focusmap_plane_check, recompose_button])
         for variable in (
             self.imgstitch_overlap_x_var,
@@ -3183,20 +3355,48 @@ class ProbeApp(tk.Tk):
         self._update_imgstitch_mode_fields()
 
     def _build_config_page(self, parent: ttk.Frame) -> None:
-        parent.columnconfigure((0, 1, 2), weight=1, uniform="config_columns")
+        parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=1)
 
-        optical_panel = ttk.Frame(parent, style="Panel.TFrame", padding=16)
+        canvas = tk.Canvas(parent, bg=self.colors["bg"], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview, style="Slim.Vertical.TScrollbar")
+        content = ttk.Frame(canvas, style="App.TFrame")
+        content_window = canvas.create_window((0, 0), window=content, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        def _sync_scroll_region(_event: tk.Event | None = None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _sync_content_width(event: tk.Event) -> None:
+            canvas.itemconfigure(content_window, width=event.width)
+
+        def _scroll_config(event: tk.Event) -> str:
+            delta = getattr(event, "delta", 0)
+            if delta:
+                canvas.yview_scroll(int(-delta / 120), "units")
+            return "break"
+
+        content.bind("<Configure>", _sync_scroll_region)
+        canvas.bind("<Configure>", _sync_content_width)
+        canvas.bind("<MouseWheel>", _scroll_config)
+        content.bind("<MouseWheel>", _scroll_config)
+
+        content.columnconfigure((0, 1, 2), weight=1, uniform="config_columns")
+        content.rowconfigure(0, weight=1)
+
+        optical_panel = ttk.Frame(content, style="Panel.TFrame", padding=16)
         optical_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         optical_panel.columnconfigure(0, weight=1)
         optical_panel.columnconfigure(1, weight=1)
 
-        motion_panel = ttk.Frame(parent, style="Panel.TFrame", padding=16)
+        motion_panel = ttk.Frame(content, style="Panel.TFrame", padding=16)
         motion_panel.grid(row=0, column=1, sticky="nsew", padx=(4, 4))
         motion_panel.columnconfigure(0, weight=1)
         motion_panel.columnconfigure(1, weight=1)
 
-        system_panel = ttk.Frame(parent, style="Panel.TFrame", padding=16)
+        system_panel = ttk.Frame(content, style="Panel.TFrame", padding=16)
         system_panel.grid(row=0, column=2, sticky="nsew", padx=(8, 0))
         system_panel.columnconfigure((1, 2), weight=1, uniform="af_thresholds")
 
@@ -3224,8 +3424,8 @@ class ProbeApp(tk.Tk):
 
         main_control_panel = ttk.Frame(optical_panel, style="Panel.TFrame")
         main_control_panel.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(24, 0))
-        main_control_panel.columnconfigure(1, weight=1)
-        ttk.Label(main_control_panel, text="MAIN CONTROL", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        main_control_panel.columnconfigure((1, 3), weight=1, uniform="main_control_values")
+        ttk.Label(main_control_panel, text="MAIN CONTROL", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
         ttk.Label(main_control_panel, text="Motion keys", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
         keyboard_combo = ttk.Combobox(
             main_control_panel,
@@ -3233,32 +3433,49 @@ class ProbeApp(tk.Tk):
             textvariable=self.keyboard_motion_scheme_var,
             state="readonly",
         )
-        keyboard_combo.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=2)
+        keyboard_combo.grid(row=1, column=1, columnspan=3, sticky="ew", padx=(8, 0), pady=2)
         keyboard_combo.bind("<<ComboboxSelected>>", lambda _event: self.apply_config(save=True))
 
-        for row_index, axis in enumerate(JOG_STEP_AXES, start=2):
-            ttk.Label(main_control_panel, text=f"Alt+{axis} levels", style="Muted.TLabel").grid(row=row_index, column=0, sticky="w", pady=2)
-            self._jog_step_levels_entry(main_control_panel, self.jog_step_level_vars[axis]).grid(row=row_index, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+        jog_layout = (("X", 2, 0), ("Y", 2, 2), ("Z", 3, 0))
+        for axis, row_index, col in jog_layout:
+            ttk.Label(main_control_panel, text=f"Alt+{axis}", style="Muted.TLabel").grid(row=row_index, column=col, sticky="w", pady=2, padx=(0 if col == 0 else 8, 0))
+            self._jog_step_levels_entry(main_control_panel, self.jog_step_level_vars[axis]).grid(row=row_index, column=col + 1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
 
-        ttk.Label(main_control_panel, text="LayoutBond FOV W (um)", style="Muted.TLabel").grid(row=5, column=0, sticky="w", pady=(10, 2))
-        self._numeric_entry(main_control_panel, self.layoutbond_fov_width_var, kind="float", minimum=0.000001, maximum=1_000_000).grid(row=5, column=1, sticky="ew", padx=(8, 0), pady=(10, 2), ipady=5)
-        ttk.Label(main_control_panel, text="LayoutBond FOV H (um)", style="Muted.TLabel").grid(row=6, column=0, sticky="w", pady=2)
-        self._numeric_entry(main_control_panel, self.layoutbond_fov_height_var, kind="float", minimum=0.000001, maximum=1_000_000).grid(row=6, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+        ttk.Label(main_control_panel, text="FOV W (um)", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=(10, 2))
+        self._numeric_entry(main_control_panel, self.layoutbond_fov_width_var, kind="float", minimum=0.000001, maximum=1_000_000).grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=(10, 2), ipady=5)
+        ttk.Label(main_control_panel, text="FOV H (um)", style="Muted.TLabel").grid(row=4, column=2, sticky="w", pady=(10, 2), padx=(8, 0))
+        self._numeric_entry(main_control_panel, self.layoutbond_fov_height_var, kind="float", minimum=0.000001, maximum=1_000_000).grid(row=4, column=3, sticky="ew", padx=(8, 0), pady=(10, 2), ipady=5)
 
         camera_control_panel = ttk.Frame(optical_panel, style="Panel.TFrame")
         camera_control_panel.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(24, 0))
-        camera_control_panel.columnconfigure(1, weight=1)
+        camera_control_panel.columnconfigure((1, 3), weight=1, uniform="camera_control_values")
         camera_mode_values = [CAMERA_CONTROL_MODE_LABELS[mode] for mode in CAMERA_CONTROL_MODES]
-        ttk.Label(camera_control_panel, text="CAMERA CONTROL", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
-        ttk.Label(camera_control_panel, text="Exposure mode", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Label(camera_control_panel, text="CAMERA CONTROL", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        ttk.Label(camera_control_panel, text="Resolution", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
+        resolution_combo = ttk.Combobox(
+            camera_control_panel,
+            values=[CAMERA_RESOLUTION_LABELS[width] for width in CAMERA_RESOLUTION_WIDTHS],
+            textvariable=self.camera_resolution_var,
+            state="readonly",
+        )
+        resolution_combo.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=2)
+        ttk.Label(camera_control_panel, text="Target FPS", style="Muted.TLabel").grid(row=1, column=2, sticky="w", pady=2, padx=(8, 0))
+        fps_combo = ttk.Combobox(
+            camera_control_panel,
+            values=[str(value) for value in CAMERA_FRAME_RATE_OPTIONS],
+            textvariable=self.camera_target_fps_var,
+            state="readonly",
+        )
+        fps_combo.grid(row=1, column=3, sticky="ew", padx=(8, 0), pady=2)
+        ttk.Label(camera_control_panel, text="Exposure mode", style="Muted.TLabel").grid(row=2, column=0, sticky="w", pady=2)
         exposure_mode_combo = ttk.Combobox(
             camera_control_panel,
             values=camera_mode_values,
             textvariable=self.camera_exposure_mode_var,
             state="readonly",
         )
-        exposure_mode_combo.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=2)
-        ttk.Label(camera_control_panel, text="Exposure value", style="Muted.TLabel").grid(row=2, column=0, sticky="w", pady=2)
+        exposure_mode_combo.grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=2)
+        ttk.Label(camera_control_panel, text="Exposure value", style="Muted.TLabel").grid(row=2, column=2, sticky="w", pady=2, padx=(8, 0))
         self._numeric_entry(
             camera_control_panel,
             self.camera_exposure_var,
@@ -3266,7 +3483,7 @@ class ProbeApp(tk.Tk):
             minimum=-1_000_000,
             maximum=1_000_000,
             width=8,
-        ).grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+        ).grid(row=2, column=3, sticky="ew", padx=(8, 0), pady=2, ipady=5)
         ttk.Label(camera_control_panel, text="Gain mode", style="Muted.TLabel").grid(row=3, column=0, sticky="w", pady=2)
         gain_mode_combo = ttk.Combobox(
             camera_control_panel,
@@ -3275,7 +3492,7 @@ class ProbeApp(tk.Tk):
             state="readonly",
         )
         gain_mode_combo.grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=2)
-        ttk.Label(camera_control_panel, text="Gain value", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=2)
+        ttk.Label(camera_control_panel, text="Gain value", style="Muted.TLabel").grid(row=3, column=2, sticky="w", pady=2, padx=(8, 0))
         self._numeric_entry(
             camera_control_panel,
             self.camera_gain_var,
@@ -3283,8 +3500,8 @@ class ProbeApp(tk.Tk):
             minimum=0,
             maximum=1_000_000,
             width=8,
-        ).grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
-        ttk.Button(camera_control_panel, text="Apply Camera", style="Accent.TButton", command=self.apply_camera_config).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ).grid(row=3, column=3, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+        ttk.Button(camera_control_panel, text="Apply Camera", style="Accent.TButton", command=self.apply_camera_config).grid(row=4, column=0, columnspan=4, sticky="ew", pady=(10, 0))
 
         ttk.Label(motion_panel, text="MOTOR MAPPING", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
 
@@ -3601,6 +3818,19 @@ class ProbeApp(tk.Tk):
                 return mode
         return normalize_camera_control_mode(label)
 
+    @staticmethod
+    def _camera_resolution_label(width: str) -> str:
+        normalized = normalize_camera_resolution_width(width)
+        return CAMERA_RESOLUTION_LABELS[normalized]
+
+    @staticmethod
+    def _camera_resolution_from_label(label: str) -> str:
+        normalized_label = label.strip().lower()
+        for width, width_label in CAMERA_RESOLUTION_LABELS.items():
+            if normalized_label == width_label.lower() or normalized_label == width:
+                return width
+        return normalize_camera_resolution_width(label)
+
     def _expected_admin_tokens(self) -> tuple[str, ...]:
         tokens: list[str] = []
         for variable_name in (ADMIN_TOKEN_ENV, WEB_ACCESS_TOKEN_ENV):
@@ -3713,6 +3943,22 @@ class ProbeApp(tk.Tk):
     def _cc_axis_param_for_logical_delta(self, axis: str | Axis, logical_delta: int, speed_profile: str | None = None) -> tuple[bool, int, int, int]:
         controller_delta = self._controller_delta_from_logical_delta(axis, logical_delta)
         return self._cc_axis_param(controller_delta < 0, abs(controller_delta), speed_profile)
+
+    def _move_relative_logical_axis(self, axis: str | Axis, logical_delta: int, speed_percent: int) -> tuple[bytes, int]:
+        assert self.serial_client is not None
+        axis_name = axis.name if isinstance(axis, Axis) else str(axis).upper()
+        controller_axis = axis if isinstance(axis, Axis) else self._controller_axis(axis_name)
+        if controller_axis is None:
+            raise ValueError(f"Unknown axis: {axis_name}")
+        controller_delta = self._controller_delta_from_logical_delta(axis_name, logical_delta)
+        pulses = abs(controller_delta)
+        command = self.serial_client.move_relative(
+            axis=controller_axis,
+            reverse=controller_delta < 0,
+            pulses=pulses,
+            speed_percent=speed_percent,
+        )
+        return command, pulses
 
     def _relative_move_args_for_logical_step(self, axis: str | Axis, reverse: bool, pulses: int) -> tuple[bool, int]:
         logical_delta = -int(pulses) if reverse else int(pulses)
@@ -4059,6 +4305,26 @@ class ProbeApp(tk.Tk):
         header = f"P6 {out_width} {out_height} 255\n".encode("ascii")
         return header + rgb.tobytes()
 
+    def _autofocus_preview_ppm(self, image_bgr) -> bytes:
+        import cv2
+
+        height, width = image_bgr.shape[:2]
+        scale = min(
+            AUTOFOCUS_PREVIEW_MAX_WIDTH / max(width, 1),
+            AUTOFOCUS_PREVIEW_MAX_HEIGHT / max(height, 1),
+            1.0,
+        )
+        preview = image_bgr
+        if scale < 1.0:
+            preview = cv2.resize(
+                image_bgr,
+                (max(1, int(width * scale)), max(1, int(height * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
+        out_height, out_width = rgb.shape[:2]
+        return f"P6 {out_width} {out_height} 255\n".encode("ascii") + rgb.tobytes()
+
     def apply_config(self, save: bool = True) -> bool:
         if self._cc_accel_time_change_pending() and not self._require_admin_mode("Change CC accel/decel"):
             self._sync_config_vars_from_config()
@@ -4091,6 +4357,8 @@ class ProbeApp(tk.Tk):
                 camera_gain_mode=self._camera_control_mode_from_label(self.camera_gain_mode_var.get()),
                 camera_gain=float(self.camera_gain_var.get() or 0.0),
                 camera_source=normalize_camera_source(self.camera_index_var.get()),
+                camera_resolution_width=self._camera_resolution_from_label(self.camera_resolution_var.get()),
+                camera_target_fps=normalize_camera_target_fps(self.camera_target_fps_var.get()),
                 cc_accel_time_s=float(self.cc_accel_time_var.get()),
                 autofocus_settle_ms=int(self.autofocus_settle_ms_var.get()),
                 autofocus_sample_count=int(self.autofocus_sample_count_var.get()),
@@ -4112,6 +4380,7 @@ class ProbeApp(tk.Tk):
                     for metric in ("Laplacian", "Tenengrad", "Brenner")
                 },
                 calibrations=dict(self.probe_config.calibrations),
+                calibration_resolution_widths=dict(self.probe_config.calibration_resolution_widths),
                 agent_api_key=self.agent_api_key_var.get(),
                 agent_base_url=self.agent_base_url_var.get() or DEFAULT_AGENT_BASE_URL,
                 agent_model=self.agent_model_var.get() or DEFAULT_AGENT_MODEL,
@@ -4184,6 +4453,8 @@ class ProbeApp(tk.Tk):
         self.camera_exposure_var.set(f"{self.probe_config.camera_exposure:g}")
         self.camera_gain_mode_var.set(self._camera_control_mode_label(self.probe_config.camera_gain_mode))
         self.camera_gain_var.set(f"{self.probe_config.camera_gain:g}")
+        self.camera_resolution_var.set(self._camera_resolution_label(self.probe_config.camera_resolution_width))
+        self.camera_target_fps_var.set(str(self.probe_config.camera_target_fps))
         self.camera_index_var.set(normalize_camera_source(self.probe_config.camera_source))
         self.cc_accel_time_var.set(f"{self.probe_config.cc_accel_time_s:g}")
         self.autofocus_settle_ms_var.set(str(self.probe_config.autofocus_settle_ms))
@@ -4252,6 +4523,8 @@ class ProbeApp(tk.Tk):
             (
                 "Camera: "
                 f"source {self.probe_config.camera_source}, "
+                f"resolution {self.probe_config.camera_resolution_width}px, "
+                f"target {self.probe_config.camera_target_fps} FPS, "
                 f"exposure {self._camera_control_mode_label(self.probe_config.camera_exposure_mode)} "
                 f"{self.probe_config.camera_exposure:g}, "
                 f"gain {self._camera_control_mode_label(self.probe_config.camera_gain_mode)} "
@@ -4290,7 +4563,12 @@ class ProbeApp(tk.Tk):
             return
 
         try:
-            self.probe_config.set_calibration(self.probe_config.objective, self.probe_config.eyepiece, dialog.result_um_per_px)
+            self.probe_config.set_calibration(
+                self.probe_config.objective,
+                self.probe_config.eyepiece,
+                dialog.result_um_per_px,
+                self.probe_config.camera_resolution_width,
+            )
             derive_missing_calibrations(self.probe_config)
             save_probe_config(self.probe_config, self.config_path)
         except Exception as exc:
@@ -5434,12 +5712,12 @@ class ProbeApp(tk.Tk):
         reached_wait_seconds: float | None = None
         if delta:
             speed_percent = self._motion_speed_percent()
-            command = self.serial_client.move_relative(axis=Axis.Z, reverse=delta < 0, pulses=abs(delta), speed_percent=speed_percent)
+            command, move_pulses = self._move_relative_logical_axis(Axis.Z, delta, speed_percent)
             command_hex = hex_bytes(command)
             self.result_queue.put(("motor_command", "Z", "autofocus", command, source))
             self.result_queue.put(("moving",))
             reached_start = time.monotonic()
-            reached = self.serial_client.wait_axis_reached(Axis.Z, timeout=self._axis_move_timeout(abs(delta), speed_percent))
+            reached = self.serial_client.wait_axis_reached(Axis.Z, timeout=self._axis_move_timeout(move_pulses, speed_percent))
             reached_wait_seconds = time.monotonic() - reached_start
             reached_hex = hex_bytes(reached)
             logger.info("AutoFocus Z reached feedback: %s", colorize_hex_frame(reached_hex, "RX"))
@@ -6844,14 +7122,10 @@ class ProbeApp(tk.Tk):
 
             delta = target_z - current_z
             speed_percent = self._motion_speed_percent()
-            if target_z >= 0:
-                command = self.serial_client.move_absolute(axis=Axis.Z, target_position=target_z, speed_percent=speed_percent)
-                action = "focusmap absolute"
-            else:
-                command = self.serial_client.move_relative(axis=Axis.Z, reverse=delta < 0, pulses=abs(delta), speed_percent=speed_percent)
-                action = "focusmap relative"
+            command, move_pulses = self._move_relative_logical_axis(Axis.Z, delta, speed_percent)
+            action = "focusmap relative"
             self.result_queue.put(("motor_command", "Z", action, command, "focusmap"))
-            reached = self.serial_client.wait_axis_reached(Axis.Z, timeout=self._axis_move_timeout(abs(delta), speed_percent))
+            reached = self.serial_client.wait_axis_reached(Axis.Z, timeout=self._axis_move_timeout(move_pulses, speed_percent))
             self.result_queue.put(("axis_done", "Z", reached, "focusmap"))
             entries = self.serial_client.read_stable_xyz_positions()
             self.result_queue.put(("read_positions", entries, "focusmap", {"Z": target_z}))
@@ -7273,7 +7547,7 @@ class ProbeApp(tk.Tk):
                     entries,
                     polyline.start,
                     "travel",
-                    MOTOR_SPEED_PROFILE_FAST,
+                    MOTOR_SPEED_PROFILE_SAFE,
                     move_label=f"Move to start path {polyline_number}",
                 )
             elif action == EDGE_TRACE_ACTION_CONTACT:
@@ -7295,7 +7569,7 @@ class ProbeApp(tk.Tk):
                         entries,
                         next_polyline.start,
                         "travel",
-                        MOTOR_SPEED_PROFILE_FAST,
+                        MOTOR_SPEED_PROFILE_SAFE,
                         move_label=f"Move to start path {next_number}",
                     )
                     if self.edge_trace_stop_event.is_set():
@@ -7365,9 +7639,7 @@ class ProbeApp(tk.Tk):
             return self.serial_client.read_stable_xyz_positions()
 
         speed_percent = self._motion_speed_percent(MOTOR_SPEED_PROFILE_SAFE)
-        controller_delta = self._controller_delta_from_logical_delta("Z", delta)
-        pulses = abs(controller_delta)
-        command = self.serial_client.move_relative(axis=Axis.Z, reverse=controller_delta < 0, pulses=pulses, speed_percent=speed_percent)
+        command, pulses = self._move_relative_logical_axis(Axis.Z, delta, speed_percent)
         self.result_queue.put(("motor_command", "Z", f"edge_trace {move_label} {MOTOR_SPEED_PROFILE_SAFE}", command, "edge_trace"))
         reached = self.serial_client.wait_axis_reached(Axis.Z, timeout=self._axis_move_timeout(pulses, speed_percent))
         self.result_queue.put(("axis_done", "Z", reached, "edge_trace"))
@@ -7578,7 +7850,7 @@ class ProbeApp(tk.Tk):
     @staticmethod
     def _autotest_requires_session_dir(settings: AutoTestSettings) -> bool:
         flow_types = {step.type_id for step in settings.measurement_flow}
-        return "photo" in settings.measurement_steps or bool({"photo", "iv", "wobb_test"} & flow_types)
+        return "photo" in settings.measurement_steps or bool({"photo", "iv", "wobb_test", "b1500_transfer", "b1500_output"} & flow_types)
 
     def stop_autotest(self) -> None:
         self.autotest_stop_event.set()
@@ -7598,6 +7870,7 @@ class ProbeApp(tk.Tk):
         (session_dir / "images").mkdir(parents=True, exist_ok=False)
         (session_dir / "iv").mkdir(parents=True, exist_ok=True)
         (session_dir / "wobb").mkdir(parents=True, exist_ok=True)
+        (session_dir / "b1500").mkdir(parents=True, exist_ok=True)
         return session_dir
 
     def _autotest_worker(self, settings: AutoTestSettings, points: tuple[AutoTestPoint, ...], session_dir: Path | None) -> None:
@@ -7691,15 +7964,15 @@ class ProbeApp(tk.Tk):
         fast_ratio = max(0.0, min(100.0, float(fast_percent))) / 100.0
         fast_pulses = int(round(total_pulses * fast_ratio))
         slow_pulses = total_pulses - fast_pulses
-        reverse = delta < 0
         for pulses, speed_percent in (
             (fast_pulses, max(0, min(100, int(fast_speed_percent)))),
             (slow_pulses, max(0, min(100, int(slow_speed_percent)))),
         ):
             if pulses <= 0 or self.autotest_stop_event.is_set():
                 continue
-            self.serial_client.move_relative(axis=Axis.Z, reverse=reverse, pulses=pulses, speed_percent=speed_percent)
-            self.serial_client.wait_axis_reached(Axis.Z, timeout=self._axis_move_timeout(pulses, speed_percent))
+            step_delta = -pulses if delta < 0 else pulses
+            _command, move_pulses = self._move_relative_logical_axis(Axis.Z, step_delta, speed_percent)
+            self.serial_client.wait_axis_reached(Axis.Z, timeout=self._axis_move_timeout(move_pulses, speed_percent))
         entries = self.serial_client.read_stable_xyz_positions()
         self.result_queue.put(("read_positions", entries, "autotest"))
         return entries
@@ -7720,8 +7993,8 @@ class ProbeApp(tk.Tk):
                 continue
             label = "offset" if offset_pulses and target_z == targets[-1] else "wobble"
             self.result_queue.put(("autotest_status", f"AutoTest Z {label}: target {int(target_z)}."))
-            self.serial_client.move_relative(axis=Axis.Z, reverse=delta < 0, pulses=abs(delta), speed_percent=slow_speed)
-            self.serial_client.wait_axis_reached(Axis.Z, timeout=self._axis_move_timeout(abs(delta), slow_speed))
+            _command, move_pulses = self._move_relative_logical_axis(Axis.Z, delta, slow_speed)
+            self.serial_client.wait_axis_reached(Axis.Z, timeout=self._axis_move_timeout(move_pulses, slow_speed))
             current_z = int(target_z)
         entries = self.serial_client.read_stable_xyz_positions()
         self.result_queue.put(("read_positions", entries, "autotest"))
@@ -7750,7 +8023,8 @@ class ProbeApp(tk.Tk):
                 "photo": "Photo",
                 "iv": "IV",
                 "wobb_test": "WobbTest",
-                "transfer": "Transfer",
+                "b1500_transfer": "B1500 Transfer",
+                "b1500_output": "B1500 Output",
                 "it": "IT",
                 "light_control": "Light",
                 "light_pulse": "Light pulse",
@@ -7789,6 +8063,14 @@ class ProbeApp(tk.Tk):
             return
         if step.type_id == "wobb_test":
             self._run_autotest_wobb_test(point, settings, params, session_dir)
+            return
+        if step.type_id == "b1500_transfer":
+            config = b1500_config_from_params(params, test_type=B1500_TEST_TRANSFER)
+            self._run_autotest_b1500_sweep(point, settings, config, session_dir)
+            return
+        if step.type_id == "b1500_output":
+            config = b1500_config_from_params(params, test_type=B1500_TEST_OUTPUT)
+            self._run_autotest_b1500_sweep(point, settings, config, session_dir)
             return
         self.result_queue.put(("autotest_status", f"{step.type_id} step placeholder at {point.name}."))
 
@@ -7961,8 +8243,8 @@ class ProbeApp(tk.Tk):
         assert self.serial_client is not None
         delta = int(target_z) - int(current_z)
         if delta:
-            self.serial_client.move_relative(axis=Axis.Z, reverse=delta < 0, pulses=abs(delta), speed_percent=speed_percent)
-            self.serial_client.wait_axis_reached(Axis.Z, timeout=self._axis_move_timeout(abs(delta), speed_percent))
+            _command, move_pulses = self._move_relative_logical_axis(Axis.Z, delta, speed_percent)
+            self.serial_client.wait_axis_reached(Axis.Z, timeout=self._axis_move_timeout(move_pulses, speed_percent))
         entries = self.serial_client.read_stable_xyz_positions()
         self.result_queue.put(("read_positions", entries, "autotest", {"Z": int(target_z)}))
         return entries
@@ -8118,6 +8400,109 @@ class ProbeApp(tk.Tk):
             self._write_iv_samples_csv(output_path, point, config, samples, statistics)
         self.result_queue.put(("iv_done", point.name, len(samples), output_path, statistics.to_dict(), point.row, point.col, settings.rows, settings.cols))
 
+    def _run_autotest_b1500_sweep(self, point: AutoTestPoint, settings: AutoTestSettings, config: B1500SweepConfig, session_dir: Path | None) -> None:
+        if session_dir is None:
+            raise RuntimeError("AutoTest B1500 session directory is unavailable.")
+        device_name = config.device_name.replace("{point}", point.name).replace("{row}", str(point.row)).replace("{col}", str(point.col)).replace("{order}", str(point.order))
+        config = B1500SweepConfig(
+            test_type=config.test_type,
+            resource_name=config.resource_name,
+            device_name=device_name,
+            experiment=config.experiment,
+            sample=config.sample,
+            save_mode=config.save_mode,
+            drain_smu=config.drain_smu,
+            gate_smu=config.gate_smu,
+            measure_gate_leak=config.measure_gate_leak,
+            abort_on_compliance=config.abort_on_compliance,
+            sweep_start_v=config.sweep_start_v,
+            sweep_end_v=config.sweep_end_v,
+            sweep_points=config.sweep_points,
+            bias_values_v=config.bias_values_v,
+            drain_current_compliance_a=config.drain_current_compliance_a,
+            gate_current_compliance_a=config.gate_current_compliance_a,
+            avg_coefficient=config.avg_coefficient,
+            step_delay_s=config.step_delay_s,
+            pre_settle_s=config.pre_settle_s,
+            post_sweep_pause_s=config.post_sweep_pause_s,
+            measurement_adc=config.measurement_adc,
+            high_speed_nplc=config.high_speed_nplc,
+            high_resolution_nplc=config.high_resolution_nplc,
+            autozero=config.autozero,
+        ).normalized()
+        label = "B1500 Transfer" if config.test_type == B1500_TEST_TRANSFER else "B1500 Output"
+        self.result_queue.put(("b1500_started", point.name, config))
+        self.result_queue.put(("autotest_status", f"{label} started at {point.name}: {config.summary()}"))
+        runner = KeysightB1500Runner()
+
+        def handle_curve(payload: dict[str, object]) -> None:
+            self.result_queue.put(("b1500_curve", point.name, dict(payload)))
+            self.result_queue.put(
+                (
+                    "autotest_status",
+                    f"{label} curve {payload.get('curve_index')}/{payload.get('curve_total')} at {point.name}: bias {payload.get('bias_v')} V, {payload.get('points')} point(s).",
+                )
+            )
+
+        output_dir = session_dir / "b1500" / self._safe_autotest_name(point.name)
+        result = runner.run(
+            config,
+            output_dir,
+            stop_requested=self.autotest_stop_event.is_set,
+            on_curve=handle_curve,
+        )
+        metadata_path = output_dir / f"{self._safe_autotest_name(device_name)}_{config.test_type}.json"
+        metadata_path.write_text(
+            json.dumps(
+                {
+                    "format": "semi_auto_probe.autotest_result_metadata",
+                    "version": 1,
+                    "result_type": f"b1500_{config.test_type}",
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "device": {"name": point.name, "order": point.order, "row": point.row, "col": point.col},
+                    "coordinates": {"gds": {"u": point.u, "v": point.v}, "stage_um": {"x": point.stage_x_um, "y": point.stage_y_um}},
+                    "measurement": {
+                        "resource": config.resource_name,
+                        "device_name": config.device_name,
+                        "experiment": config.experiment,
+                        "sample": config.sample,
+                        "save_mode": config.save_mode,
+                        "drain_smu": config.drain_smu,
+                        "gate_smu": config.gate_smu,
+                        "measure_gate_leak": config.measure_gate_leak,
+                        "abort_on_compliance": config.abort_on_compliance,
+                        "sweep_start_v": config.sweep_start_v,
+                        "sweep_end_v": config.sweep_end_v,
+                        "sweep_points": config.sweep_points,
+                        "bias_values_v": list(config.bias_values_v),
+                        "drain_current_compliance_a": config.drain_current_compliance_a,
+                        "gate_current_compliance_a": config.gate_current_compliance_a,
+                        "staircase_nplc": abs(config.avg_coefficient) if config.avg_coefficient < 0 else None,
+                        "step_delay_s": config.step_delay_s,
+                        "pre_settle_s": config.pre_settle_s,
+                        "post_sweep_pause_s": config.post_sweep_pause_s,
+                        "measurement_adc": config.measurement_adc,
+                        "autozero": config.autozero,
+                    },
+                    "result": result.to_dict(),
+                    "csv_files": [path.name for path in result.output_paths],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        saved = ", ".join(path.name for path in result.output_paths[:3])
+        if len(result.output_paths) > 3:
+            saved += f", +{len(result.output_paths) - 3} more"
+        message = f"{label} completed at {point.name}: {result.curve_count} curve(s), {result.sample_count} sample(s)"
+        if saved:
+            message += f"; saved {saved}"
+        message += "."
+        self.result_queue.put(("b1500_done", point.name, message))
+        self.result_queue.put(("autotest_status", message))
+
     @staticmethod
     def _write_iv_samples_csv(output_path: Path, point: AutoTestPoint, config: IVSweepConfig, samples: list[IVSweepSample], statistics: IVSweepStatistics) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -8182,9 +8567,6 @@ class ProbeApp(tk.Tk):
                 "nplc": config.nplc,
                 "output_statistics": config.output_statistics,
                 "resistance_method": config.resistance_method,
-                "device_length_um": config.device_length_um,
-                "device_width_um": config.device_width_um,
-                "film_thickness_nm": config.film_thickness_nm,
                 "output_off_after": config.output_off_after,
             },
             "statistics": statistics.to_dict(),
@@ -8236,6 +8618,50 @@ class ProbeApp(tk.Tk):
         centers_text = "; ".join(center_parts) if center_parts else "no reliable green-edge center"
         return f"Edges G/Y/R {counts['good']}/{counts['warning']}/{counts['bad']}; {centers_text}; {correction_state}."
 
+    def _set_imgstitch_full_image(self, image_bgr, output_path: Path | None = None) -> None:
+        self.imgstitch_full_image_bgr = image_bgr.copy()
+        if output_path is not None:
+            self.imgstitch_last_output_path = output_path
+
+    def save_imgstitch_full_image(self) -> None:
+        source_path = self.imgstitch_last_output_path if self.imgstitch_last_output_path and self.imgstitch_last_output_path.exists() else self._latest_stitch_image_path()
+        if self.imgstitch_full_image_bgr is None and source_path is None:
+            self.imgstitch_status_var.set("No stitched image to save.")
+            return
+        initialfile = source_path.name if source_path is not None else "imgstitch_full.png"
+        initialdir = str(source_path.parent) if source_path is not None else str(Path.cwd())
+        output = filedialog.asksaveasfilename(
+            title="Save ImgStitch Full Image",
+            initialdir=initialdir,
+            initialfile=initialfile,
+            defaultextension=".png",
+            filetypes=(
+                ("PNG image", "*.png"),
+                ("TIFF image", "*.tif *.tiff"),
+                ("JPEG image", "*.jpg *.jpeg"),
+                ("All files", "*.*"),
+            ),
+        )
+        if not output:
+            return
+        output_path = Path(output)
+        try:
+            if self.imgstitch_full_image_bgr is not None:
+                import cv2
+
+                if not cv2.imwrite(str(output_path), self.imgstitch_full_image_bgr):
+                    raise OSError(f"OpenCV could not write {output_path}")
+            elif source_path is not None:
+                if output_path.resolve() != source_path.resolve():
+                    shutil.copyfile(source_path, output_path)
+            self.imgstitch_last_output_path = output_path
+        except Exception as exc:
+            self.imgstitch_status_var.set(f"Save failed: {exc}")
+            self.status_var.set(f"ImgStitch save failed: {exc}")
+            return
+        self.imgstitch_status_var.set(f"Saved {output_path.name}")
+        self.status_var.set(f"ImgStitch saved: {output_path}")
+
     def recompose_imgstitch_session(self) -> None:
         if self.imgstitch_session is None:
             self.imgstitch_status_var.set("No captured session to recompose.")
@@ -8266,7 +8692,7 @@ class ProbeApp(tk.Tk):
             import cv2
 
             cv2.imwrite(str(self.imgstitch_session_dir / "recomposed_imgstitch.png"), display)
-            self.result_queue.put(("imgstitch_recompose_done", display, positions, edges, self._imgstitch_displacement_status(edges, settings.use_green_edge_correction)))
+            self.result_queue.put(("imgstitch_recompose_done", display, mosaic, positions, edges, self._imgstitch_displacement_status(edges, settings.use_green_edge_correction)))
         except Exception as exc:
             self.result_queue.put(("imgstitch_recompose_error", exc))
 
@@ -8480,6 +8906,8 @@ class ProbeApp(tk.Tk):
         self.imgstitch_latest_positions = {}
         self.imgstitch_latest_edges = []
         self.imgstitch_quality_var.set("No seam data")
+        self.imgstitch_full_image_bgr = None
+        self.imgstitch_last_output_path = None
         self.imgstitch_status_var.set(f"Running: X {step_x_um:g} um -> {step_x} pulse, Y {step_y_um:g} um -> {step_y} pulse")
         self.status_var.set(f"ImgStitch running: X {step_x_um:g} um -> {step_x} pulse, Y {step_y_um:g} um -> {step_y} pulse.")
         self.imgstitch_thread = threading.Thread(
@@ -8533,6 +8961,8 @@ class ProbeApp(tk.Tk):
         self.imgstitch_progress_current = 0
         self.imgstitch_progress_total = 1
         self.imgstitch_stop_event.clear()
+        self.imgstitch_full_image_bgr = None
+        self.imgstitch_last_output_path = None
         self.imgstitch_status_var.set(f"Running {mode}")
         self.status_var.set(f"ImgStitch {mode} running.")
         self.imgstitch_thread = threading.Thread(
@@ -8671,7 +9101,7 @@ class ProbeApp(tk.Tk):
                 session.save(self.imgstitch_session_dir / "session.json")
                 mosaic, positions, edges = recompose_session(session, settings, tiles)
                 display = build_seam_quality_overlay(mosaic, positions, edges, (session.tile_width, session.tile_height)) if settings.show_seams else mosaic
-                self.result_queue.put(("imgstitch_preview", display, session, dict(tiles), positions, edges))
+                self.result_queue.put(("imgstitch_preview", display, session, dict(tiles), positions, edges, mosaic))
                 self.result_queue.put(("imgstitch_status", f"Tile {index}/{rows * cols}, step X {step_x_um:g} um/{step_x} pulse Y {step_y_um:g} um/{step_y} pulse"))
             if tiles and not self.imgstitch_stop_event.is_set():
                 assert session is not None
@@ -8680,7 +9110,7 @@ class ProbeApp(tk.Tk):
 
                 cv2.imwrite(str(output_path), mosaic)
                 cv2.imwrite(str(self.imgstitch_session_dir / "last_imgstitch.png"), mosaic)
-                self.result_queue.put(("imgstitch_done", output_path))
+                self.result_queue.put(("imgstitch_done", output_path, mosaic))
             elif self.imgstitch_stop_event.is_set():
                 self.result_queue.put(("imgstitch_status", "Stopped"))
         except Exception as exc:
@@ -9716,6 +10146,17 @@ class ProbeApp(tk.Tk):
             self.wobb_test_plot_window = WobbTestPlotWindow(self, self.colors)
         return self.wobb_test_plot_window
 
+    def _ensure_b1500_plot_window(self) -> B1500PlotWindow:
+        if self.b1500_plot_window is None:
+            self.b1500_plot_window = B1500PlotWindow(self, self.colors)
+            return self.b1500_plot_window
+        try:
+            if not self.b1500_plot_window.window.winfo_exists():
+                self.b1500_plot_window = B1500PlotWindow(self, self.colors)
+        except tk.TclError:
+            self.b1500_plot_window = B1500PlotWindow(self, self.colors)
+        return self.b1500_plot_window
+
     def _poll_result_queue(self) -> None:
         started_at = time.monotonic()
         processed = 0
@@ -10196,16 +10637,21 @@ class ProbeApp(tk.Tk):
                 self.imgstitch_latest_edges = event[5]
                 self.imgstitch_quality_var.set(self._imgstitch_quality_summary(self.imgstitch_latest_edges))
                 self.imgstitch_status_var.set(self._imgstitch_displacement_status(self.imgstitch_latest_edges))
+            if len(event) >= 7:
+                self._set_imgstitch_full_image(event[6])
+            elif len(event) == 2:
+                self._set_imgstitch_full_image(mosaic)
             self._show_imgstitch_preview(mosaic)
             return
 
         if event_type == "imgstitch_recompose_done":
-            _, mosaic, positions, edges, status = event
+            _, mosaic, full_image, positions, edges, status = event
             self.imgstitch_recompose_running = False
             if self.imgstitch_recompose_button is not None:
                 self.imgstitch_recompose_button.configure(state="normal", text="Apply and Recalculate")
             self.imgstitch_latest_positions = positions
             self.imgstitch_latest_edges = edges
+            self._set_imgstitch_full_image(full_image)
             self.imgstitch_quality_var.set(self._imgstitch_quality_summary(edges))
             self.imgstitch_status_var.set(str(status))
             self.status_var.set("ImgStitch recalculated.")
@@ -10223,7 +10669,11 @@ class ProbeApp(tk.Tk):
             return
 
         if event_type == "imgstitch_done":
-            _, output_path = event
+            _, output_path, *image_payload = event
+            if image_payload:
+                self._set_imgstitch_full_image(image_payload[0], output_path)
+            else:
+                self.imgstitch_last_output_path = output_path
             self.imgstitch_status_var.set(f"Saved {output_path.name}")
             self.status_var.set(f"ImgStitch saved: {output_path}")
             self._set_agent_status(f"ImgStitch saved: {output_path}")
@@ -10417,8 +10867,6 @@ class ProbeApp(tk.Tk):
             message = f"IV completed at {point_name}: {count} sample(s){suffix}."
             if statistics is not None and _finite_number(statistics.get("resistance_ohm")):
                 message += f" R={float(statistics['resistance_ohm']):.6g} ohm."
-            if statistics is not None and _finite_number(statistics.get("resistivity_ohm_cm")):
-                message += f" rho={float(statistics['resistivity_ohm_cm']):.6g} ohm cm."
             self._ensure_iv_plot_window().finish(message)
             if self.autotest_panel is not None:
                 self.autotest_panel.set_status(message)
@@ -10452,6 +10900,29 @@ class ProbeApp(tk.Tk):
                 self.autotest_panel.set_status(str(message))
             self.status_var.set(str(message))
             logger.info("WobbTest completed at %s: %s", point_name, message)
+            return
+
+        if event_type == "b1500_started":
+            _, point_name, config = event
+            if isinstance(config, B1500SweepConfig):
+                self._ensure_b1500_plot_window().start(str(point_name), config)
+                self.status_var.set(f"B1500 started at {point_name}.")
+            return
+
+        if event_type == "b1500_curve":
+            _, point_name, payload = event
+            if isinstance(payload, dict):
+                self._ensure_b1500_plot_window().add_curve(payload)
+                self.status_var.set(f"B1500 curve {payload.get('curve_index')}/{payload.get('curve_total')} at {point_name}.")
+            return
+
+        if event_type == "b1500_done":
+            _, point_name, message = event
+            self._ensure_b1500_plot_window().finish(str(message))
+            if self.autotest_panel is not None:
+                self.autotest_panel.set_status(str(message))
+            self.status_var.set(str(message))
+            logger.info("B1500 completed at %s: %s", point_name, message)
             return
 
         if event_type == "autotest_status":
@@ -10611,10 +11082,19 @@ class ProbeApp(tk.Tk):
         self.latest_panel_preview_source_at = 0.0
         self.probe_config.camera_source = source
         self.camera_index_var.set(source)
-        self.camera = UsbCamera(index=0, source=source, width=800, height=450, settings=self._camera_settings_from_config())
+        camera_width, camera_height = camera_resolution_dimensions(self.probe_config.camera_resolution_width)
+        camera_fps = float(self.probe_config.camera_target_fps)
+        self.camera = UsbCamera(
+            index=0,
+            source=source,
+            width=camera_width,
+            height=camera_height,
+            target_fps=camera_fps,
+            settings=self._camera_settings_from_config(),
+        )
         self.camera_running = True
         self.camera_rendering = True
-        logger.info("Starting USB camera preview from source %s.", source)
+        logger.info("Starting USB camera preview from source %s at %sx%s, target %.1f FPS.", source, camera_width, camera_height, camera_fps)
         self.camera_thread = threading.Thread(target=self._camera_worker, args=(session_id, self.camera), daemon=True)
         self.camera_thread.start()
         self._update_camera_frame()
@@ -10694,7 +11174,7 @@ class ProbeApp(tk.Tk):
                 self.vision_panel.set_image_bgr(self._bgr_with_scalebar(frame.image_bgr))
                 self.camera_image = self.vision_panel.photo
             with self.focus_lock:
-                self.latest_focus_frame_ppm = frame.ppm_bytes
+                self.latest_focus_frame_ppm = self._autofocus_preview_ppm(frame.image_bgr)
             with self.camera_lock:
                 self.latest_stitch_frame = frame.image_bgr
                 self.latest_stitch_frame_captured_at = frame.captured_at
@@ -10703,7 +11183,7 @@ class ProbeApp(tk.Tk):
                 self.focusmap_realtime_bgr = frame.image_bgr.copy()
                 self._draw_focusmap_realtime()
             if self._should_update_autofocus_preview() and hasattr(self, "autofocus_video_label") and not self.autofocus_running:
-                self.autofocus_camera_image = tk.PhotoImage(data=frame.ppm_bytes, format="PPM")
+                self.autofocus_camera_image = tk.PhotoImage(data=self._autofocus_preview_ppm(frame.image_bgr), format="PPM")
                 self.autofocus_video_label.configure(image=self.autofocus_camera_image, text="")
             if self._should_update_imgstitch_preview() and hasattr(self, "imgstitch_live_label") and not self.imgstitch_running:
                 import cv2

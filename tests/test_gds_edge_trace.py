@@ -407,7 +407,7 @@ class EdgeTraceAppBridgeTests(unittest.TestCase):
         app = self._app_shell(mapper)
         app.probe_down_var = DummyBool(True)
         app.serial_client = FakeEdgeTraceSerial(x=100, y=100, z=120)
-        app.probe_config = DummyProbeConfig()
+        app.probe_config = DummyProbeConfig(speed_by_profile={MOTOR_SPEED_PROFILE_FAST: 80, MOTOR_SPEED_PROFILE_SAFE: 12})
         app.current_position_values = {"X": 100, "Y": 100, "Z": 120}
         app.result_queue = queue.Queue()
         app._gds_mapper_focus_z_um = lambda _x, _y: 100.0
@@ -416,6 +416,7 @@ class EdgeTraceAppBridgeTests(unittest.TestCase):
         ProbeApp._edge_trace_action_worker(app, plan, EDGE_TRACE_ACTION_START, 0)
 
         self.assertEqual(app.serial_client.positions[Axis.Z], 95)
+        self.assertEqual(app.serial_client.moves[-1][Axis.X][2], 12)
         self.assertFalse(any(move[0] in {Axis.X, Axis.Y} for move in app.serial_client.relative_moves))
 
     def test_auto_multi_segment_uses_edge_trace_waits_without_coordinate_reset(self) -> None:

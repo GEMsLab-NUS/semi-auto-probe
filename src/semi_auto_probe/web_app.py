@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .camera import DEFAULT_CAMERA_SOURCE, UsbCamera, camera_source_choices, normalize_camera_source
-from .monitor_feed import publisher_url
+from .monitor_feed import DEFAULT_PUBLISHER_FPS, PUBLISHER_FPS_ENV, publisher_url
 from .protocol import hex_bytes
 from .serial_client import ControllerSerialClient, list_serial_ports
 
@@ -271,10 +271,10 @@ class WebProbeService:
                     if shared_frame is not None:
                         self.release_direct_camera()
                         yield self._mjpeg_part(shared_frame)
-                        time.sleep(1.0)
+                        time.sleep(1.0 / self._desktop_camera_fps())
                         continue
                     if selected == "desktop":
-                        time.sleep(1.0)
+                        time.sleep(1.0 / self._desktop_camera_fps())
                         continue
 
                 direct_source = self._direct_source_for_selected_source(selected)
@@ -398,6 +398,13 @@ class WebProbeService:
             return max(1.0, float(os.environ.get(DIRECT_CAMERA_FPS_ENV, str(DEFAULT_DIRECT_CAMERA_FPS))))
         except ValueError:
             return DEFAULT_DIRECT_CAMERA_FPS
+
+    @staticmethod
+    def _desktop_camera_fps() -> float:
+        try:
+            return max(1.0, float(os.environ.get(PUBLISHER_FPS_ENV, str(DEFAULT_PUBLISHER_FPS))))
+        except ValueError:
+            return DEFAULT_PUBLISHER_FPS
 
     @staticmethod
     def _read_published_frame(timeout_seconds: float = 1.0) -> bytes | None:

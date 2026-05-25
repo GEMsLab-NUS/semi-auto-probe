@@ -11,6 +11,7 @@ from semi_auto_probe.camera import (
     camera_source_choices,
     normalize_camera_source,
 )
+from semi_auto_probe.config import ProbeConfig, camera_resolution_dimensions, normalize_camera_target_fps
 from semi_auto_probe.web_app import WebProbeService
 
 
@@ -60,6 +61,13 @@ class CameraSourceTest(unittest.TestCase):
         normalized = camera._normalize_frame(frame)
 
         self.assertEqual(normalized.shape[:2], (450, 800))
+
+    def test_config_accepts_camera_resolution_and_frame_rate(self) -> None:
+        config = ProbeConfig(camera_resolution_width="648", camera_target_fps=30)
+        config.validate()
+
+        self.assertEqual(camera_resolution_dimensions(config.camera_resolution_width), (648, 486))
+        self.assertEqual(normalize_camera_target_fps(config.camera_target_fps), 30)
 
 
 class WebCameraSourceTest(unittest.TestCase):

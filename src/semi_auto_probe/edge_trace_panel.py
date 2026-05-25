@@ -22,6 +22,8 @@ EDGE_TRACE_ACTIONS = {
     EDGE_TRACE_ACTION_SEGMENT,
     EDGE_TRACE_ACTION_AUTO,
 }
+EDGE_TRACE_PREVIEW_INTERVAL_MS = 45
+EDGE_TRACE_CURRENT_NEEDLE_TOLERANCE_UM = 0.05
 
 
 class EdgeTraceCanvasViewer(GDSCanvasViewer):
@@ -56,11 +58,12 @@ class EdgeTraceCanvasViewer(GDSCanvasViewer):
         self.completed_polyline_count = 0
         self.current_polyline_index = None
         self.needle_gds = None
-        self._draw_overlay_items()
+        self._draw_edge_static_overlay()
+        self._draw_edge_needle_overlay()
 
     def set_work_bounds(self, bounds: tuple[float, float, float, float] | None) -> None:
         self.work_bounds = normalize_work_bounds(bounds) if bounds is not None else None
-        self._draw_overlay_items()
+        self._draw_edge_static_overlay()
 
     def set_edge_progress(
         self,
@@ -72,33 +75,34 @@ class EdgeTraceCanvasViewer(GDSCanvasViewer):
         self.completed_polyline_count = max(0, int(completed_polyline_count))
         self.current_polyline_index = current_polyline_index
         self.needle_gds = needle_gds
-        self._draw_overlay_items()
+        self._draw_edge_static_overlay()
+        self._draw_edge_needle_overlay()
 
     def set_current_needle_gds(self, point: tuple[float, float] | None) -> None:
-        if _same_optional_point(self.current_needle_gds, point):
+        if _same_optional_point(self.current_needle_gds, point, tolerance=EDGE_TRACE_CURRENT_NEEDLE_TOLERANCE_UM):
             return
         self.current_needle_gds = point
-        self._draw_overlay_items()
+        self._draw_edge_needle_overlay()
 
     def set_range_pick_mode(self, active: bool) -> None:
         self.range_pick_active = bool(active)
         self.range_drag_start_gds = None
         self.range_drag_current_gds = None
         self.canvas.configure(cursor="tcross" if active else "crosshair")
-        self._draw_overlay_items()
+        self._draw_edge_static_overlay()
 
     def _on_button_press(self, event: tk.Event) -> str:
         if self.range_pick_active and self.model is not None:
             self.range_drag_start_gds = self._event_gds(event)
             self.range_drag_current_gds = self.range_drag_start_gds
-            self._draw_overlay_items()
+            self._draw_edge_static_overlay()
             return "break"
         return super()._on_button_press(event)
 
     def _on_drag(self, event: tk.Event) -> str:
         if self.range_pick_active and self.model is not None and self.range_drag_start_gds is not None:
             self.range_drag_current_gds = self._event_gds(event)
-            self._draw_overlay_items()
+            self._draw_edge_static_overlay()
             return "break"
         return super()._on_drag(event)
 
@@ -144,10 +148,20 @@ class EdgeTraceCanvasViewer(GDSCanvasViewer):
 
     def _draw_overlay_items(self) -> None:
         super()._draw_overlay_items()
+        self._draw_edge_static_overlay()
+        self._draw_edge_needle_overlay()
+
+    def _draw_edge_static_overlay(self) -> None:
         try:
-            self.canvas.delete("edge_trace_overlay")
+            self.canvas.delete("edge_trace_static_overlay")
             self._draw_work_bounds()
             self._draw_edge_plan()
+        except tk.TclError:
+            return
+
+    def _draw_edge_needle_overlay(self) -> None:
+        try:
+            self.canvas.delete("edge_trace_needle_overlay")
             self._draw_current_needle()
             self._draw_needle()
         except tk.TclError:
@@ -173,7 +187,7 @@ class EdgeTraceCanvasViewer(GDSCanvasViewer):
             outline="#fbbf24",
             width=2,
             dash=(7, 5),
-            tags="edge_trace_overlay",
+            tags="edge_trace_static_overlay",
         )
 
     def _draw_edge_plan(self) -> None:
@@ -191,7 +205,7 @@ class EdgeTraceCanvasViewer(GDSCanvasViewer):
                     dash=(8, 6),
                     arrow=tk.LAST,
                     arrowshape=(8, 10, 4),
-                    tags="edge_trace_overlay",
+                    tags="edge_trace_static_overlay",
                 )
         for polyline in self.edge_plan.polylines:
             coords = self._coords_for_points([point.gds for point in polyline.points])
@@ -212,23 +226,23 @@ class EdgeTraceCanvasViewer(GDSCanvasViewer):
                 width=width,
                 arrow=tk.LAST,
                 arrowshape=(10, 12, 5),
-                tags="edge_trace_overlay",
+                tags="edge_trace_static_overlay",
             )
 
     def _draw_needle(self) -> None:
         if self.needle_gds is None:
             return
         x, y = self.transform.gds_to_canvas(*self.needle_gds)
-        self.canvas.create_oval(x - 5, y - 5, x + 5, y + 5, fill="#e0f2fe", outline="#0ea5e9", width=2, tags="edge_trace_overlay")
+        self.canvas.create_oval(x - 5, y - 5, x + 5, y + 5, fill="#e0f2fe", outline="#0ea5e9", width=2, tags="edge_trace_needle_overlay")
 
     def _draw_current_needle(self) -> None:
         if self.current_needle_gds is None:
             return
         x, y = self.transform.gds_to_canvas(*self.current_needle_gds)
         color = "#f43f5e"
-        self.canvas.create_oval(x - 10, y - 10, x + 10, y + 10, outline=color, width=3, tags="edge_trace_overlay")
-        self.canvas.create_line(x - 16, y, x + 16, y, fill=color, width=2, tags="edge_trace_overlay")
-        self.canvas.create_line(x, y - 16, x, y + 16, fill=color, width=2, tags="edge_trace_overlay")
+        self.canvas.create_oval(x - 10, y - 10, x + 10, y + 10, outline=color, width=3, tags="edge_trace_needle_overlay")
+        self.canvas.create_line(x - 16, y, x + 16, y, fill=color, width=2, tags="edge_trace_needle_overlay")
+        self.canvas.create_line(x, y - 16, x, y + 16, fill=color, width=2, tags="edge_trace_needle_overlay")
         self.canvas.create_text(
             x + 12,
             y - 12,
@@ -236,7 +250,7 @@ class EdgeTraceCanvasViewer(GDSCanvasViewer):
             anchor="sw",
             fill=color,
             font=("Segoe UI Semibold", 9),
-            tags="edge_trace_overlay",
+            tags="edge_trace_needle_overlay",
         )
 
     def _coords_for_points(self, points: list[tuple[float, float]]) -> list[float]:
@@ -1026,7 +1040,7 @@ class EdgeTracePanel:
     def _schedule_microscope_preview_poll(self) -> None:
         try:
             self._update_microscope_preview()
-            self.microscope_poll_job = self.frame.after(300, self._schedule_microscope_preview_poll)
+            self.microscope_poll_job = self.frame.after(EDGE_TRACE_PREVIEW_INTERVAL_MS, self._schedule_microscope_preview_poll)
         except tk.TclError:
             return
 

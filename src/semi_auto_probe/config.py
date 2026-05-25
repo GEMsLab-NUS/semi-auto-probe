@@ -48,6 +48,25 @@ CAMERA_CONTROL_MODE_LABELS = {
     CAMERA_CONTROL_MODE_AUTO: "Auto",
     CAMERA_CONTROL_MODE_MANUAL: "Manual",
 }
+CAMERA_RESOLUTION_FULL = "2592"
+CAMERA_RESOLUTION_HALF = "1296"
+CAMERA_RESOLUTION_QUARTER = "648"
+CAMERA_RESOLUTION_WIDTHS = (
+    CAMERA_RESOLUTION_FULL,
+    CAMERA_RESOLUTION_HALF,
+    CAMERA_RESOLUTION_QUARTER,
+)
+CAMERA_RESOLUTION_LABELS = {
+    CAMERA_RESOLUTION_FULL: "2592 px",
+    CAMERA_RESOLUTION_HALF: "1296 px",
+    CAMERA_RESOLUTION_QUARTER: "648 px",
+}
+CAMERA_RESOLUTION_DIMENSIONS = {
+    CAMERA_RESOLUTION_FULL: (2592, 1944),
+    CAMERA_RESOLUTION_HALF: (1296, 972),
+    CAMERA_RESOLUTION_QUARTER: (648, 486),
+}
+CAMERA_FRAME_RATE_OPTIONS = (5, 10, 15, 30, 60, 120)
 
 
 def normalize_motor_speed_profile(value: Any) -> str:
@@ -79,6 +98,43 @@ def normalize_camera_control_mode(value: Any) -> str:
     if normalized not in CAMERA_CONTROL_MODES:
         raise ValueError(f"Camera control mode must be one of {CAMERA_CONTROL_MODES}.")
     return normalized
+
+
+def normalize_camera_resolution_width(value: Any) -> str:
+    text = str(value or CAMERA_RESOLUTION_HALF).strip().lower()
+    text = text.replace("px", "").replace(" ", "")
+    aliases = {
+        "full": CAMERA_RESOLUTION_FULL,
+        "high": CAMERA_RESOLUTION_FULL,
+        "hi": CAMERA_RESOLUTION_FULL,
+        "0": CAMERA_RESOLUTION_FULL,
+        "half": CAMERA_RESOLUTION_HALF,
+        "medium": CAMERA_RESOLUTION_HALF,
+        "mid": CAMERA_RESOLUTION_HALF,
+        "1": CAMERA_RESOLUTION_HALF,
+        "quarter": CAMERA_RESOLUTION_QUARTER,
+        "low": CAMERA_RESOLUTION_QUARTER,
+        "fast": CAMERA_RESOLUTION_QUARTER,
+        "2": CAMERA_RESOLUTION_QUARTER,
+    }
+    normalized = aliases.get(text, text)
+    if normalized not in CAMERA_RESOLUTION_WIDTHS:
+        raise ValueError(f"Camera resolution must be one of {CAMERA_RESOLUTION_WIDTHS}.")
+    return normalized
+
+
+def camera_resolution_dimensions(value: Any) -> tuple[int, int]:
+    return CAMERA_RESOLUTION_DIMENSIONS[normalize_camera_resolution_width(value)]
+
+
+def normalize_camera_target_fps(value: Any) -> int:
+    try:
+        fps = int(float(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Camera target FPS must be one of {CAMERA_FRAME_RATE_OPTIONS}.") from exc
+    if fps not in CAMERA_FRAME_RATE_OPTIONS:
+        raise ValueError(f"Camera target FPS must be one of {CAMERA_FRAME_RATE_OPTIONS}.")
+    return fps
 
 
 AUTOFOCUS_PEAK_MODEL_GAUSSIAN = "gaussian"
@@ -207,6 +263,7 @@ def derive_missing_calibrations(config: "ProbeConfig") -> int:
     base_um_per_px = config.calibrations.get(base_key)
     if base_um_per_px is None:
         return 0
+    base_resolution_width = config.calibration_resolution_widths.get(base_key, config.camera_resolution_width)
 
     added = 0
     reference_magnification = CALIBRATION_REFERENCE_OBJECTIVE * CALIBRATION_REFERENCE_EYEPIECE
@@ -216,6 +273,7 @@ def derive_missing_calibrations(config: "ProbeConfig") -> int:
             if key in config.calibrations:
                 continue
             config.calibrations[key] = float(base_um_per_px) * reference_magnification / (objective * eyepiece)
+            config.calibration_resolution_widths[key] = base_resolution_width
             added += 1
     return added
 
@@ -266,6 +324,8 @@ class ProbeConfig:
     camera_gain_mode: str = CAMERA_CONTROL_MODE_AUTO
     camera_gain: float = 0.0
     camera_source: str = "auto"
+    camera_resolution_width: str = CAMERA_RESOLUTION_HALF
+    camera_target_fps: int = 30
     cc_accel_time_s: float = 0.3
     autofocus_settle_ms: int = 100
     autofocus_sample_count: int = 5
@@ -280,6 +340,7 @@ class ProbeConfig:
     focus_threshold_yellow: dict[str, float] = field(default_factory=lambda: {"Laplacian": 1000.0, "Tenengrad": 20000.0, "Brenner": 1000.0})
     focus_threshold_green: dict[str, float] = field(default_factory=lambda: {"Laplacian": 2000.0, "Tenengrad": 40000.0, "Brenner": 2000.0})
     calibrations: dict[str, float] = field(default_factory=dict)
+    calibration_resolution_widths: dict[str, str] = field(default_factory=dict)
     agent_api_key: str = ""
     agent_base_url: str = DEFAULT_AGENT_BASE_URL
     agent_model: str = DEFAULT_AGENT_MODEL
@@ -316,6 +377,8 @@ class ProbeConfig:
         self.camera_source = str(self.camera_source or "auto").strip().lower()
         if not self.camera_source:
             raise ValueError("Camera source cannot be empty.")
+        self.camera_resolution_width = normalize_camera_resolution_width(self.camera_resolution_width)
+        self.camera_target_fps = normalize_camera_target_fps(self.camera_target_fps)
         if not math.isfinite(self.camera_exposure) or abs(self.camera_exposure) > 1_000_000:
             raise ValueError("Camera exposure must be a finite number in range -1000000..1000000.")
         if not math.isfinite(self.camera_gain) or self.camera_gain < 0 or self.camera_gain > 1_000_000:
@@ -353,6 +416,13 @@ class ProbeConfig:
         for value in self.calibrations.values():
             if value <= 0:
                 raise ValueError("Calibration values must be positive.")
+        self.calibration_resolution_widths = {
+            str(key): normalize_camera_resolution_width(value)
+            for key, value in self.calibration_resolution_widths.items()
+            if key in self.calibrations
+        }
+        for key in self.calibrations:
+            self.calibration_resolution_widths.setdefault(key, self.camera_resolution_width)
         self.agent_api_key = str(self.agent_api_key or "").strip()
         self.agent_base_url = str(self.agent_base_url or DEFAULT_AGENT_BASE_URL).strip().rstrip("/")
         self.agent_model = str(self.agent_model or DEFAULT_AGENT_MODEL).strip()
@@ -395,16 +465,24 @@ class ProbeConfig:
         return calibration_key(self.objective, self.eyepiece)
 
     def current_um_per_px(self) -> float | None:
-        return self.calibrations.get(self.current_calibration_key())
+        key = self.current_calibration_key()
+        calibrated_um_per_px = self.calibrations.get(key)
+        if calibrated_um_per_px is None:
+            return None
+        calibration_width = int(normalize_camera_resolution_width(self.calibration_resolution_widths.get(key, self.camera_resolution_width)))
+        current_width = int(normalize_camera_resolution_width(self.camera_resolution_width))
+        return float(calibrated_um_per_px) * calibration_width / current_width
 
-    def set_calibration(self, objective: int, eyepiece: float, um_per_px: float) -> None:
+    def set_calibration(self, objective: int, eyepiece: float, um_per_px: float, camera_resolution_width: Any | None = None) -> None:
         if objective not in OBJECTIVE_OPTIONS:
             raise ValueError(f"Objective must be one of {OBJECTIVE_OPTIONS}.")
         if eyepiece not in EYEPIECE_OPTIONS:
             raise ValueError(f"Eyepiece must be one of {EYEPIECE_OPTIONS}.")
         if um_per_px <= 0:
             raise ValueError("Calibration value must be positive.")
-        self.calibrations[calibration_key(objective, eyepiece)] = float(um_per_px)
+        key = calibration_key(objective, eyepiece)
+        self.calibrations[key] = float(um_per_px)
+        self.calibration_resolution_widths[key] = normalize_camera_resolution_width(camera_resolution_width or self.camera_resolution_width)
 
     def to_dict(self) -> dict[str, Any]:
         derive_missing_calibrations(self)
@@ -435,6 +513,8 @@ class ProbeConfig:
             "camera_gain_mode": self.camera_gain_mode,
             "camera_gain": self.camera_gain,
             "camera_source": self.camera_source,
+            "camera_resolution_width": self.camera_resolution_width,
+            "camera_target_fps": self.camera_target_fps,
             "cc_accel_time_s": self.cc_accel_time_s,
             "autofocus_settle_ms": self.autofocus_settle_ms,
             "autofocus_sample_count": self.autofocus_sample_count,
@@ -452,6 +532,7 @@ class ProbeConfig:
             "focus_threshold_yellow": dict(sorted(self.focus_threshold_yellow.items())),
             "focus_threshold_green": dict(sorted(self.focus_threshold_green.items())),
             "calibrations": dict(sorted(self.calibrations.items())),
+            "calibration_resolution_widths": dict(sorted(self.calibration_resolution_widths.items())),
             "agent_api_key": self.agent_api_key,
             "agent_base_url": self.agent_base_url,
             "agent_model": self.agent_model,
@@ -490,6 +571,8 @@ class ProbeConfig:
             camera_gain_mode=normalize_camera_control_mode(data.get("camera_gain_mode", CAMERA_CONTROL_MODE_AUTO)),
             camera_gain=float(data.get("camera_gain", cls.camera_gain)),
             camera_source=str(data.get("camera_source", cls.camera_source)),
+            camera_resolution_width=normalize_camera_resolution_width(data.get("camera_resolution_width", cls.camera_resolution_width)),
+            camera_target_fps=normalize_camera_target_fps(data.get("camera_target_fps", cls.camera_target_fps)),
             cc_accel_time_s=float(data.get("cc_accel_time_s", cls.cc_accel_time_s)),
             autofocus_settle_ms=int(data.get("autofocus_settle_ms", cls.autofocus_settle_ms)),
             autofocus_sample_count=int(data.get("autofocus_sample_count", cls.autofocus_sample_count)),
@@ -510,6 +593,10 @@ class ProbeConfig:
                 **{str(key): float(value) for key, value in data.get("focus_threshold_green", {}).items()},
             },
             calibrations={str(key): float(value) for key, value in data.get("calibrations", {}).items()},
+            calibration_resolution_widths={
+                str(key): normalize_camera_resolution_width(value)
+                for key, value in data.get("calibration_resolution_widths", {}).items()
+            },
             agent_api_key=str(data.get("agent_api_key", "")),
             agent_base_url=str(data.get("agent_base_url", DEFAULT_AGENT_BASE_URL)),
             agent_model=str(data.get("agent_model", DEFAULT_AGENT_MODEL)),

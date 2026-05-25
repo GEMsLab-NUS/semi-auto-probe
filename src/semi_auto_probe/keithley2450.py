@@ -56,16 +56,12 @@ class IVSweepSample:
 class IVSweepStatistics:
     sample_count: int
     resistance_ohm: float | None
-    sheet_resistance_ohm_sq: float | None
-    resistivity_ohm_cm: float | None
     resistance_method: str
 
     def to_dict(self) -> dict[str, object]:
         return {
             "sample_count": self.sample_count,
             "resistance_ohm": self.resistance_ohm,
-            "sheet_resistance_ohm_sq": self.sheet_resistance_ohm_sq,
-            "resistivity_ohm_cm": self.resistivity_ohm_cm,
             "resistance_method": self.resistance_method,
         }
 
@@ -127,9 +123,6 @@ class IVSweepConfig:
     nplc: float = 1.0
     output_statistics: bool = True
     resistance_method: str = RESISTANCE_METHOD_LINEAR_FIT
-    device_length_um: float = 0.0
-    device_width_um: float = 0.0
-    film_thickness_nm: float = 0.0
     output_off_after: bool = True
 
     def normalized(self) -> "IVSweepConfig":
@@ -144,9 +137,6 @@ class IVSweepConfig:
             self.current_limit_a,
             self.source_delay_s,
             self.nplc,
-            self.device_length_um,
-            self.device_width_um,
-            self.film_thickness_nm,
         )
         if any(not math.isfinite(float(value)) for value in values):
             raise ValueError("IV sweep numeric parameters must be finite.")
@@ -162,8 +152,6 @@ class IVSweepConfig:
             raise ValueError("IV source delay must be in range 0..60 seconds.")
         if float(self.nplc) <= 0 or float(self.nplc) > 25:
             raise ValueError("IV NPLC must be in range 0..25.")
-        if float(self.device_length_um) < 0 or float(self.device_width_um) < 0 or float(self.film_thickness_nm) < 0:
-            raise ValueError("IV geometry values must be zero or positive.")
         resource_name = str(self.resource_name or DEFAULT_KEITHLEY2450_RESOURCE).strip()
         if not resource_name:
             raise ValueError("Keithley VISA resource cannot be empty.")
@@ -181,9 +169,6 @@ class IVSweepConfig:
             nplc=float(self.nplc),
             output_statistics=bool(self.output_statistics),
             resistance_method=resistance_method,
-            device_length_um=float(self.device_length_um),
-            device_width_um=float(self.device_width_um),
-            film_thickness_nm=float(self.film_thickness_nm),
             output_off_after=bool(self.output_off_after),
         )
 
@@ -287,9 +272,6 @@ def iv_sweep_config_from_params(params: dict[str, str]) -> IVSweepConfig:
         nplc=float(params.get("nplc", 1.0)),
         output_statistics=parse_bool(params.get("output_statistics", "true"), default=True),
         resistance_method=params.get("resistance_method", RESISTANCE_METHOD_LINEAR_FIT),
-        device_length_um=float(params.get("device_length_um", params.get("length_um", 0.0))),
-        device_width_um=float(params.get("device_width_um", params.get("width_um", 0.0))),
-        film_thickness_nm=float(params.get("film_thickness_nm", params.get("thickness_nm", 0.0))),
         output_off_after=parse_bool(params.get("output_off_after", "true"), default=True),
     ).normalized()
 
@@ -312,22 +294,12 @@ def calculate_iv_statistics(samples: list[IVSweepSample] | tuple[IVSweepSample, 
         return IVSweepStatistics(
             sample_count=len(samples),
             resistance_ohm=None,
-            sheet_resistance_ohm_sq=None,
-            resistivity_ohm_cm=None,
             resistance_method=normalized.resistance_method,
         )
     resistance = _calculate_resistance_ohm(samples, normalized.resistance_method)
-    sheet_resistance = None
-    resistivity = None
-    if resistance is not None and normalized.device_length_um > 0 and normalized.device_width_um > 0:
-        sheet_resistance = resistance * normalized.device_width_um / normalized.device_length_um
-        if normalized.film_thickness_nm > 0:
-            resistivity = sheet_resistance * normalized.film_thickness_nm * 1e-7
     return IVSweepStatistics(
         sample_count=len(samples),
         resistance_ohm=resistance,
-        sheet_resistance_ohm_sq=sheet_resistance,
-        resistivity_ohm_cm=resistivity,
         resistance_method=normalized.resistance_method,
     )
 

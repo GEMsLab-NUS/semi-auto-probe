@@ -51,9 +51,6 @@ class Keithley2450Tests(unittest.TestCase):
                 "current_limit_a": "0.01",
                 "output_statistics": "true",
                 "resistance_method": "linear_fit",
-                "device_length_um": "10",
-                "device_width_um": "20",
-                "film_thickness_nm": "50",
             }
         )
 
@@ -64,9 +61,6 @@ class Keithley2450Tests(unittest.TestCase):
         self.assertAlmostEqual(config.current_limit_a, 0.01)
         self.assertTrue(config.output_statistics)
         self.assertEqual(config.resistance_method, "linear_fit")
-        self.assertAlmostEqual(config.device_length_um, 10)
-        self.assertAlmostEqual(config.device_width_um, 20)
-        self.assertAlmostEqual(config.film_thickness_nm, 50)
 
     def test_runner_configures_voltage_sweep_and_reports_samples(self) -> None:
         instrument = FakeInstrument()
@@ -109,23 +103,20 @@ class Keithley2450Tests(unittest.TestCase):
         self.assertAlmostEqual(config.current_limit_a, 1e-5)
         self.assertAlmostEqual(config.nplc, 10.0)
 
-    def test_statistics_use_linear_iv_slope_and_geometry(self) -> None:
+    def test_statistics_use_linear_iv_slope_for_resistance_only(self) -> None:
         samples = [
             IVSweepSample(1, 3, 0.0, -1.0, -1.0, -0.001, 1000.0, ""),
             IVSweepSample(2, 3, 0.1, 0.0, 0.0, 0.0, None, ""),
             IVSweepSample(3, 3, 0.2, 1.0, 1.0, 0.001, 1000.0, ""),
         ]
-        config = IVSweepConfig(
-            device_length_um=10.0,
-            device_width_um=20.0,
-            film_thickness_nm=50.0,
-        )
 
-        stats = calculate_iv_statistics(samples, config)
+        stats = calculate_iv_statistics(samples, IVSweepConfig())
 
         self.assertAlmostEqual(stats.resistance_ohm or 0.0, 1000.0)
-        self.assertAlmostEqual(stats.sheet_resistance_ohm_sq or 0.0, 2000.0)
-        self.assertAlmostEqual(stats.resistivity_ohm_cm or 0.0, 1e-2)
+        self.assertEqual(stats.sample_count, 3)
+        self.assertEqual(stats.resistance_method, "linear_fit")
+        self.assertNotIn("sheet_resistance_ohm_sq", stats.to_dict())
+        self.assertNotIn("resistivity_ohm_cm", stats.to_dict())
 
 
 if __name__ == "__main__":

@@ -173,7 +173,7 @@ class AutoTestTests(unittest.TestCase):
         samples = [
             IVSweepSample(index=1, total=1, elapsed_s=0.1, source_value=0.0, voltage_v=0.0, current_a=1e-6, resistance_ohm=0.0, raw="0,1e-6")
         ]
-        statistics = IVSweepStatistics(sample_count=1, resistance_ohm=1000.0, sheet_resistance_ohm_sq=None, resistivity_ohm_cm=None, resistance_method="linear_fit")
+        statistics = IVSweepStatistics(sample_count=1, resistance_ohm=1000.0, resistance_method="linear_fit")
         with tempfile.TemporaryDirectory() as temp_dir:
             output_path = Path(temp_dir) / "DevA1_iv.csv"
             ProbeApp._write_iv_samples_csv(output_path, point, config, samples, statistics)
@@ -191,17 +191,18 @@ class AutoTestTests(unittest.TestCase):
             create_autotest_flow_card("wait", "card_1"),
             create_autotest_flow_card("wobb_test", "card_wobb"),
             create_autotest_flow_card("iv", "card_2"),
+            create_autotest_flow_card("b1500_transfer", "card_b1500_transfer"),
             create_autotest_flow_card("photo", "card_3"),
         ]
 
         self.assertEqual(
             summarize_autotest_flow(cards),
-            "Measurement flow: Entity Pause -> WobbTest -> Keithley IV -> Capture Photo",
+            "Measurement flow: Entity Pause -> WobbTest -> Keithley IV -> B1500 Transfer -> Capture Photo",
         )
         self.assertEqual(legacy_measurement_steps_from_flow(cards), ("pause", "photo"))
 
         steps = measurement_flow_steps_from_cards(cards)
-        self.assertEqual([step.type_id for step in steps], ["wait", "wobb_test", "iv", "photo"])
+        self.assertEqual([step.type_id for step in steps], ["wait", "wobb_test", "iv", "b1500_transfer", "photo"])
         self.assertEqual(steps[1].params["mode"], "Z")
         self.assertEqual(steps[1].params["bias_v"], "0.1")
         self.assertEqual(steps[1].params["current_limit_a"], "1e-5")
@@ -211,6 +212,15 @@ class AutoTestTests(unittest.TestCase):
         self.assertEqual(steps[2].params["sweep_mode"], "voltage")
         self.assertEqual(steps[2].params["output_statistics"], "true")
         self.assertEqual(steps[2].params["resistance_method"], "linear_fit")
+        self.assertEqual(steps[3].params["resource"], "GPIB0::17::INSTR")
+        self.assertEqual(steps[3].params["drain_smu"], "smu3")
+        self.assertEqual(steps[3].params["gate_smu"], "smu4")
+        self.assertEqual(steps[3].params["sweep_start_v"], "-40")
+        self.assertEqual(steps[3].params["bias_values_v"], "0:5:1")
+        self.assertEqual(steps[3].params["abort_on_compliance"], "false")
+        self.assertEqual(steps[3].params["staircase_nplc"], "10")
+        self.assertEqual(steps[3].params["measurement_adc"], "high_speed")
+        self.assertNotIn("avg_coefficient", steps[3].params)
 
     def test_wobbtest_requires_session_dir_and_best_z_uses_median_current(self) -> None:
         settings = AutoTestSettings(
@@ -267,20 +277,20 @@ class AutoTestTests(unittest.TestCase):
         panel = object.__new__(AutoTestPanel)
         panel.probe_assist_enabled_var = type("Var", (), {"get": lambda self: True})()
         panel.probe_assist_vars = {
-            "圆": {"du": type("Var", (), {"get": lambda self: "1"})(), "dv": type("Var", (), {"get": lambda self: "2"})()},
-            "Low": {"du": type("Var", (), {"get": lambda self: "-1"})(), "dv": type("Var", (), {"get": lambda self: "0"})()},
-            "山": {"du": type("Var", (), {"get": lambda self: "0.5"})(), "dv": type("Var", (), {"get": lambda self: "-0.5"})()},
+            "Source": {"du": type("Var", (), {"get": lambda self: "1"})(), "dv": type("Var", (), {"get": lambda self: "2"})()},
+            "Drain": {"du": type("Var", (), {"get": lambda self: "-1"})(), "dv": type("Var", (), {"get": lambda self: "0"})()},
+            "Gate": {"du": type("Var", (), {"get": lambda self: "0.5"})(), "dv": type("Var", (), {"get": lambda self: "-0.5"})()},
         }
 
         overlays = panel.probe_assist_overlays_for_center((10.0, 20.0))
 
-        self.assertEqual([overlay.label for overlay in overlays], ["圆", "Low", "山"])
+        self.assertEqual([overlay.label for overlay in overlays], ["Source", "Drain", "Gate"])
         self.assertEqual([overlay.point for overlay in overlays], [(11.0, 22.0), (9.0, 20.0), (10.5, 19.5)])
 
     def test_autotest_probe_assist_default_offsets_match_probe_layout(self) -> None:
         self.assertEqual(
             [(name, du, dv) for name, _color, _style, du, dv in PROBE_ASSIST_PROBES],
-            [("圆", "100", "0"), ("Low", "-100", "0"), ("山", "0", "100")],
+            [("Source", "100", "0"), ("Drain", "-100", "0"), ("Gate", "0", "100")],
         )
 
     def test_expanded_iv_card_height_accounts_for_all_params(self) -> None:
@@ -289,6 +299,13 @@ class AutoTestTests(unittest.TestCase):
         card = create_autotest_flow_card("iv", "card_1", expanded=True)
 
         self.assertGreaterEqual(panel._flow_card_height_for_card(card), 382)
+
+    def test_expanded_b1500_card_height_accounts_for_grouped_params(self) -> None:
+        panel = object.__new__(AutoTestPanel)
+        panel._flow_zoom = 1.0
+        card = create_autotest_flow_card("b1500_output", "card_b1500", expanded=True)
+
+        self.assertGreaterEqual(panel._flow_card_height_for_card(card), 500)
 
     def test_discarding_flow_widget_cache_preserves_flow_cards_and_entry_vars(self) -> None:
         panel = object.__new__(AutoTestPanel)

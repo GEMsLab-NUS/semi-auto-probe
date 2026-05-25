@@ -807,21 +807,30 @@ class GDSCanvasViewer:
         self.redraw()
 
     def set_selected_gds(self, point: tuple[float, float] | None) -> None:
+        if self.selected_gds == point:
+            return
         self.selected_gds = point
-        self._draw_overlay_items()
+        self._draw_dynamic_overlay_items()
 
     def set_stage_overlay(self, center_gds: tuple[float, float] | None, fov_polygon_gds: list[tuple[float, float]] | None) -> None:
+        normalized_polygon = list(fov_polygon_gds) if fov_polygon_gds is not None else None
+        if self.stage_center_gds == center_gds and self.fov_polygon_gds == normalized_polygon:
+            return
         self.stage_center_gds = center_gds
-        self.fov_polygon_gds = fov_polygon_gds
-        self._draw_overlay_items()
+        self.fov_polygon_gds = normalized_polygon
+        self._draw_dynamic_overlay_items()
 
     def set_matrix_overlay(self, polygons_gds: list[MatrixOverlay]) -> None:
         self.matrix_fov_polygons_gds = polygons_gds
-        self._draw_overlay_items()
+        self._draw_matrix_overlay_items()
+        self._draw_dynamic_overlay_items()
 
     def set_auxiliary_points(self, points_gds: list[AuxiliaryPointOverlay]) -> None:
-        self.auxiliary_points_gds = list(points_gds)
-        self._draw_overlay_items()
+        normalized_points = list(points_gds)
+        if self.auxiliary_points_gds == normalized_points:
+            return
+        self.auxiliary_points_gds = normalized_points
+        self._draw_dynamic_overlay_items()
 
     def viewport_bounds_gds(self) -> tuple[float, float, float, float] | None:
         if self.model is None or self.transform.scale == 0:
@@ -1011,11 +1020,14 @@ class GDSCanvasViewer:
 
     def _draw_overlay_items(self) -> None:
         try:
-            self.canvas.delete("gds_cursor")
-            self.canvas.delete("gds_overlay")
+            self._draw_matrix_overlay_items()
+            self._draw_dynamic_overlay_items()
+        except tk.TclError:
+            return
+
+    def _draw_matrix_overlay_items(self) -> None:
+        try:
             self.canvas.delete("gds_matrix_overlay")
-            self.canvas.delete("gds_selection")
-            self.canvas.delete("gds_zoom_box")
             for overlay_item in self.matrix_fov_polygons_gds:
                 polygon_gds, label, state = self._normalize_matrix_overlay_item(overlay_item)
                 if len(polygon_gds) < 3:
@@ -1068,6 +1080,15 @@ class GDSCanvasViewer:
                         font=("Segoe UI Semibold", 8),
                         tags="gds_matrix_overlay",
                     )
+        except tk.TclError:
+            return
+
+    def _draw_dynamic_overlay_items(self) -> None:
+        try:
+            self.canvas.delete("gds_cursor")
+            self.canvas.delete("gds_overlay")
+            self.canvas.delete("gds_selection")
+            self.canvas.delete("gds_zoom_box")
             if self.fov_polygon_gds and len(self.fov_polygon_gds) >= 3:
                 coords: list[float] = []
                 for u, v in self.fov_polygon_gds:
@@ -1186,17 +1207,17 @@ class GDSCanvasViewer:
     def _on_motion(self, event: tk.Event) -> None:
         if self.model is None:
             self.cursor_gds = None
-            self._draw_overlay_items()
+            self._draw_dynamic_overlay_items()
             self.on_cursor_gds(None)
             return
         self.cursor_gds = snap_gds_point(self.transform.canvas_to_gds(event.x, event.y), self.snap_grid_um)
         self.on_cursor_gds(self.cursor_gds)
-        self._draw_overlay_items()
+        self._draw_dynamic_overlay_items()
 
     def _on_leave(self, _event: tk.Event) -> None:
         self.cursor_gds = None
         self.on_cursor_gds(None)
-        self._draw_overlay_items()
+        self._draw_dynamic_overlay_items()
 
     def _on_mouse_wheel(self, event: tk.Event) -> str:
         if self.model is None:
@@ -1243,7 +1264,7 @@ class GDSCanvasViewer:
             point = snap_gds_point(self.transform.canvas_to_gds(event.x, event.y), self.snap_grid_um)
             self.selected_gds = point
             self.on_select_gds(point[0], point[1])
-            self._draw_overlay_items()
+            self._draw_dynamic_overlay_items()
             self.ignore_next_release = True
         self.drag_start = None
         self.drag_last = None

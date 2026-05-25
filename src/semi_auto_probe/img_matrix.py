@@ -11,6 +11,10 @@ from typing import Callable
 from .gds_stage_mapper import AuxiliaryPointOverlay, AffineCoordinateMapper, GDSCanvasViewer, GDSLayoutModel, MatrixOverlay
 
 
+IMGMATRIX_PREVIEW_INTERVAL_MS = 45
+IMGMATRIX_OVERLAY_REDRAW_INTERVAL_MS = 90
+
+
 @dataclass(frozen=True)
 class ImgMatrixSettings:
     origin_u: float
@@ -193,6 +197,10 @@ class ImgMatrixPanel:
         self.microscope_photo: tk.PhotoImage | None = None
         self.microscope_payload_id: int | None = None
         self.status_poll_job: str | None = None
+        self.microscope_poll_job: str | None = None
+        self.preview_redraw_job: str | None = None
+        self._preview_cache_key: tuple[object, ...] | None = None
+        self._preview_cache_points: tuple[ImgMatrixPoint, ...] | None = None
         self.preview_labels: list[ttk.Label] = []
         self.matrix_overlay_states: dict[tuple[int, int], str] = {}
         self.last_overlay_items: list[MatrixOverlay] = []
@@ -226,6 +234,7 @@ class ImgMatrixPanel:
         self.frame.rowconfigure(0, weight=1)
         self._build_ui()
         self._schedule_status_poll()
+        self._schedule_microscope_preview_poll()
 
     def _build_ui(self) -> None:
         pane = ttk.PanedWindow(self.frame, orient=tk.HORIZONTAL)
@@ -509,7 +518,7 @@ class ImgMatrixPanel:
             self.fov_width_var,
             self.fov_height_var,
         ):
-            variable.trace_add("write", lambda *_args: self.redraw_matrix_preview())
+            variable.trace_add("write", lambda *_args: self._schedule_matrix_preview_redraw())
 
     def set_layout_context(
         self,
@@ -618,7 +627,7 @@ class ImgMatrixPanel:
             return
         try:
             settings = self.settings_from_ui()
-            points = generate_imgmatrix_points(settings, mapper)
+            points = self._points_for_settings(settings, mapper)
         except Exception as exc:
             self._set_matrix_overlays([])
             self.matrix_summary_var.set(f"Preview unavailable: {exc}")
@@ -633,6 +642,27 @@ class ImgMatrixPanel:
             f"Preview: {settings.rows} x {settings.cols} = {len(points)} shots. "
             f"Last UV {last.u:.6g}, {last.v:.6g}."
         )
+
+    def _points_for_settings(self, settings: ImgMatrixSettings, mapper: AffineCoordinateMapper) -> tuple[ImgMatrixPoint, ...]:
+        key = (
+            id(mapper),
+            settings.origin_u,
+            settings.origin_v,
+            settings.u_vector_u,
+            settings.u_vector_v,
+            settings.v_vector_u,
+            settings.v_vector_v,
+            settings.rows,
+            settings.cols,
+            settings.fov_width_um,
+            settings.fov_height_um,
+        )
+        if self._preview_cache_key == key and self._preview_cache_points is not None:
+            return self._preview_cache_points
+        points = generate_imgmatrix_points(settings, mapper)
+        self._preview_cache_key = key
+        self._preview_cache_points = points
+        return points
 
     def _start_run(self) -> None:
         try:
@@ -652,7 +682,7 @@ class ImgMatrixPanel:
         self.status_var.set(f"{message} ({current}/{total})")
         if row is not None and col is not None and state is not None:
             self.matrix_overlay_states[(row, col)] = state
-            self.redraw_matrix_preview()
+            self._schedule_matrix_preview_redraw()
 
     def set_session_path(self, session_dir: Path | None) -> None:
         self.session_var.set(f"Session: {session_dir}" if session_dir else "Session: -")
@@ -671,10 +701,28 @@ class ImgMatrixPanel:
     def _schedule_status_poll(self) -> None:
         try:
             self._update_status_panel()
-            self._update_microscope_preview()
             self.status_poll_job = self.frame.after(300, self._schedule_status_poll)
         except tk.TclError:
             return
+
+    def _schedule_microscope_preview_poll(self) -> None:
+        try:
+            self._update_microscope_preview()
+            self.microscope_poll_job = self.frame.after(IMGMATRIX_PREVIEW_INTERVAL_MS, self._schedule_microscope_preview_poll)
+        except tk.TclError:
+            return
+
+    def _schedule_matrix_preview_redraw(self) -> None:
+        if self.preview_redraw_job is not None:
+            return
+        try:
+            self.preview_redraw_job = self.frame.after(IMGMATRIX_OVERLAY_REDRAW_INTERVAL_MS, self._run_scheduled_matrix_preview_redraw)
+        except tk.TclError:
+            self.preview_redraw_job = None
+
+    def _run_scheduled_matrix_preview_redraw(self) -> None:
+        self.preview_redraw_job = None
+        self.redraw_matrix_preview()
 
     def _update_status_panel(self) -> None:
         try:

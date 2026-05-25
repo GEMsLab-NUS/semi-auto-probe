@@ -18,6 +18,7 @@ CAMERA_FLIP_VERTICAL_ENV = "SEMI_AUTO_PROBE_CAMERA_FLIP_VERTICAL"
 CAMERA_FOURCC_ENV = "SEMI_AUTO_PROBE_CAMERA_FOURCC"
 MIICAM_SDK_ENV = "SEMI_AUTO_PROBE_MIICAM_SDK"
 _OPENCV_AUTO_BACKENDS = ("dshow", "msmf", "any")
+_SDK_RESOLUTION_INDEX_BY_WIDTH = {2592: 0, 1296: 1, 648: 2}
 
 
 @dataclass(frozen=True)
@@ -162,12 +163,14 @@ class _OpenCvCameraBackend(_CameraBackend):
         index: int,
         width: int,
         height: int,
+        target_fps: float | None,
         backends: tuple[str, ...],
     ) -> None:
         self._cv2 = cv2
         self.index = index
         self.width = width
         self.height = height
+        self.target_fps = target_fps
         self.backends = backends
         self._capture = None
         self.label = f"OpenCV camera {index}"
@@ -216,13 +219,24 @@ class _OpenCvCameraBackend(_CameraBackend):
                     break
         self._capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self._capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        if self.target_fps and self.target_fps > 0:
+            self._capture.set(cv2.CAP_PROP_FPS, float(self.target_fps))
         self._capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     def read_bgr(self) -> object | None:
         if not self.is_open:
             self.open()
         assert self._capture is not None
-        ok, frame = self._capture.read()
+        for _ in range(3):
+            try:
+                if not self._capture.grab():
+                    break
+            except Exception:
+                break
+        try:
+            ok, frame = self._capture.retrieve()
+        except Exception:
+            ok, frame = self._capture.read()
         return frame if ok else None
 
     def apply_settings(self, settings: CameraSettings) -> None:
@@ -307,8 +321,9 @@ class _MiiCamBackend(_CameraBackend):
     _EVENT_IMAGE = 0x0004
     _ERROR_EVENTS = {0x0080, 0x0081, 0x0082, 0x0085}
 
-    def __init__(self, *, index: int = 0) -> None:
+    def __init__(self, *, index: int = 0, resolution_index: int | None = None) -> None:
         self.index = index
+        self.resolution_index = resolution_index
         self.label = f"MiiCam {index}"
         self._ctypes = None
         self._dll = None
@@ -338,6 +353,7 @@ class _MiiCamBackend(_CameraBackend):
         self._handle = self._dll.Miicam_OpenByIndex(ctypes.c_uint(self.index))
         if not self._handle:
             raise RuntimeError(f"Could not open MiiCam index {self.index}.")
+        self._select_resolution()
         self._width, self._height = self._get_size()
         self._stride = ((self._width * 24 + 31) // 32) * 4
         self._buffer = ctypes.create_string_buffer(self._stride * self._height)
@@ -348,6 +364,14 @@ class _MiiCamBackend(_CameraBackend):
         if int(result) < 0:
             self.close()
             raise RuntimeError(f"Could not start MiiCam stream: HRESULT 0x{int(result) & 0xFFFFFFFF:08x}.")
+
+    def _select_resolution(self) -> None:
+        if self.resolution_index is None or not self._dll or not self._handle or not hasattr(self._dll, "Miicam_put_eSize"):
+            return
+        try:
+            self._dll.Miicam_put_eSize(self._handle, int(self.resolution_index))
+        except Exception:
+            pass
 
     def _load_dll(self, ctypes: Any) -> Any:
         errors: list[str] = []
@@ -377,6 +401,9 @@ class _MiiCamBackend(_CameraBackend):
         self._dll.Miicam_Stop.restype = ctypes.c_int
         self._dll.Miicam_get_Size.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
         self._dll.Miicam_get_Size.restype = ctypes.c_int
+        if hasattr(self._dll, "Miicam_put_eSize"):
+            self._dll.Miicam_put_eSize.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            self._dll.Miicam_put_eSize.restype = ctypes.c_int
         callback_factory = ctypes.WINFUNCTYPE if os.name == "nt" and hasattr(ctypes, "WINFUNCTYPE") else ctypes.CFUNCTYPE
         callback_type = callback_factory(None, ctypes.c_uint, ctypes.c_void_p)
         self._callback_type = callback_type
@@ -500,9 +527,10 @@ class _MiiCamBackend(_CameraBackend):
 
 
 class _ToupCamBackend(_CameraBackend):
-    def __init__(self, *, index: int = 0, device_id: str | None = None) -> None:
+    def __init__(self, *, index: int = 0, device_id: str | None = None, resolution_index: int | None = None) -> None:
         self.index = index
         self.device_id = device_id
+        self.resolution_index = resolution_index
         self.label = f"ToupCam {device_id or index}"
         self._toupcam = None
         self._handle = None
@@ -530,6 +558,7 @@ class _ToupCamBackend(_CameraBackend):
         self._handle = self._toupcam.Toupcam.Open(device.id)
         if not self._handle:
             raise RuntimeError(f"Could not open {self.label}.")
+        self._select_resolution()
         self._width, self._height = self._handle.get_Size()
         self._stride = ((self._width * 24 + 31) // 32) * 4
         self._buffer = bytes(self._stride * self._height)
@@ -538,6 +567,14 @@ class _ToupCamBackend(_CameraBackend):
         except Exception:
             self.close()
             raise
+
+    def _select_resolution(self) -> None:
+        if self.resolution_index is None or not self._handle or not hasattr(self._handle, "put_eSize"):
+            return
+        try:
+            self._handle.put_eSize(int(self.resolution_index))
+        except Exception:
+            pass
 
     def _select_device(self, devices: list[Any]) -> Any:
         if self.device_id:
@@ -649,6 +686,7 @@ class UsbCamera:
         index: int = 0,
         width: int = 960,
         height: int = 540,
+        target_fps: float | None = None,
         settings: CameraSettings | None = None,
         source: str | None = None,
         flip_vertical: bool | None = None,
@@ -656,6 +694,7 @@ class UsbCamera:
         self.index = index
         self.width = width
         self.height = height
+        self.target_fps = target_fps
         self.settings = settings or CameraSettings()
         self.source = normalize_camera_source(source or os.environ.get(CAMERA_SOURCE_ENV) or DEFAULT_CAMERA_SOURCE)
         self.flip_vertical = _bool_from_env(CAMERA_FLIP_VERTICAL_ENV, True) if flip_vertical is None else flip_vertical
@@ -697,15 +736,16 @@ class UsbCamera:
         for spec in _camera_source_candidates(self.source, self.index):
             backend: _CameraBackend
             if spec.kind == "miicam":
-                backend = _MiiCamBackend(index=spec.index)
+                backend = _MiiCamBackend(index=spec.index, resolution_index=self._sdk_resolution_index())
             elif spec.kind == "toupcam":
-                backend = _ToupCamBackend(index=spec.index, device_id=spec.device_id)
+                backend = _ToupCamBackend(index=spec.index, device_id=spec.device_id, resolution_index=self._sdk_resolution_index())
             elif spec.kind == "opencv":
                 backend = _OpenCvCameraBackend(
                     self._cv2,
                     index=spec.index,
                     width=self.width,
                     height=self.height,
+                    target_fps=self.target_fps,
                     backends=spec.opencv_backends,
                 )
             else:
@@ -718,6 +758,9 @@ class UsbCamera:
                 attempts.append(f"{backend.label}: {exc}")
         detail = "; ".join(attempts) if attempts else "no backends were attempted"
         raise RuntimeError(f"Could not open camera source {self.source!r}. {detail}")
+
+    def _sdk_resolution_index(self) -> int | None:
+        return _SDK_RESOLUTION_INDEX_BY_WIDTH.get(int(self.width))
 
     def read(self, calculate_focus_scores: bool = True) -> CameraFrame | None:
         if not self.is_open:
