@@ -91,10 +91,33 @@ function Check-Connections {
     Show-ConnectionsWindow
 }
 
+function Check-Sessions {
+    Show-SessionsWindow
+}
+
 function Get-ConnectionSnapshot {
     $token = Get-WebToken
     $headers = @{ "X-Access-Token" = $token }
     return Invoke-RestMethod -Uri "http://127.0.0.1:$WebPort/api/connections" -Headers $headers -TimeoutSec 5
+}
+
+function Get-SessionSnapshot {
+    $token = Get-WebToken
+    $headers = @{ "X-Access-Token" = $token }
+    return Invoke-RestMethod -Uri "http://127.0.0.1:$WebPort/api/autotest/sessions?limit=100" -Headers $headers -TimeoutSec 10
+}
+
+function Format-FileSize {
+    param([double]$Bytes)
+    if ($Bytes -lt 1024) { return ("{0:N0} B" -f $Bytes) }
+    $units = @("KiB", "MiB", "GiB", "TiB")
+    $size = $Bytes / 1024
+    $index = 0
+    while ($size -ge 1024 -and $index -lt ($units.Count - 1)) {
+        $size = $size / 1024
+        $index += 1
+    }
+    return ("{0:N1} {1}" -f $size, $units[$index])
 }
 
 function Show-ConnectionsWindow {
@@ -125,11 +148,11 @@ function Show-ConnectionsWindow {
     $grid.BackColor = [System.Drawing.Color]::FromArgb(22, 30, 38)
     $grid.ForeColor = [System.Drawing.Color]::White
     [void]$grid.Columns.Add("IP", 130)
-    [void]$grid.Columns.Add("Streams", 70)
     [void]$grid.Columns.Add("Active Req", 80)
+    [void]$grid.Columns.Add("Downloads", 80)
     [void]$grid.Columns.Add("Total Req", 80)
     [void]$grid.Columns.Add("Last Seen", 80)
-    [void]$grid.Columns.Add("Last Path", 140)
+    [void]$grid.Columns.Add("Last Path", 190)
     [void]$grid.Columns.Add("User Agent", 260)
     $form.Controls.Add($grid)
 
@@ -156,12 +179,12 @@ function Show-ConnectionsWindow {
     $refreshAction = {
         try {
             $data = Get-ConnectionSnapshot
-            $summary.Text = "Active camera streams: $($data.active_camera_streams)    Active HTTP requests: $($data.active_http_requests)    Total requests: $($data.total_http_requests)    Sources: $($data.client_count)"
+            $summary.Text = "Active HTTP requests: $($data.active_http_requests)    Total requests: $($data.total_http_requests)    File downloads: $($data.total_file_downloads)    Sources: $($data.client_count)"
             $grid.Items.Clear()
             foreach ($client in $data.clients) {
                 $item = New-Object System.Windows.Forms.ListViewItem([string]$client.ip)
-                [void]$item.SubItems.Add([string]$client.active_camera_streams)
                 [void]$item.SubItems.Add([string]$client.active_requests)
+                [void]$item.SubItems.Add([string]$client.file_downloads)
                 [void]$item.SubItems.Add([string]$client.total_requests)
                 [void]$item.SubItems.Add(("{0}s" -f $client.last_seen_seconds_ago))
                 [void]$item.SubItems.Add([string]$client.last_path)
@@ -191,6 +214,128 @@ function Show-ConnectionsWindow {
     [void]$form.ShowDialog()
 }
 
+function Show-SessionsWindow {
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Semi Auto Probe AutoTest Sessions"
+    $form.Size = New-Object System.Drawing.Size(900, 540)
+    $form.StartPosition = "CenterScreen"
+    $form.FormBorderStyle = "FixedDialog"
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.BackColor = [System.Drawing.Color]::FromArgb(18, 24, 30)
+    $form.ForeColor = [System.Drawing.Color]::White
+
+    $summary = New-Object System.Windows.Forms.Label
+    $summary.AutoSize = $false
+    $summary.Location = New-Object System.Drawing.Point(16, 14)
+    $summary.Size = New-Object System.Drawing.Size(840, 44)
+    $summary.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Regular)
+    $summary.ForeColor = [System.Drawing.Color]::Gainsboro
+    $form.Controls.Add($summary)
+
+    $grid = New-Object System.Windows.Forms.ListView
+    $grid.Location = New-Object System.Drawing.Point(16, 68)
+    $grid.Size = New-Object System.Drawing.Size(840, 250)
+    $grid.View = [System.Windows.Forms.View]::Details
+    $grid.FullRowSelect = $true
+    $grid.GridLines = $true
+    $grid.BackColor = [System.Drawing.Color]::FromArgb(22, 30, 38)
+    $grid.ForeColor = [System.Drawing.Color]::White
+    [void]$grid.Columns.Add("Session", 150)
+    [void]$grid.Columns.Add("Status", 80)
+    [void]$grid.Columns.Add("Files", 70)
+    [void]$grid.Columns.Add("JSON", 70)
+    [void]$grid.Columns.Add("CSV", 70)
+    [void]$grid.Columns.Add("Images", 80)
+    [void]$grid.Columns.Add("Size", 90)
+    [void]$grid.Columns.Add("Modified", 180)
+    $form.Controls.Add($grid)
+
+    $detail = New-Object System.Windows.Forms.TextBox
+    $detail.Location = New-Object System.Drawing.Point(16, 330)
+    $detail.Size = New-Object System.Drawing.Size(650, 110)
+    $detail.Multiline = $true
+    $detail.ReadOnly = $true
+    $detail.ScrollBars = "Vertical"
+    $detail.BackColor = [System.Drawing.Color]::FromArgb(12, 15, 18)
+    $detail.ForeColor = [System.Drawing.Color]::Gainsboro
+    $detail.Font = New-Object System.Drawing.Font("Consolas", 9, [System.Drawing.FontStyle]::Regular)
+    $form.Controls.Add($detail)
+
+    $refreshLabel = New-Object System.Windows.Forms.Label
+    $refreshLabel.AutoSize = $false
+    $refreshLabel.Location = New-Object System.Drawing.Point(16, 452)
+    $refreshLabel.Size = New-Object System.Drawing.Size(450, 24)
+    $refreshLabel.ForeColor = [System.Drawing.Color]::DarkGray
+    $form.Controls.Add($refreshLabel)
+
+    $openButton = New-Object System.Windows.Forms.Button
+    $openButton.Text = "Open Web"
+    $openButton.Location = New-Object System.Drawing.Point(678, 332)
+    $openButton.Size = New-Object System.Drawing.Size(178, 32)
+    $openButton.Add_Click({ Start-Process "http://127.0.0.1:$WebPort" })
+    $form.Controls.Add($openButton)
+
+    $refreshButton = New-Object System.Windows.Forms.Button
+    $refreshButton.Text = "Refresh"
+    $refreshButton.Location = New-Object System.Drawing.Point(678, 374)
+    $refreshButton.Size = New-Object System.Drawing.Size(84, 30)
+    $form.Controls.Add($refreshButton)
+
+    $closeButton = New-Object System.Windows.Forms.Button
+    $closeButton.Text = "Close"
+    $closeButton.Location = New-Object System.Drawing.Point(772, 374)
+    $closeButton.Size = New-Object System.Drawing.Size(84, 30)
+    $closeButton.Add_Click({ $form.Close() })
+    $form.Controls.Add($closeButton)
+
+    $grid.Add_SelectedIndexChanged({
+        if ($grid.SelectedItems.Count -eq 0) { return }
+        $session = $grid.SelectedItems[0].Tag
+        $categories = $session.categories
+        $detail.Text = @(
+            "Session: $($session.id)",
+            "Path: $($session.relative_path)",
+            "Modified: $($session.modified_at)",
+            "Images: $($categories.images.file_count) files, $(Format-FileSize $categories.images.size_bytes)",
+            "IV: $($categories.iv.file_count) files, $(Format-FileSize $categories.iv.size_bytes)",
+            "WobbTest: $($categories.wobb.file_count) files, $(Format-FileSize $categories.wobb.size_bytes)",
+            "B1500: $($categories.b1500.file_count) files, $(Format-FileSize $categories.b1500.size_bytes)"
+        ) -join [Environment]::NewLine
+    })
+
+    $refreshAction = {
+        try {
+            $data = Get-SessionSnapshot
+            $summary.Text = "Root: $($data.root)    Sessions listed: $($data.listed_session_count)/$($data.total_session_count)    Files: $($data.totals.files)    JSON: $($data.totals.json)    Size: $(Format-FileSize $data.totals.size_bytes)"
+            $grid.Items.Clear()
+            foreach ($session in @($data.sessions)) {
+                $item = New-Object System.Windows.Forms.ListViewItem([string]$session.id)
+                [void]$item.SubItems.Add([string]$session.status)
+                [void]$item.SubItems.Add([string]$session.file_count)
+                [void]$item.SubItems.Add([string]$session.counts.json)
+                [void]$item.SubItems.Add([string]$session.counts.csv)
+                [void]$item.SubItems.Add([string]$session.counts.images)
+                [void]$item.SubItems.Add((Format-FileSize $session.size_bytes))
+                [void]$item.SubItems.Add([string]$session.modified_at)
+                $item.Tag = $session
+                [void]$grid.Items.Add($item)
+            }
+            if ($grid.Items.Count -gt 0) {
+                $grid.Items[0].Selected = $true
+            }
+            $refreshLabel.Text = "Last refresh: $(Get-Date -Format 'HH:mm:ss')"
+        } catch {
+            $summary.Text = "Unable to read AutoTest sessions: $($_.Exception.Message)"
+            $refreshLabel.Text = "Last refresh failed: $(Get-Date -Format 'HH:mm:ss')"
+        }
+    }
+
+    $refreshButton.Add_Click($refreshAction)
+    $form.Add_Shown({ & $refreshAction })
+    [void]$form.ShowDialog()
+}
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName Microsoft.VisualBasic
@@ -206,6 +351,9 @@ $openItem = $menu.Items.Add("Open Dashboard")
 $openItem.add_Click({
     Start-Process "http://127.0.0.1:8000"
 })
+
+$sessionsItem = $menu.Items.Add("AutoTest Sessions")
+$sessionsItem.add_Click({ Check-Sessions })
 
 $restartItem = $menu.Items.Add("Restart Web Service")
 $restartItem.add_Click({

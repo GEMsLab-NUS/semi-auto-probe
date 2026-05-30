@@ -559,6 +559,43 @@ class GDSMapperMotionBridgeTests(unittest.TestCase):
         self.assertEqual(moves, [(11.0, 20.0, None)])
         self.assertIn("Layout UV jog requested", panel.motion_status_var.get())
 
+    def test_stage_xy_jog_buttons_invert_screen_x_to_stage_x(self) -> None:
+        specs = {text: (dx, dy) for text, dx, dy, *_rest in GDSStageMapperPanel._jog_button_specs(x_sign=-1.0)}
+
+        self.assertEqual(specs["\u2190"], (1.0, 0.0))
+        self.assertEqual(specs["\u2192"], (-1.0, 0.0))
+        self.assertEqual(specs["\u2196"], (1.0, 1.0))
+        self.assertEqual(specs["\u2198"], (-1.0, -1.0))
+
+    def test_probe_assist_du_uses_layout_uv_direction(self) -> None:
+        class FakeViewer:
+            def __init__(self) -> None:
+                self.points = None
+
+            def set_auxiliary_points(self, points):
+                self.points = points
+
+        panel = self.panel_for_coordinate_tests()
+        panel.viewer = FakeViewer()
+        panel.mapper = AffineCoordinateMapper.fit(
+            [
+                CalibrationPoint("P1", 0.0, 0.0, 10.0, 20.0),
+                CalibrationPoint("P2", 10.0, 0.0, 20.0, 20.0),
+                CalibrationPoint("P3", 0.0, 10.0, 10.0, 30.0),
+                CalibrationPoint("P4", 10.0, 10.0, 20.0, 30.0),
+            ]
+        )
+        panel.assist_enabled_var = DummyVar(True)
+        panel.assist_du_var = DummyVar("2")
+        panel.assist_dv_var = DummyVar("3")
+        panel.assist_label_var = DummyVar("Probe")
+        panel.assist_style_var = DummyVar("cross")
+        panel.assist_color_var = DummyVar("#f43f5e")
+
+        GDSStageMapperPanel._update_auxiliary_points(panel, center_gds=(8.0, 9.0))
+
+        self.assertEqual(panel.viewer.points[0].point, (10.0, 12.0))
+
     def test_autosave_writes_default_ignored_layoutbond_file(self) -> None:
         panel = self.panel_for_coordinate_tests()
         panel.gds_path = None

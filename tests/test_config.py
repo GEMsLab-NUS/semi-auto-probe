@@ -45,6 +45,12 @@ class ProbeConfigTest(unittest.TestCase):
         self.assertEqual(config.camera_exposure, 0.0)
         self.assertEqual(config.camera_gain_mode, CAMERA_CONTROL_MODE_AUTO)
         self.assertEqual(config.camera_gain, 0.0)
+        self.assertEqual(config.camera_white_balance_mode, CAMERA_CONTROL_MODE_AUTO)
+        self.assertEqual(config.camera_white_balance_temperature, 6500.0)
+        self.assertEqual(config.camera_color_saturation, 128.0)
+        self.assertEqual(config.camera_color_brightness, 0.0)
+        self.assertEqual(config.camera_color_contrast, 0.0)
+        self.assertEqual(config.camera_color_gamma, 100.0)
         self.assertEqual(config.camera_source, "auto")
         self.assertEqual(config.objective, 10)
         self.assertEqual(config.motor_axis_polarity, {"X": 1, "Y": 1, "Z": 1})
@@ -59,6 +65,8 @@ class ProbeConfigTest(unittest.TestCase):
         )
         self.assertAlmostEqual(config.cc_accel_time_s, 0.3)
         self.assertEqual(config.cc_acceleration_units(), 30)
+        self.assertAlmostEqual(config.layoutbond_fov_width_um, 540.0)
+        self.assertAlmostEqual(config.layoutbond_fov_height_um, 450.0)
 
     def test_cc_acceleration_time_cannot_be_zero(self) -> None:
         config = ProbeConfig(cc_accel_time_s=0)
@@ -135,6 +143,12 @@ class ProbeConfigTest(unittest.TestCase):
                 camera_exposure=-6.0,
                 camera_gain_mode=CAMERA_CONTROL_MODE_MANUAL,
                 camera_gain=12.5,
+                camera_white_balance_mode=CAMERA_CONTROL_MODE_MANUAL,
+                camera_white_balance_temperature=5200.0,
+                camera_color_saturation=140.0,
+                camera_color_brightness=12.0,
+                camera_color_contrast=-8.0,
+                camera_color_gamma=110.0,
                 camera_source="miicam:0",
                 cc_accel_time_s=0.2,
                 layoutbond_fov_width_um=320.0,
@@ -165,6 +179,12 @@ class ProbeConfigTest(unittest.TestCase):
             self.assertAlmostEqual(loaded.camera_exposure, -6.0)
             self.assertEqual(loaded.camera_gain_mode, CAMERA_CONTROL_MODE_MANUAL)
             self.assertAlmostEqual(loaded.camera_gain, 12.5)
+            self.assertEqual(loaded.camera_white_balance_mode, CAMERA_CONTROL_MODE_MANUAL)
+            self.assertAlmostEqual(loaded.camera_white_balance_temperature, 5200.0)
+            self.assertAlmostEqual(loaded.camera_color_saturation, 140.0)
+            self.assertAlmostEqual(loaded.camera_color_brightness, 12.0)
+            self.assertAlmostEqual(loaded.camera_color_contrast, -8.0)
+            self.assertAlmostEqual(loaded.camera_color_gamma, 110.0)
             self.assertEqual(loaded.camera_source, "miicam:0")
             self.assertAlmostEqual(loaded.cc_accel_time_s, 0.2)
             self.assertAlmostEqual(loaded.layoutbond_fov_width_um, 320.0)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from semi_auto_probe.gds_stage_mapper import AffineCoordinateMapper, CalibrationPoint
-from semi_auto_probe.img_matrix import ImgMatrixSettings, generate_imgmatrix_points, imgmatrix_filename
+from semi_auto_probe.img_matrix import ImgMatrixSettings, fov_polygon_for_stage_target, generate_imgmatrix_points, imgmatrix_filename
 
 
 class ImgMatrixTests(unittest.TestCase):
@@ -48,6 +48,14 @@ class ImgMatrixTests(unittest.TestCase):
             ImgMatrixSettings(0, 0, 1, 0, 0, 1, 0, 1, 10, 10).normalized()
         with self.assertRaisesRegex(ValueError, "non-zero"):
             ImgMatrixSettings(0, 0, 0, 0, 0, 1, 1, 1, 10, 10).normalized()
+
+    def test_fov_polygon_uses_camera_image_orientation(self) -> None:
+        polygon = fov_polygon_for_stage_target(self.mapper(), 100.0, 200.0, 20.0, 10.0)
+
+        self.assertAlmostEqual(polygon[0][0], 5.0)
+        self.assertAlmostEqual(polygon[0][1], 1.6666666666666667)
+        self.assertAlmostEqual(polygon[1][0], -5.0)
+        self.assertAlmostEqual(polygon[1][1], 1.6666666666666667)
 
     def test_filename_uses_layout_uv_coordinates(self) -> None:
         self.assertEqual(imgmatrix_filename(1, 2, -12.5, 3.25), "r001_c002_um12p5_v3p25.png")

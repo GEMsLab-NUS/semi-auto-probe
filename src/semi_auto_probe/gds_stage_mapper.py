@@ -14,6 +14,8 @@ from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 
+from .camera_stage_transform import fov_stage_corners_from_image_frame
+
 
 GDS_MISSING_MESSAGE = "gdstk is required for GDS loading. Please install it with: pip install gdstk"
 DEFAULT_MAX_GDS_SHAPES: int | None = None
@@ -1356,6 +1358,7 @@ class GDSStageMapperPanel:
         move_to_stage_xyz_um: Callable[[float, float, float | None], None] | None = None,
         get_focus_z_um: Callable[[float, float], float | None] | None = None,
         get_microscope_preview: Callable[[], bytes | None] | None = None,
+        get_camera_fov_rotation_deg: Callable[[], float] | None = None,
         fov_width_var: tk.StringVar | None = None,
         fov_height_var: tk.StringVar | None = None,
         use_focus_z_var: tk.BooleanVar | None = None,
@@ -1369,6 +1372,7 @@ class GDSStageMapperPanel:
         self.move_to_stage_xyz_um = move_to_stage_xyz_um
         self.get_focus_z_um = get_focus_z_um
         self.get_microscope_preview = get_microscope_preview
+        self.get_camera_fov_rotation_deg = get_camera_fov_rotation_deg or (lambda: 0.0)
         self.on_focus_z_toggle = on_focus_z_toggle
         self.on_layout_changed = on_layout_changed
         self.set_app_status = set_status
@@ -1650,11 +1654,25 @@ class GDSStageMapperPanel:
         panel = ttk.LabelFrame(parent, text="Stage Jog", padding=8)
         panel.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         panel.columnconfigure((0, 1), weight=1, uniform="stage_jog_groups")
-        xy = self._build_jog_group(panel, "XY", "um", self.stage_jog_step_um_var, self._move_stage_jog)
+        xy = self._build_jog_group(panel, "XY", "um", self.stage_jog_step_um_var, self._move_stage_jog, x_sign=-1.0)
         xy.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
         uv = self._build_jog_group(panel, "UV", "UV", self.layout_jog_step_uv_var, self._move_layout_uv_jog, gated=True)
         uv.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
         self._update_layout_jog_state()
+
+    @staticmethod
+    def _jog_button_specs(x_sign: float = 1.0) -> tuple[tuple[str, float, float, int, int, tuple[int, int], tuple[int, int]], ...]:
+        x = -1.0 if x_sign < 0 else 1.0
+        return (
+            ("\u2196", -x, 1.0, 0, 0, (0, 1), (0, 1)),
+            ("\u2191", 0.0, 1.0, 0, 1, (0, 1), (0, 1)),
+            ("\u2197", x, 1.0, 0, 2, (0, 1), (0, 0)),
+            ("\u2190", -x, 0.0, 1, 0, (0, 1), (0, 1)),
+            ("\u2192", x, 0.0, 1, 2, (0, 1), (0, 0)),
+            ("\u2199", -x, -1.0, 2, 0, (0, 0), (0, 1)),
+            ("\u2193", 0.0, -1.0, 2, 1, (0, 0), (0, 1)),
+            ("\u2198", x, -1.0, 2, 2, (0, 0), (0, 0)),
+        )
 
     def _build_jog_group(
         self,
@@ -1665,21 +1683,12 @@ class GDSStageMapperPanel:
         command: Callable[[float, float], None],
         *,
         gated: bool = False,
+        x_sign: float = 1.0,
     ) -> ttk.LabelFrame:
         group = ttk.LabelFrame(parent, text=title, padding=6)
         group.columnconfigure((0, 1, 2), weight=1, uniform=f"{title}_cols")
-        buttons = (
-            ("\u2196", -1.0, 1.0, 0, 0, (0, 1), (0, 1)),
-            ("\u2191", 0.0, 1.0, 0, 1, (0, 1), (0, 1)),
-            ("\u2197", 1.0, 1.0, 0, 2, (0, 1), (0, 0)),
-            ("\u2190", -1.0, 0.0, 1, 0, (0, 1), (0, 1)),
-            ("\u2192", 1.0, 0.0, 1, 2, (0, 1), (0, 0)),
-            ("\u2199", -1.0, -1.0, 2, 0, (0, 0), (0, 1)),
-            ("\u2193", 0.0, -1.0, 2, 1, (0, 0), (0, 1)),
-            ("\u2198", 1.0, -1.0, 2, 2, (0, 0), (0, 0)),
-        )
         created_buttons: list[ttk.Button] = []
-        for text, dx, dy, row, column, pady, padx in buttons:
+        for text, dx, dy, row, column, pady, padx in self._jog_button_specs(x_sign):
             button = ttk.Button(group, text=text, width=2, command=lambda x=dx, y=dy: command(x, y))
             button.grid(row=row, column=column, sticky="ew", padx=padx, pady=pady)
             created_buttons.append(button)
@@ -2575,12 +2584,13 @@ class GDSStageMapperPanel:
             if width_um <= 0 or height_um <= 0:
                 raise ValueError("FOV dimensions must be positive.")
             center_gds = self.mapper.stage_to_gds(x_um, y_um)
-            corners_stage = [
-                (x_um - width_um / 2.0, y_um - height_um / 2.0),
-                (x_um + width_um / 2.0, y_um - height_um / 2.0),
-                (x_um + width_um / 2.0, y_um + height_um / 2.0),
-                (x_um - width_um / 2.0, y_um + height_um / 2.0),
-            ]
+            corners_stage = fov_stage_corners_from_image_frame(
+                x_um,
+                y_um,
+                width_um,
+                height_um,
+                self.get_camera_fov_rotation_deg(),
+            )
             corners_gds = [self.mapper.stage_to_gds(x, y) for x, y in corners_stage]
         except Exception as exc:
             self.current_stage_var.set(f"Current stage: unavailable ({exc})")

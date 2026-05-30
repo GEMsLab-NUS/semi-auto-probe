@@ -3,90 +3,134 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Semi Auto Probe Monitor</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260517-camera-source" />
+    <title>Semi Auto Probe AutoTest Sessions</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260530-autotest-files-3" />
   </head>
   <body>
     <main class="shell">
       <header class="topbar">
-        <div>
+        <div class="brandBlock">
           <h1>Semi Auto Probe</h1>
-          <p>Remote monitoring dashboard</p>
+          <p>AutoTest session file browser</p>
         </div>
-        <time id="clock">--:--:--</time>
+        <div class="topActions">
+          <div class="tokenBox">
+            <label for="token">Access Token</label>
+            <input id="token" type="password" autocomplete="current-password" placeholder="Required when configured" />
+            <button id="saveToken" type="button">Save</button>
+          </div>
+          <time id="clock">--:--:--</time>
+        </div>
       </header>
 
-      <section class="statusGrid">
+      <section class="statusGrid" aria-label="AutoTest overview">
         <article class="metric">
-          <span>Desktop App</span>
-          <strong id="desktopState">Unknown</strong>
+          <span>Sessions</span>
+          <strong id="sessionCount">-</strong>
         </article>
         <article class="metric">
-          <span>Camera Feed</span>
-          <strong id="cameraState">Unknown</strong>
+          <span>Files</span>
+          <strong id="fileCount">-</strong>
         </article>
         <article class="metric">
-          <span>Serial Link</span>
-          <strong id="serialState">Unknown</strong>
+          <span>JSON Metadata</span>
+          <strong id="jsonCount">-</strong>
         </article>
         <article class="metric">
-          <span>Monitor Rate</span>
-          <strong id="rateState">1 FPS</strong>
+          <span>Total Size</span>
+          <strong id="sizeCount">-</strong>
         </article>
       </section>
 
-      <section class="mainGrid">
-        <section class="panel visionPanel">
+      <section class="workspace">
+        <aside class="panel sessionPanel" aria-label="AutoTest sessions">
           <div class="panelHead">
-            <h2>Optical View</h2>
-            <span class="pill" id="feedPill">Standby</span>
-          </div>
-          <div class="videoBox" id="videoBox">
-            <img id="cameraFeed" alt="" />
-            <div class="emptyState" id="cameraEmpty">
-              <strong>Camera stream is starting</strong>
-              <span>The dashboard will use the local desktop feed when available, otherwise it opens the camera directly.</span>
+            <div>
+              <h2>Test History</h2>
+              <p id="rootPath">Waiting for session root</p>
             </div>
+            <button id="refreshSessions" type="button">Refresh</button>
+          </div>
+          <div class="sessionList" id="sessionList"></div>
+        </aside>
+
+        <section class="panel detailPanel" aria-label="Selected session detail">
+          <div class="panelHead">
+            <div>
+              <h2 id="detailTitle">Session Detail</h2>
+              <p id="detailSubtitle">Select a session to inspect its files</p>
+            </div>
+            <span class="statusPill" id="sessionStatus">Standby</span>
+          </div>
+
+          <div class="detailStats" id="detailStats"></div>
+          <div class="categoryStrip" id="categoryStrip"></div>
+          <div class="previewGrid" id="previewGrid"></div>
+
+          <div class="tableTools">
+            <div class="filterRow">
+              <select id="categoryFilter" aria-label="File category">
+                <option value="all">All files</option>
+                <option value="images">Images</option>
+                <option value="iv">IV</option>
+                <option value="wobb">WobbTest</option>
+                <option value="b1500">B1500</option>
+                <option value="other">Other</option>
+              </select>
+              <input id="fileSearch" type="search" placeholder="Filter files" />
+            </div>
+          </div>
+
+          <div class="fileTableWrap">
+            <table class="fileTable">
+              <thead>
+                <tr>
+                  <th>File</th>
+                  <th>Type</th>
+                  <th>Size</th>
+                  <th>Modified</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="fileRows"></tbody>
+            </table>
           </div>
         </section>
 
         <aside class="sideStack">
           <section class="panel">
-            <h2>Camera Source</h2>
-            <div class="sourceRow">
-              <select id="cameraSource"></select>
-              <button id="applySource">Apply</button>
+            <div class="panelHead">
+              <div>
+                <h2>JSON Index</h2>
+                <p id="jsonIndexSubtitle">No metadata loaded</p>
+              </div>
             </div>
+            <div class="jsonList" id="jsonList"></div>
+          </section>
+
+          <section class="panel jsonPanel">
+            <div class="panelHead">
+              <div>
+                <h2 id="jsonTitle">JSON Preview</h2>
+                <p id="jsonSubtitle">Select a metadata file</p>
+              </div>
+              <button id="copyJson" type="button">Copy</button>
+            </div>
+            <pre id="jsonPreview"></pre>
           </section>
 
           <section class="panel">
             <div class="panelHead">
-              <h2>Stage Position</h2>
-              <span class="pill" id="positionPill">Idle</span>
+              <div>
+                <h2>Activity</h2>
+                <p id="connectionSummary">Waiting for API</p>
+              </div>
             </div>
-            <div class="axisGrid">
-              <div><span>X</span><strong id="posX">-</strong></div>
-              <div><span>Y</span><strong id="posY">-</strong></div>
-              <div><span>Z</span><strong id="posZ">-</strong></div>
-            </div>
-          </section>
-
-          <section class="panel">
-            <h2>Access</h2>
-            <label>Access Token</label>
-            <div class="tokenRow">
-              <input id="token" type="password" autocomplete="current-password" placeholder="Optional" />
-              <button id="saveToken">Save</button>
-            </div>
-          </section>
-
-          <section class="panel">
-            <h2>System Log</h2>
             <pre id="log"></pre>
           </section>
         </aside>
       </section>
     </main>
-    <script src="/static/app.js?v=20260517-camera-source"></script>
+    <script src="/static/app.js?v=20260530-autotest-files-3"></script>
   </body>
 </html>

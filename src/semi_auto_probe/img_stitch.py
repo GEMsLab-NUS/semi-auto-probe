@@ -7,7 +7,7 @@ from typing import Iterable
 
 import numpy as np
 
-from .camera_stage_transform import normalize_camera_fov_rotation_deg, stage_delta_um_to_image_delta_px
+from .camera_stage_transform import image_delta_px_to_stage_delta_um, normalize_camera_fov_rotation_deg, stage_delta_um_to_image_delta_px
 
 try:
     import cv2
@@ -538,6 +538,32 @@ def stage_positions_from_um(
         )
         for tile in records
     }
+
+
+def mosaic_pixel_to_stage_um(
+    session: StitchSession,
+    positions: dict[GridIndex, tuple[float, float]],
+    image_x_px: float,
+    image_y_px: float,
+) -> tuple[float, float]:
+    if not session.tiles:
+        raise ValueError("Stitch session has no tiles.")
+    if not positions:
+        raise ValueError("Stitch session has no mosaic positions.")
+    if session.um_per_px <= 0:
+        raise ValueError("um_per_px must be positive.")
+    min_x = min(position[0] for position in positions.values())
+    min_y = min(position[1] for position in positions.values())
+    raw_x_px = float(image_x_px) + min_x
+    raw_y_px = float(image_y_px) + min_y
+    stage_dx_um, stage_dy_um = image_delta_px_to_stage_delta_um(
+        raw_x_px,
+        raw_y_px,
+        session.um_per_px,
+        session.camera_fov_rotation_deg,
+    )
+    first_tile = session.tiles[0]
+    return first_tile.stage_x_um + stage_dx_um, first_tile.stage_y_um + stage_dy_um
 
 
 def _direction_from_expected_shift(previous: GridIndex, current: GridIndex, shift: tuple[float, float]) -> str:

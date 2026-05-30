@@ -8,6 +8,7 @@ from pathlib import Path
 from tkinter import ttk
 from typing import Callable
 
+from .camera_stage_transform import fov_stage_corners_from_image_frame
 from .gds_stage_mapper import AuxiliaryPointOverlay, AffineCoordinateMapper, GDSCanvasViewer, GDSLayoutModel, MatrixOverlay
 
 
@@ -83,7 +84,11 @@ class ImgMatrixPoint:
         return imgmatrix_filename(self.row, self.col, self.u, self.v)
 
 
-def generate_imgmatrix_points(settings: ImgMatrixSettings, mapper: AffineCoordinateMapper) -> tuple[ImgMatrixPoint, ...]:
+def generate_imgmatrix_points(
+    settings: ImgMatrixSettings,
+    mapper: AffineCoordinateMapper,
+    camera_fov_rotation_deg: float = 0.0,
+) -> tuple[ImgMatrixPoint, ...]:
     normalized = settings.normalized()
     points: list[ImgMatrixPoint] = []
     order = 1
@@ -107,6 +112,7 @@ def generate_imgmatrix_points(settings: ImgMatrixSettings, mapper: AffineCoordin
                         stage_y_um,
                         normalized.fov_width_um,
                         normalized.fov_height_um,
+                        camera_fov_rotation_deg,
                     ),
                 )
             )
@@ -120,14 +126,14 @@ def fov_polygon_for_stage_target(
     center_y_um: float,
     width_um: float,
     height_um: float,
+    camera_fov_rotation_deg: float = 0.0,
 ) -> tuple[tuple[float, float], ...]:
-    if width_um <= 0 or height_um <= 0:
-        raise ValueError("FOV dimensions must be positive.")
-    corners_stage = (
-        (center_x_um - width_um / 2.0, center_y_um - height_um / 2.0),
-        (center_x_um + width_um / 2.0, center_y_um - height_um / 2.0),
-        (center_x_um + width_um / 2.0, center_y_um + height_um / 2.0),
-        (center_x_um - width_um / 2.0, center_y_um + height_um / 2.0),
+    corners_stage = fov_stage_corners_from_image_frame(
+        center_x_um,
+        center_y_um,
+        width_um,
+        height_um,
+        camera_fov_rotation_deg,
     )
     return tuple(mapper.stage_to_gds(x_um, y_um) for x_um, y_um in corners_stage)
 
@@ -169,6 +175,7 @@ class ImgMatrixPanel:
         z_stack_save_raw_var: tk.BooleanVar,
         start_run: Callable[[ImgMatrixSettings], None],
         stop_run: Callable[[], None],
+        get_camera_fov_rotation_deg: Callable[[], float] | None = None,
         set_status: Callable[[str], None] | None = None,
         on_overlay_changed: Callable[[list[MatrixOverlay]], None] | None = None,
     ) -> None:
@@ -176,6 +183,7 @@ class ImgMatrixPanel:
         self.get_stage_position_um = get_stage_position_um
         self.get_mapper = get_mapper
         self.get_microscope_preview = get_microscope_preview
+        self.get_camera_fov_rotation_deg = get_camera_fov_rotation_deg or (lambda: 0.0)
         self.fov_width_var = fov_width_var
         self.fov_height_var = fov_height_var
         self.tile_acquisition_var = tile_acquisition_var
@@ -656,10 +664,11 @@ class ImgMatrixPanel:
             settings.cols,
             settings.fov_width_um,
             settings.fov_height_um,
+            round(float(self.get_camera_fov_rotation_deg()), 8),
         )
         if self._preview_cache_key == key and self._preview_cache_points is not None:
             return self._preview_cache_points
-        points = generate_imgmatrix_points(settings, mapper)
+        points = generate_imgmatrix_points(settings, mapper, self.get_camera_fov_rotation_deg())
         self._preview_cache_key = key
         self._preview_cache_points = points
         return points
@@ -762,13 +771,10 @@ class ImgMatrixPanel:
             if width_um <= 0 or height_um <= 0:
                 raise ValueError
             center_gds = mapper.stage_to_gds(x_um, y_um)
-            corners_stage = [
-                (x_um - width_um / 2.0, y_um - height_um / 2.0),
-                (x_um + width_um / 2.0, y_um - height_um / 2.0),
-                (x_um + width_um / 2.0, y_um + height_um / 2.0),
-                (x_um - width_um / 2.0, y_um + height_um / 2.0),
-            ]
-            self.viewer.set_stage_overlay(center_gds, [mapper.stage_to_gds(x, y) for x, y in corners_stage])
+            self.viewer.set_stage_overlay(
+                center_gds,
+                list(fov_polygon_for_stage_target(mapper, x_um, y_um, width_um, height_um, self.get_camera_fov_rotation_deg())),
+            )
             self._update_auxiliary_points(center_gds)
         except Exception:
             self.viewer.set_stage_overlay(None, None)

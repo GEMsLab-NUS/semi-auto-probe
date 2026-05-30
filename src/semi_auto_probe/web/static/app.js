@@ -1,74 +1,58 @@
 const els = {
   clock: document.querySelector("#clock"),
-  desktopState: document.querySelector("#desktopState"),
-  cameraState: document.querySelector("#cameraState"),
-  serialState: document.querySelector("#serialState"),
-  rateState: document.querySelector("#rateState"),
-  feedPill: document.querySelector("#feedPill"),
-  positionPill: document.querySelector("#positionPill"),
-  cameraSource: document.querySelector("#cameraSource"),
-  applySource: document.querySelector("#applySource"),
   token: document.querySelector("#token"),
   saveToken: document.querySelector("#saveToken"),
-  posX: document.querySelector("#posX"),
-  posY: document.querySelector("#posY"),
-  posZ: document.querySelector("#posZ"),
-  cameraFeed: document.querySelector("#cameraFeed"),
-  cameraEmpty: document.querySelector("#cameraEmpty"),
+  sessionCount: document.querySelector("#sessionCount"),
+  fileCount: document.querySelector("#fileCount"),
+  jsonCount: document.querySelector("#jsonCount"),
+  sizeCount: document.querySelector("#sizeCount"),
+  rootPath: document.querySelector("#rootPath"),
+  refreshSessions: document.querySelector("#refreshSessions"),
+  sessionList: document.querySelector("#sessionList"),
+  detailTitle: document.querySelector("#detailTitle"),
+  detailSubtitle: document.querySelector("#detailSubtitle"),
+  sessionStatus: document.querySelector("#sessionStatus"),
+  detailStats: document.querySelector("#detailStats"),
+  categoryStrip: document.querySelector("#categoryStrip"),
+  previewGrid: document.querySelector("#previewGrid"),
+  categoryFilter: document.querySelector("#categoryFilter"),
+  fileSearch: document.querySelector("#fileSearch"),
+  fileRows: document.querySelector("#fileRows"),
+  jsonIndexSubtitle: document.querySelector("#jsonIndexSubtitle"),
+  jsonList: document.querySelector("#jsonList"),
+  jsonTitle: document.querySelector("#jsonTitle"),
+  jsonSubtitle: document.querySelector("#jsonSubtitle"),
+  jsonPreview: document.querySelector("#jsonPreview"),
+  copyJson: document.querySelector("#copyJson"),
+  connectionSummary: document.querySelector("#connectionSummary"),
   log: document.querySelector("#log"),
 };
 
-let streamActive = false;
-let lastError = "";
+const state = {
+  sessions: [],
+  detail: null,
+  selectedSessionId: null,
+  selectedJsonPath: "",
+  lastJsonText: "",
+};
+
 let tokenSaveTimer = null;
-
+const initialParams = new URLSearchParams(window.location.search);
+if (initialParams.get("token")) {
+  localStorage.setItem("probeWebToken", initialParams.get("token"));
+  initialParams.delete("token");
+  const cleanQuery = initialParams.toString();
+  history.replaceState(null, "", `${location.pathname}${cleanQuery ? `?${cleanQuery}` : ""}`);
+}
 els.token.value = localStorage.getItem("probeWebToken") || "";
-populateFallbackCameraSources();
 
-function token() {
+function accessToken() {
   return localStorage.getItem("probeWebToken") || "";
-}
-
-function selectedSource() {
-  return els.cameraSource.value || "auto";
-}
-
-function cameraUrl() {
-  const savedToken = token();
-  const query = new URLSearchParams({ ts: String(Date.now()), source: selectedSource() });
-  if (savedToken) query.set("token", savedToken);
-  return `/camera.mjpg?${query.toString()}`;
-}
-
-function log(message, data) {
-  const detail = data ? ` ${JSON.stringify(data)}` : "";
-  els.log.textContent = `[${new Date().toLocaleTimeString()}] ${message}${detail}\n${els.log.textContent}`;
-}
-
-function setTone(element, tone) {
-  element.dataset.tone = tone;
-}
-
-function populateFallbackCameraSources() {
-  if (els.cameraSource.options.length > 0) return;
-  const fallbackSources = [
-    { id: "auto", label: "Auto", fps: "1/10" },
-    { id: "desktop", label: "Microscope feed", fps: 1 },
-    { id: "direct:0", label: "ProbeOM", fps: 10 },
-    { id: "direct:1", label: "EmbeddedCam", fps: 10 },
-    { id: "direct:2", label: "MonitorCam", fps: 10 },
-  ];
-  for (const source of fallbackSources) {
-    const option = document.createElement("option");
-    option.value = source.id;
-    option.textContent = `${source.label} (${source.fps} FPS)`;
-    els.cameraSource.append(option);
-  }
 }
 
 async function api(path, options = {}) {
   const headers = { ...(options.headers || {}) };
-  if (token()) headers["X-Access-Token"] = token();
+  if (accessToken()) headers["X-Access-Token"] = accessToken();
   const response = await fetch(path, { ...options, headers });
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};
@@ -78,162 +62,386 @@ async function api(path, options = {}) {
   return data;
 }
 
-function showStream() {
-  if (!streamActive) {
-    els.cameraFeed.src = cameraUrl();
-    streamActive = true;
-  }
-  els.cameraFeed.style.display = "block";
-  els.cameraEmpty.style.display = "none";
+function encodedPath(path) {
+  return String(path)
+    .split("/")
+    .map((part) => encodeURIComponent(part))
+    .join("/");
 }
 
-function hideStream(title, detail) {
-  if (streamActive) {
-    els.cameraFeed.removeAttribute("src");
-    streamActive = false;
-  }
-  els.cameraFeed.style.display = "none";
-  els.cameraEmpty.style.display = "flex";
-  els.cameraEmpty.querySelector("strong").textContent = title;
-  els.cameraEmpty.querySelector("span").textContent = detail;
+function fileUrl(sessionId, path, { download = false } = {}) {
+  const query = new URLSearchParams();
+  if (download) query.set("download", "true");
+  if (accessToken()) query.set("token", accessToken());
+  return `/api/autotest/sessions/${encodeURIComponent(sessionId)}/files/${encodedPath(path)}?${query.toString()}`;
 }
 
-async function refreshStatus() {
+function log(message, data) {
+  const detail = data ? ` ${JSON.stringify(data)}` : "";
+  els.log.textContent = `[${new Date().toLocaleTimeString()}] ${message}${detail}\n${els.log.textContent}`;
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (value < 1024) return `${value} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let size = value / 1024;
+  let index = 0;
+  while (size >= 1024 && index < units.length - 1) {
+    size /= 1024;
+    index += 1;
+  }
+  return `${size.toFixed(size >= 10 ? 1 : 2)} ${units[index]}`;
+}
+
+function formatDate(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
+}
+
+function statusTone(status) {
+  if (status === "active") return "good";
+  if (status === "empty") return "warn";
+  return "neutral";
+}
+
+function setStatus(text, tone = "neutral") {
+  els.sessionStatus.textContent = text;
+  els.sessionStatus.dataset.tone = tone;
+}
+
+function metric(label, value, subtext = "") {
+  return `<div class="statCell"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong>${subtext ? `<small>${escapeHtml(subtext)}</small>` : ""}</div>`;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+async function refreshSessions({ keepSelection = true } = {}) {
   try {
-    const data = await api("/api/status");
-    lastError = "";
+    const data = await api("/api/autotest/sessions?limit=120");
+    state.sessions = data.sessions || [];
+    els.rootPath.textContent = data.root_exists ? data.root : `${data.root} (missing)`;
+    els.sessionCount.textContent = String(data.total_session_count ?? state.sessions.length);
+    els.fileCount.textContent = String(data.totals?.files ?? "-");
+    els.jsonCount.textContent = String(data.totals?.json ?? "-");
+    els.sizeCount.textContent = formatBytes(data.totals?.size_bytes ?? 0);
+    renderSessionList();
 
-    els.desktopState.textContent = data.desktop_app_running ? "Online" : "Offline";
-    setTone(els.desktopState, data.desktop_app_running ? "good" : "bad");
-
-    els.cameraState.textContent = data.camera_running ? (data.camera_source_label || "Live") : "Unavailable";
-    setTone(els.cameraState, data.camera_running ? "good" : "warn");
-
-    els.serialState.textContent = data.serial_connected ? data.serial_port : "Disconnected";
-    setTone(els.serialState, data.serial_connected ? "good" : "warn");
-
-    els.rateState.textContent = `${Number(data.publisher_fps || (data.desktop_app_running ? 1 : 10)).toFixed(0)} FPS`;
-    els.feedPill.textContent = data.camera_running
-      ? (data.camera_source === "direct" ? "Direct" : "Live")
-      : "Starting";
-    setTone(els.feedPill, data.camera_running ? "good" : "warn");
-
-    if (!data.desktop_app_running) {
-      showStream();
-      if (!data.camera_running) {
-        els.cameraState.textContent = "Direct fallback";
-        setTone(els.cameraState, "warn");
-      }
-      els.positionPill.textContent = "Waiting";
-      setTone(els.positionPill, "warn");
-      return;
+    const keepId = keepSelection && state.selectedSessionId && state.sessions.some((item) => item.id === state.selectedSessionId);
+    if (!keepId && state.sessions.length > 0) {
+      await selectSession(state.sessions[0].id);
+    } else if (state.sessions.length === 0) {
+      clearDetail("No AutoTest sessions found", "Run AutoTest locally to populate the session folder.");
     }
-
-    if (!data.camera_running) {
-      hideStream("Camera feed is not available", "The local software is online, but no recent frame is being published.");
-      els.positionPill.textContent = "Online";
-      setTone(els.positionPill, "good");
-      return;
-    }
-
-    showStream();
   } catch (error) {
-    if (error.message !== lastError) {
-      log("Status error", { message: error.message });
-      lastError = error.message;
-    }
-    els.desktopState.textContent = "Unauthorized";
-    els.cameraState.textContent = "Locked";
-    els.serialState.textContent = "-";
-    setTone(els.desktopState, "bad");
-    setTone(els.cameraState, "bad");
-    hideStream("Access token required", "Enter the monitor token to view the remote dashboard.");
+    log("Session refresh failed", { message: error.message });
+    clearDetail("Access required", "Enter the configured token to inspect AutoTest sessions.");
+    setStatus("Locked", "bad");
   }
 }
 
-async function refreshCameraSources() {
+function renderSessionList() {
+  if (!state.sessions.length) {
+    els.sessionList.innerHTML = `<div class="emptyPanel">No sessions available</div>`;
+    return;
+  }
+  els.sessionList.innerHTML = state.sessions
+    .map((session) => {
+      const selected = session.id === state.selectedSessionId ? " selected" : "";
+      const counts = session.counts || {};
+      return `
+        <button class="sessionItem${selected}" type="button" data-session-id="${escapeHtml(session.id)}">
+          <span class="sessionName">${escapeHtml(session.id)}</span>
+          <span class="sessionMeta">${formatDate(session.modified_at)} · ${counts.json || 0} JSON · ${formatBytes(session.size_bytes)}</span>
+          <span class="sessionFoot">
+            <span class="dot" data-tone="${statusTone(session.status)}"></span>
+            <span>${escapeHtml(session.status)}</span>
+            <span>${session.file_count || 0} files</span>
+          </span>
+        </button>
+      `;
+    })
+    .join("");
+}
+
+async function selectSession(sessionId) {
+  state.selectedSessionId = sessionId;
+  renderSessionList();
+  setStatus("Loading", "warn");
   try {
-    const data = await api("/api/camera-sources");
-    const currentValue = els.cameraSource.value || data.selected || "auto";
-    els.cameraSource.innerHTML = "";
-    for (const source of data.sources) {
-      const option = document.createElement("option");
-      option.value = source.id;
-      option.textContent = `${source.label} (${source.fps} FPS)`;
-      if (!source.available) option.textContent += " - standby";
-      els.cameraSource.append(option);
+    const detail = await api(`/api/autotest/sessions/${encodeURIComponent(sessionId)}?file_limit=8000&json_limit=500`);
+    state.detail = detail;
+    renderDetail();
+    const firstJson = detail.json_documents?.[0];
+    if (firstJson) {
+      await loadJson(firstJson.path);
+    } else {
+      state.selectedJsonPath = "";
+      state.lastJsonText = "";
+      els.jsonTitle.textContent = "JSON Preview";
+      els.jsonSubtitle.textContent = "No JSON metadata in this session";
+      els.jsonPreview.textContent = "";
     }
-    els.cameraSource.value = [...els.cameraSource.options].some((option) => option.value === currentValue)
-      ? currentValue
-      : data.selected;
   } catch (error) {
-    populateFallbackCameraSources();
-    if (token()) {
-      log("Camera source error", { message: error.message });
-    }
+    log("Session detail failed", { sessionId, message: error.message });
+    clearDetail("Unable to load session", error.message);
+    setStatus("Error", "bad");
   }
 }
 
-async function readPositions() {
+function clearDetail(title, subtitle) {
+  state.detail = null;
+  els.detailTitle.textContent = title;
+  els.detailSubtitle.textContent = subtitle;
+  els.detailStats.innerHTML = "";
+  els.categoryStrip.innerHTML = "";
+  els.previewGrid.innerHTML = "";
+  els.fileRows.innerHTML = "";
+  els.jsonList.innerHTML = "";
+  els.jsonIndexSubtitle.textContent = "No metadata loaded";
+  els.jsonPreview.textContent = "";
+}
+
+function renderDetail() {
+  const detail = state.detail;
+  if (!detail) return;
+  const summary = detail.summary;
+  const counts = summary.counts || {};
+  const devices = detail.devices || {};
+  els.detailTitle.textContent = summary.id;
+  els.detailSubtitle.textContent = `${formatDate(summary.created_at)} · ${summary.relative_path}`;
+  setStatus(summary.status, statusTone(summary.status));
+  els.detailStats.innerHTML = [
+    metric("Files", String(summary.file_count || 0), formatBytes(summary.size_bytes)),
+    metric("Devices", String(devices.count || 0), `${devices.rows || 0} rows x ${devices.cols || 0} cols`),
+    metric("Images", String(counts.images || 0), "microscope captures"),
+    metric("CSV", String(counts.csv || 0), "measurement tables"),
+  ].join("");
+  renderCategories();
+  renderPreviewGrid();
+  renderJsonList();
+  renderFileTable();
+}
+
+function renderCategories() {
+  const categories = state.detail?.summary?.categories || {};
+  const names = ["images", "iv", "wobb", "b1500", "other"];
+  els.categoryStrip.innerHTML = names
+    .map((name) => {
+      const item = categories[name] || { file_count: 0, size_bytes: 0 };
+      return `
+        <button class="categoryChip" type="button" data-filter="${name}">
+          <strong>${escapeHtml(name)}</strong>
+          <span>${item.file_count || 0} files · ${formatBytes(item.size_bytes || 0)}</span>
+        </button>
+      `;
+    })
+    .join("");
+}
+
+function renderPreviewGrid() {
+  const detail = state.detail;
+  if (!detail) return;
+  const files = detail.files || [];
+  const images = files.filter((file) => file.kind === "image").slice(0, 4);
+  const resultCounts = Object.entries(detail.result_counts || {}).slice(0, 5);
+  const imageHtml = images
+    .map(
+      (file) => `
+        <a class="imagePreview" href="${fileUrl(detail.summary.id, file.path)}" target="_blank" rel="noreferrer">
+          <img src="${fileUrl(detail.summary.id, file.path)}" alt="${escapeHtml(file.name)}" loading="lazy" />
+          <span>${escapeHtml(file.name)}</span>
+        </a>
+      `,
+    )
+    .join("");
+  const resultHtml = resultCounts
+    .map(([name, count]) => `<div class="resultChip"><span>${escapeHtml(name)}</span><strong>${count}</strong></div>`)
+    .join("");
+  els.previewGrid.innerHTML = imageHtml || resultHtml || `<div class="emptyPanel">No previews available</div>`;
+}
+
+function renderJsonList() {
+  const docs = state.detail?.json_documents || [];
+  els.jsonIndexSubtitle.textContent = `${docs.length} loaded · ${state.detail?.json_total || 0} total`;
+  if (!docs.length) {
+    els.jsonList.innerHTML = `<div class="emptyPanel">No JSON metadata</div>`;
+    return;
+  }
+  els.jsonList.innerHTML = docs
+    .map((doc) => {
+      const device = doc.device?.name || doc.device?.order || "-";
+      const selected = doc.path === state.selectedJsonPath ? " selected" : "";
+      return `
+        <button class="jsonItem${selected}" type="button" data-json-path="${escapeHtml(doc.path)}">
+          <strong>${escapeHtml(device)}</strong>
+          <span>${escapeHtml(doc.result_type || "json")} · ${escapeHtml(doc.name)}</span>
+        </button>
+      `;
+    })
+    .join("");
+}
+
+function filteredFiles() {
+  const detail = state.detail;
+  if (!detail) return [];
+  const category = els.categoryFilter.value;
+  const search = els.fileSearch.value.trim().toLowerCase();
+  return (detail.files || []).filter((file) => {
+    const categoryOk = category === "all" || file.category === category;
+    const searchOk = !search || file.path.toLowerCase().includes(search);
+    return categoryOk && searchOk;
+  });
+}
+
+function renderFileTable() {
+  const files = filteredFiles();
+  if (!files.length) {
+    els.fileRows.innerHTML = `<tr><td colspan="5" class="emptyCell">No files match the current filter</td></tr>`;
+    return;
+  }
+  const visible = files.slice(0, 300);
+  els.fileRows.innerHTML = visible
+    .map((file) => {
+      const primaryAction = file.kind === "json" ? "Preview" : file.kind === "image" ? "Open" : file.kind === "csv" || file.kind === "text" ? "View" : "Download";
+      const primaryKind = file.kind === "json" ? "json" : file.kind === "image" ? "open" : file.kind === "csv" || file.kind === "text" ? "text" : "download";
+      return `
+        <tr>
+          <td><span class="fileName">${escapeHtml(file.name)}</span><small>${escapeHtml(file.path)}</small></td>
+          <td><span class="typePill">${escapeHtml(file.category)} · ${escapeHtml(file.kind)}</span></td>
+          <td>${formatBytes(file.size_bytes)}</td>
+          <td>${formatDate(file.modified_at)}</td>
+          <td class="actionCell">
+            <button type="button" data-action="${primaryKind}" data-path="${escapeHtml(file.path)}">${primaryAction}</button>
+            <button type="button" data-action="download" data-path="${escapeHtml(file.path)}">Download</button>
+          </td>
+        </tr>
+      `;
+    })
+    .join("");
+  if (files.length > visible.length) {
+    els.fileRows.insertAdjacentHTML("beforeend", `<tr><td colspan="5" class="emptyCell">Showing 300 of ${files.length} matching files</td></tr>`);
+  }
+}
+
+async function loadJson(path) {
+  if (!state.selectedSessionId) return;
   try {
-    const data = await api("/api/positions");
-    els.posX.textContent = data.positions.X?.position ?? "-";
-    els.posY.textContent = data.positions.Y?.position ?? "-";
-    els.posZ.textContent = data.positions.Z?.position ?? "-";
-    els.positionPill.textContent = "Updated";
-    setTone(els.positionPill, "good");
+    const data = await api(`/api/autotest/sessions/${encodeURIComponent(state.selectedSessionId)}/json/${encodedPath(path)}`);
+    state.selectedJsonPath = path;
+    state.lastJsonText = JSON.stringify(data.content, null, 2);
+    els.jsonTitle.textContent = data.summary?.device?.name || data.summary?.name || "JSON Preview";
+    els.jsonSubtitle.textContent = `${data.path} · ${formatBytes(data.size_bytes)}`;
+    els.jsonPreview.innerHTML = syntaxHighlight(state.lastJsonText);
+    renderJsonList();
+  } catch (error) {
+    log("JSON preview failed", { path, message: error.message });
+  }
+}
+
+async function loadText(path) {
+  if (!state.selectedSessionId) return;
+  try {
+    const data = await api(`/api/autotest/sessions/${encodeURIComponent(state.selectedSessionId)}/text/${encodedPath(path)}`);
+    state.selectedJsonPath = "";
+    state.lastJsonText = data.content;
+    els.jsonTitle.textContent = data.path.split("/").pop();
+    els.jsonSubtitle.textContent = `${data.path} · ${formatBytes(data.size_bytes)}`;
+    els.jsonPreview.textContent = data.content;
+    renderJsonList();
+  } catch (error) {
+    log("Text preview failed", { path, message: error.message });
+  }
+}
+
+function syntaxHighlight(jsonText) {
+  const escaped = escapeHtml(jsonText);
+  return escaped.replace(
+    /("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)/g,
+    (match) => {
+      let cls = "jsonNumber";
+      if (match.startsWith('"')) cls = match.endsWith(":") ? "jsonKey" : "jsonString";
+      else if (match === "true" || match === "false") cls = "jsonBoolean";
+      else if (match === "null") cls = "jsonNull";
+      return `<span class="${cls}">${match}</span>`;
+    },
+  );
+}
+
+async function refreshConnections() {
+  try {
+    const data = await api("/api/connections");
+    els.connectionSummary.textContent = `${data.active_http_requests} active · ${data.total_http_requests} requests · ${data.total_file_downloads} downloads`;
   } catch {
-    els.posX.textContent = "-";
-    els.posY.textContent = "-";
-    els.posZ.textContent = "-";
-    els.positionPill.textContent = "No Serial";
-    setTone(els.positionPill, "warn");
+    els.connectionSummary.textContent = "Connection telemetry unavailable";
   }
 }
 
-els.saveToken.addEventListener("click", async () => {
+function saveTokenNow() {
   localStorage.setItem("probeWebToken", els.token.value);
-  streamActive = false;
   log("Token saved");
-  await refreshCameraSources();
-  await refreshStatus();
-});
+  refreshSessions({ keepSelection: false });
+  refreshConnections();
+}
 
+els.saveToken.addEventListener("click", saveTokenNow);
+els.token.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") saveTokenNow();
+});
 els.token.addEventListener("input", () => {
   window.clearTimeout(tokenSaveTimer);
-  tokenSaveTimer = window.setTimeout(async () => {
+  tokenSaveTimer = window.setTimeout(() => {
     localStorage.setItem("probeWebToken", els.token.value);
-    streamActive = false;
-    await refreshCameraSources();
-    await refreshStatus();
   }, 300);
 });
 
-els.token.addEventListener("keydown", async (event) => {
-  if (event.key === "Enter") {
-    localStorage.setItem("probeWebToken", els.token.value);
-    streamActive = false;
-    await refreshCameraSources();
-    await refreshStatus();
-  }
+els.refreshSessions.addEventListener("click", () => refreshSessions({ keepSelection: false }));
+els.sessionList.addEventListener("click", (event) => {
+  const item = event.target.closest("[data-session-id]");
+  if (item) selectSession(item.dataset.sessionId);
 });
-
-els.applySource.addEventListener("click", async () => {
-  const source = selectedSource();
-  await api(`/api/camera-source?source=${encodeURIComponent(source)}`, { method: "POST" });
-  streamActive = false;
-  showStream();
-  log("Camera source changed", { source });
-  await refreshStatus();
+els.categoryStrip.addEventListener("click", (event) => {
+  const item = event.target.closest("[data-filter]");
+  if (!item) return;
+  els.categoryFilter.value = item.dataset.filter;
+  renderFileTable();
+});
+els.categoryFilter.addEventListener("change", renderFileTable);
+els.fileSearch.addEventListener("input", renderFileTable);
+els.jsonList.addEventListener("click", (event) => {
+  const item = event.target.closest("[data-json-path]");
+  if (item) loadJson(item.dataset.jsonPath);
+});
+els.fileRows.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-action]");
+  if (!button || !state.selectedSessionId) return;
+  const path = button.dataset.path;
+  const action = button.dataset.action;
+  if (action === "json") loadJson(path);
+  if (action === "text") loadText(path);
+  if (action === "open") window.open(fileUrl(state.selectedSessionId, path), "_blank", "noreferrer");
+  if (action === "download") window.open(fileUrl(state.selectedSessionId, path, { download: true }), "_blank", "noreferrer");
+});
+els.copyJson.addEventListener("click", async () => {
+  if (!state.lastJsonText) return;
+  await navigator.clipboard.writeText(state.lastJsonText);
+  log("Preview copied");
 });
 
 setInterval(() => {
   els.clock.textContent = new Date().toLocaleTimeString();
 }, 1000);
 
-refreshStatus();
-refreshCameraSources();
-readPositions();
-setInterval(refreshStatus, 5000);
-setInterval(refreshCameraSources, 15000);
-setInterval(readPositions, 5000);
+refreshSessions({ keepSelection: false });
+refreshConnections();
+setInterval(() => refreshSessions({ keepSelection: true }), 15000);
+setInterval(refreshConnections, 7000);

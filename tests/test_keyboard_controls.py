@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from semi_auto_probe.app import ProbeApp
+from semi_auto_probe.camera_stage_transform import stage_delta_um_to_image_delta_px
 from semi_auto_probe.config import KEYBOARD_MOTION_SCHEME_WASD_QE, MOTOR_SPEED_PROFILE_FINE, MOTOR_SPEED_PROFILE_SAFE, ProbeConfig
 from semi_auto_probe.protocol import Axis, AxisPosition
 
@@ -47,6 +48,21 @@ class KeyboardControlsTests(unittest.TestCase):
         self.assertEqual(bindings["s"], ("Y", True))
         self.assertEqual(bindings["q"], ("Z", False))
         self.assertEqual(bindings["e"], ("Z", True))
+
+    def test_wasd_bindings_match_main_view_motion_baseline(self) -> None:
+        app = self.make_app_shell(KEYBOARD_MOTION_SCHEME_WASD_QE)
+        bindings = ProbeApp._keyboard_bindings_for_configured_scheme(app)
+        stage_deltas = {
+            key: (-10 if reverse else 10, 0) if axis == "X" else (0, -10 if reverse else 10)
+            for key, (axis, reverse) in bindings.items()
+            if axis in {"X", "Y"}
+        }
+        image_deltas = {key: stage_delta_um_to_image_delta_px(dx, dy, 1.0) for key, (dx, dy) in stage_deltas.items()}
+
+        self.assertLess(image_deltas["w"][1], 0.0)
+        self.assertLess(image_deltas["a"][0], 0.0)
+        self.assertGreater(image_deltas["s"][1], 0.0)
+        self.assertGreater(image_deltas["d"][0], 0.0)
 
     def test_x_axis_polarity_reverses_controller_direction_without_changing_key_bindings(self) -> None:
         app = self.make_app_shell(KEYBOARD_MOTION_SCHEME_WASD_QE)

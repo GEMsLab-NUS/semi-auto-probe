@@ -20,6 +20,7 @@ PROBE_ASSIST_PROBES: tuple[tuple[str, str, str, str, str], ...] = (
 )
 WOBBTEST_FLOW_CARD_HEIGHT_Z = 464
 WOBBTEST_FLOW_CARD_HEIGHT_ZXY = 544
+IV_FLOW_CARD_HEIGHT = 532
 
 
 @dataclass(frozen=True)
@@ -195,17 +196,20 @@ AUTOTEST_FLOW_DEFINITIONS: tuple[AutoTestFlowDefinition, ...] = (
             AutoTestFlowParam("resource", "VISA resource", "GPIB0::18::INSTR"),
             AutoTestFlowParam("output_terminal", "Output terminal", "rear"),
             AutoTestFlowParam("sweep_mode", "Sweep mode", "voltage"),
-            AutoTestFlowParam("bidirectional", "Bidirectional", "false"),
+            AutoTestFlowParam("scan_type", "Scan type", "single"),
             AutoTestFlowParam("start", "Start", "0"),
-            AutoTestFlowParam("stop", "Stop", "1"),
+            AutoTestFlowParam("stop", "Vtop", "1"),
             AutoTestFlowParam("step", "Step", "0.05"),
             AutoTestFlowParam("voltage_limit_v", "Voltage limit V", "20"),
             AutoTestFlowParam("current_limit_a", "Current limit A", "1e-3"),
+            AutoTestFlowParam("measure_range", "Measure range", "auto"),
             AutoTestFlowParam("source_delay_s", "Delay s", "0.02"),
             AutoTestFlowParam("nplc", "NPLC", "1"),
             AutoTestFlowParam("output_statistics", "Output stats", "true"),
             AutoTestFlowParam("resistance_method", "Resistance method", "linear_fit"),
             AutoTestFlowParam("output_off_after", "Output off after", "true"),
+            AutoTestFlowParam("plot_layout", "Plot layout", "horizontal"),
+            AutoTestFlowParam("heatmap_values", "Heatmap values", "true"),
         ),
     ),
     AutoTestFlowDefinition(
@@ -246,16 +250,17 @@ AUTOTEST_FLOW_DEFINITIONS: tuple[AutoTestFlowDefinition, ...] = (
             AutoTestFlowParam("sweep_start_v", "Vg start V", "-40"),
             AutoTestFlowParam("sweep_end_v", "Vg end V", "40"),
             AutoTestFlowParam("sweep_points", "Vg points", "201"),
-            AutoTestFlowParam("bias_values_v", "Vd list V", "0:5:1"),
+            AutoTestFlowParam("scan_type", "Vg scan", "single"),
+            AutoTestFlowParam("bias_values_v", "Vd list V", "0:1:5"),
             AutoTestFlowParam("drain_current_compliance_a", "Id compliance A", "1e-5"),
             AutoTestFlowParam("gate_current_compliance_a", "Ig compliance A", "1e-9"),
             AutoTestFlowParam("measure_gate_leak", "Measure Ig", "true"),
             AutoTestFlowParam("abort_on_compliance", "Abort on compliance", "false"),
-            AutoTestFlowParam("staircase_nplc", "Staircase NPLC", "10"),
-            AutoTestFlowParam("step_delay_s", "Step delay s", "0.02"),
+            AutoTestFlowParam("staircase_nplc", "Staircase NPLC", "8"),
+            AutoTestFlowParam("step_delay_s", "Step delay s", "0"),
             AutoTestFlowParam("pre_settle_s", "Pre-settle s", "1.0"),
             AutoTestFlowParam("post_sweep_pause_s", "Post pause s", "1.0"),
-            AutoTestFlowParam("measurement_adc", "Measurement ADC", "high_speed"),
+            AutoTestFlowParam("measurement_adc", "Measurement ADC", "high_resolution"),
             AutoTestFlowParam("autozero", "Autozero", "false"),
             AutoTestFlowParam("save_mode", "Save mode", "both"),
         ),
@@ -275,16 +280,16 @@ AUTOTEST_FLOW_DEFINITIONS: tuple[AutoTestFlowDefinition, ...] = (
             AutoTestFlowParam("sweep_start_v", "Vd start V", "0"),
             AutoTestFlowParam("sweep_end_v", "Vd end V", "10"),
             AutoTestFlowParam("sweep_points", "Vd points", "201"),
-            AutoTestFlowParam("bias_values_v", "Vg list V", "-25:25:5"),
+            AutoTestFlowParam("bias_values_v", "Vg list V", "-25:5:25"),
             AutoTestFlowParam("drain_current_compliance_a", "Id compliance A", "1e-5"),
             AutoTestFlowParam("gate_current_compliance_a", "Ig compliance A", "1e-8"),
             AutoTestFlowParam("measure_gate_leak", "Measure Ig", "true"),
             AutoTestFlowParam("abort_on_compliance", "Abort on compliance", "false"),
-            AutoTestFlowParam("staircase_nplc", "Staircase NPLC", "10"),
-            AutoTestFlowParam("step_delay_s", "Step delay s", "0.01"),
+            AutoTestFlowParam("staircase_nplc", "Staircase NPLC", "8"),
+            AutoTestFlowParam("step_delay_s", "Step delay s", "0"),
             AutoTestFlowParam("pre_settle_s", "Pre-settle s", "0.2"),
             AutoTestFlowParam("post_sweep_pause_s", "Post pause s", "0.2"),
-            AutoTestFlowParam("measurement_adc", "Measurement ADC", "high_speed"),
+            AutoTestFlowParam("measurement_adc", "Measurement ADC", "high_resolution"),
             AutoTestFlowParam("autozero", "Autozero", "false"),
             AutoTestFlowParam("save_mode", "Save mode", "both"),
         ),
@@ -452,7 +457,11 @@ def wobbtest_xy_offsets_um(range_um: float, step_um: float, pattern: str) -> tup
     return tuple(unique)
 
 
-def generate_autotest_points(settings: AutoTestSettings, mapper: AffineCoordinateMapper) -> tuple[AutoTestPoint, ...]:
+def generate_autotest_points(
+    settings: AutoTestSettings,
+    mapper: AffineCoordinateMapper,
+    camera_fov_rotation_deg: float = 0.0,
+) -> tuple[AutoTestPoint, ...]:
     normalized = settings.normalized()
     points: list[AutoTestPoint] = []
     order = 1
@@ -477,6 +486,7 @@ def generate_autotest_points(settings: AutoTestSettings, mapper: AffineCoordinat
                         stage_y_um,
                         normalized.fov_width_um,
                         normalized.fov_height_um,
+                        camera_fov_rotation_deg,
                     ),
                 )
             )
@@ -488,6 +498,7 @@ def generate_autotest_points_from_specs(
     specs: tuple[AutoTestPointSpec, ...] | list[AutoTestPointSpec],
     settings: AutoTestSettings,
     mapper: AffineCoordinateMapper,
+    camera_fov_rotation_deg: float = 0.0,
 ) -> tuple[AutoTestPoint, ...]:
     normalized = settings.normalized()
     points: list[AutoTestPoint] = []
@@ -512,6 +523,7 @@ def generate_autotest_points_from_specs(
                     stage_y_um,
                     normalized.fov_width_um,
                     normalized.fov_height_um,
+                    camera_fov_rotation_deg,
                 ),
             )
         )
@@ -896,6 +908,7 @@ class AutoTestPanel:
         fov_height_var: tk.StringVar,
         start_run: Callable[[AutoTestSettings, tuple[AutoTestPoint, ...] | None], None],
         stop_run: Callable[[], None],
+        get_camera_fov_rotation_deg: Callable[[], float] | None = None,
         set_status: Callable[[str], None] | None = None,
         on_overlay_changed: Callable[[list[MatrixOverlay]], None] | None = None,
         on_probe_assist_changed: Callable[[], None] | None = None,
@@ -908,6 +921,7 @@ class AutoTestPanel:
         self.get_microscope_preview = get_microscope_preview
         self.fov_width_var = fov_width_var
         self.fov_height_var = fov_height_var
+        self.get_camera_fov_rotation_deg = get_camera_fov_rotation_deg or (lambda: 0.0)
         self.start_run = start_run
         self.stop_run = stop_run
         self.set_app_status = set_status
@@ -941,9 +955,9 @@ class AutoTestPanel:
         self.z_up_fast_percent_text_var = tk.StringVar(value="Fast 50% / slow 50%")
         self.z_fast_speed_percent_var = tk.StringVar(value="50")
         self.z_slow_speed_percent_var = tk.StringVar(value="2")
-        self.z_wobble_um_var = tk.StringVar(value="0")
-        self.z_wobble_cycles_var = tk.StringVar(value="0")
-        self.z_offset_um_var = tk.StringVar(value="0")
+        self.z_wobble_um_var = tk.StringVar(value="4")
+        self.z_wobble_cycles_var = tk.StringVar(value="1")
+        self.z_offset_um_var = tk.StringVar(value="10")
         self.approach_expanded_var = tk.BooleanVar(value=True)
         self.approach_toggle_button: ttk.Button | None = None
         self.approach_content_frame: ttk.Frame | None = None
@@ -978,6 +992,8 @@ class AutoTestPanel:
         self.point_source_var = tk.StringVar(value="Point source: Base array")
         self.measurement_var = tk.StringVar(value="Measurement flow: not configured")
         self.status_var = tk.StringVar(value="Idle")
+        self.execution_progress_var = tk.DoubleVar(value=0.0)
+        self.execution_progress_text_var = tk.StringVar(value="Progress: 0/0 | ETA: -")
 
         self.frame = ttk.Frame(parent, style="App.TFrame")
         self.frame.grid(row=0, column=0, sticky="nsew")
@@ -1300,7 +1316,10 @@ class AutoTestPanel:
         self.run_button.grid(row=0, column=0, sticky="ew", padx=(0, 5))
         self.stop_button = ttk.Button(section, text="Stop", command=self.stop_run, state="disabled")
         self.stop_button.grid(row=0, column=1, sticky="ew", padx=(5, 0))
-        ttk.Label(section, textvariable=self.status_var, style="Status.TLabel", padding=8, wraplength=320).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.execution_progress_bar = ttk.Progressbar(section, variable=self.execution_progress_var, maximum=100, mode="determinate")
+        self.execution_progress_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Label(section, textvariable=self.execution_progress_text_var, style="Muted.TLabel", padding=(2, 5), wraplength=320).grid(row=2, column=0, columnspan=2, sticky="ew")
+        ttk.Label(section, textvariable=self.status_var, style="Status.TLabel", padding=8, wraplength=320).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         return row + 1
 
     def _bind_preview_updates(self) -> None:
@@ -1699,15 +1718,16 @@ class AutoTestPanel:
             settings.cols,
             settings.fov_width_um,
             settings.fov_height_um,
+            round(float(self.get_camera_fov_rotation_deg()), 8),
             settings.name_pattern,
             self.custom_point_specs,
         )
         if self._preview_cache_key == key and self._preview_cache_points is not None:
             return self._preview_cache_points
         if self.custom_point_specs is not None:
-            points = generate_autotest_points_from_specs(self.custom_point_specs, settings, mapper)
+            points = generate_autotest_points_from_specs(self.custom_point_specs, settings, mapper, self.get_camera_fov_rotation_deg())
         else:
-            points = generate_autotest_points(settings, mapper)
+            points = generate_autotest_points(settings, mapper, self.get_camera_fov_rotation_deg())
         self._preview_cache_key = key
         self._preview_cache_points = points
         return points
@@ -1736,8 +1756,21 @@ class AutoTestPanel:
         self.stop_button.configure(state="normal" if running else "disabled")
         self._update_prerequisite_status()
 
-    def set_progress(self, current: int, total: int, message: str, row: int | None = None, col: int | None = None, state: str | None = None) -> None:
+    def set_progress(
+        self,
+        current: int,
+        total: int,
+        message: str,
+        row: int | None = None,
+        col: int | None = None,
+        state: str | None = None,
+        estimate_text: str | None = None,
+    ) -> None:
         self.status_var.set(f"{message} ({current}/{total})")
+        total_value = max(0, int(total))
+        current_value = max(0, min(int(current), total_value)) if total_value else 0
+        self.execution_progress_var.set(100.0 * current_value / total_value if total_value else 0.0)
+        self.execution_progress_text_var.set(estimate_text or f"Progress: {current_value}/{total_value} | ETA: -")
         if row is not None and col is not None and state is not None:
             self.point_overlay_states[(row, col)] = state
             self._schedule_preview_redraw()
@@ -1909,13 +1942,10 @@ class AutoTestPanel:
             if width_um <= 0 or height_um <= 0:
                 raise ValueError
             center_gds = mapper.stage_to_gds(x_um, y_um)
-            corners_stage = [
-                (x_um - width_um / 2.0, y_um - height_um / 2.0),
-                (x_um + width_um / 2.0, y_um - height_um / 2.0),
-                (x_um + width_um / 2.0, y_um + height_um / 2.0),
-                (x_um - width_um / 2.0, y_um + height_um / 2.0),
-            ]
-            self.viewer.set_stage_overlay(center_gds, [mapper.stage_to_gds(x, y) for x, y in corners_stage])
+            self.viewer.set_stage_overlay(
+                center_gds,
+                list(fov_polygon_for_stage_target(mapper, x_um, y_um, width_um, height_um, self.get_camera_fov_rotation_deg())),
+            )
             self._update_auxiliary_points(center_gds)
         except Exception:
             self.viewer.set_stage_overlay(None, None)
@@ -2364,6 +2394,8 @@ class AutoTestPanel:
         if card.type_id == "wobb_test":
             height = WOBBTEST_FLOW_CARD_HEIGHT_ZXY if self._wobb_card_mode_is_zxy(card) else WOBBTEST_FLOW_CARD_HEIGHT_Z
             return int(height * self._flow_zoom)
+        if card.type_id == "iv":
+            return int(IV_FLOW_CARD_HEIGHT * self._flow_zoom)
         if card.type_id in {"b1500_transfer", "b1500_output"}:
             return int(585 * self._flow_zoom)
         definition = autotest_flow_definitions_by_type()[card.type_id]
@@ -2664,6 +2696,9 @@ class AutoTestPanel:
         frame.bind("<Double-Button-1>", lambda _event, card_id=card.card_id: self._toggle_flow_card(card_id))
 
     def _build_flow_card_params(self, frame: tk.Frame, card: AutoTestFlowCard, definition: AutoTestFlowDefinition) -> None:
+        if card.type_id == "iv":
+            self._build_iv_flow_card_params(frame, card, definition)
+            return
         if card.type_id == "wobb_test":
             self._build_wobb_test_flow_card_params(frame, card, definition)
             return
@@ -2716,6 +2751,110 @@ class AutoTestPanel:
             self._flow_entry_vars[(card.card_id, key)] = var
             var.trace_add("write", lambda *_args, target=card, param_key=key, value_var=var: self._set_flow_card_param(target, param_key, value_var.get()))
         return var
+
+    def _build_iv_flow_card_params(self, frame: tk.Frame, card: AutoTestFlowCard, definition: AutoTestFlowDefinition) -> None:
+        defaults = {param.key: param.default for param in definition.parameters}
+        params = tk.Frame(frame, bg=self.colors["surface"], padx=10, pady=2)
+        params.grid(row=2, column=1, columnspan=4, sticky="nsew")
+        params.columnconfigure(0, weight=1)
+
+        def group(title: str, row: int) -> tk.LabelFrame:
+            section = tk.LabelFrame(
+                params,
+                text=title,
+                bg=self.colors["surface"],
+                fg=self.colors["muted"],
+                bd=0,
+                highlightthickness=1,
+                highlightbackground=self.colors["border"],
+                padx=8,
+                pady=5,
+                font=("Segoe UI Semibold", 8),
+            )
+            section.grid(row=row, column=0, sticky="ew", pady=(0, 7))
+            return section
+
+        def entry(parent: tk.Widget, key: str, row: int, column: int, *, width: int = 10, padx: tuple[int, int] = (0, 6)) -> tk.Entry:
+            var = self._flow_card_param_var(card, key, defaults.get(key, ""))
+            widget = tk.Entry(
+                parent,
+                textvariable=var,
+                bg=self.colors["input"],
+                fg=self.colors["text"],
+                insertbackground=self.colors["accent"],
+                relief="flat",
+                highlightthickness=1,
+                highlightbackground=self.colors["border"],
+                highlightcolor=self.colors["border_focus"],
+                font=("Cascadia Mono", 9),
+                width=width,
+            )
+            widget.grid(row=row, column=column, sticky="ew", padx=padx, pady=(2, 0))
+            return widget
+
+        def combo(parent: tk.Widget, key: str, values: tuple[str, ...], row: int, column: int, *, width: int = 10, padx: tuple[int, int] = (0, 6)) -> ttk.Combobox:
+            var = self._flow_card_param_var(card, key, defaults.get(key, ""))
+            widget = ttk.Combobox(parent, textvariable=var, values=values, state="readonly", width=width)
+            widget.grid(row=row, column=column, sticky="ew", padx=padx, pady=(2, 0))
+            return widget
+
+        identity = group("Instrument", 0)
+        identity.columnconfigure((0, 1), weight=1, uniform=f"iv_identity_{card.card_id}")
+        ttk.Label(identity, text="VISA", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Label(identity, text="Terminal", style="Muted.TLabel").grid(row=0, column=1, sticky="w")
+        entry(identity, "resource", 1, 0, width=16)
+        combo(identity, "output_terminal", ("rear", "front"), 1, 1, width=10, padx=(0, 0))
+
+        sweep = group("Sweep", 1)
+        sweep.columnconfigure((0, 1, 2, 3), weight=1, uniform=f"iv_sweep_{card.card_id}")
+        for column, (key, label) in enumerate(
+            (
+                ("sweep_mode", "Source"),
+                ("scan_type", "Path"),
+                ("start", "Start"),
+                ("stop", "Vtop/list"),
+            )
+        ):
+            ttk.Label(sweep, text=label, style="Muted.TLabel").grid(row=0, column=column, sticky="w", padx=(0, 6))
+            if key in {"sweep_mode", "scan_type"}:
+                combo(sweep, key, self._flow_param_choices(key), 1, column, width=10, padx=(0, 6 if column < 3 else 0))
+            else:
+                entry(sweep, key, 1, column, width=10, padx=(0, 6 if column < 3 else 0))
+        ttk.Label(sweep, text="Step", style="Muted.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+        ttk.Label(sweep, text="Delay s", style="Muted.TLabel").grid(row=2, column=1, sticky="w", padx=(0, 6), pady=(6, 0))
+        entry(sweep, "step", 3, 0)
+        entry(sweep, "source_delay_s", 3, 1)
+
+        protection = group("Compliance and Acquisition", 2)
+        protection.columnconfigure((0, 1, 2, 3), weight=1, uniform=f"iv_protection_{card.card_id}")
+        for column, (key, label) in enumerate(
+            (
+                ("voltage_limit_v", "V limit"),
+                ("current_limit_a", "I limit"),
+                ("measure_range", "Meas range"),
+                ("nplc", "NPLC"),
+            )
+        ):
+            ttk.Label(protection, text=label, style="Muted.TLabel").grid(row=0, column=column, sticky="w", padx=(0, 6))
+            if key == "measure_range":
+                combo(protection, key, self._flow_param_choices(key), 1, column, width=10, padx=(0, 6 if column < 3 else 0))
+            else:
+                entry(protection, key, 1, column, width=10, padx=(0, 6 if column < 3 else 0))
+
+        output = group("Statistics and Display", 3)
+        output.columnconfigure((0, 1, 2, 3), weight=1, uniform=f"iv_output_{card.card_id}")
+        for column, (key, label) in enumerate(
+            (
+                ("output_statistics", "Stats"),
+                ("resistance_method", "R method"),
+                ("plot_layout", "Plot"),
+                ("heatmap_values", "Values"),
+            )
+        ):
+            ttk.Label(output, text=label, style="Muted.TLabel").grid(row=0, column=column, sticky="w", padx=(0, 6))
+            combo(output, key, self._flow_param_choices(key), 1, column, width=12, padx=(0, 6 if column < 3 else 0))
+        ttk.Label(output, text="Output off", style="Muted.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+        combo(output, "output_off_after", ("true", "false"), 3, 0, width=10)
 
     def _build_wobb_test_flow_card_params(self, frame: tk.Frame, card: AutoTestFlowCard, definition: AutoTestFlowDefinition) -> None:
         defaults = {param.key: param.default for param in definition.parameters}
@@ -2781,10 +2920,10 @@ class AutoTestPanel:
         upper_var.trace_add("write", update_range_text)
         update_range_text()
         ttk.Label(z_group, textvariable=range_text, style="Muted.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
-        RangeSlider(z_group, lower_var, upper_var, self.colors, minimum=-20, maximum=20, step=0.5).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 4))
+        RangeSlider(z_group, lower_var, upper_var, self.colors, minimum=-100, maximum=50, step=0.5).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 4))
         ttk.Label(z_group, text="Step", style="Muted.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 6))
         ttk.Label(z_group, text="Settle s", style="Muted.TLabel").grid(row=2, column=1, sticky="w")
-        combo(z_group, "z_step_um", ("0.5", "1", "2", "4"), 3, 0, width=8)
+        combo(z_group, "z_step_um", ("0.5", "1", "2", "4", "8"), 3, 0, width=8)
         entry(z_group, "settle_s", 3, 1, width=8, padx=(0, 0))
 
         row_index = 2
@@ -2881,19 +3020,23 @@ class AutoTestPanel:
         combo(mapping, "gate_smu", ("smu1", "smu2", "smu3", "smu4"), 1, 1, width=8, padx=(0, 0))
 
         sweep = group("Sweep", 2)
-        sweep.columnconfigure((0, 1, 2, 3), weight=1, uniform=f"b1500_sweep_{card.card_id}")
+        sweep.columnconfigure((0, 1, 2, 3, 4), weight=1, uniform=f"b1500_sweep_{card.card_id}")
         axis_label = "Vg" if card.type_id == "b1500_transfer" else "Vd"
         bias_label = "Vd list" if card.type_id == "b1500_transfer" else "Vg list"
-        for column, (key, label) in enumerate(
-            (
-                ("sweep_start_v", f"{axis_label} start V"),
-                ("sweep_end_v", f"{axis_label} end V"),
-                ("sweep_points", f"{axis_label} points"),
-                ("bias_values_v", f"{bias_label} V"),
-            )
-        ):
+        sweep_fields = [
+            ("sweep_start_v", f"{axis_label} start V"),
+            ("sweep_end_v", f"{axis_label} end V"),
+            ("sweep_points", f"{axis_label} points"),
+        ]
+        if card.type_id == "b1500_transfer":
+            sweep_fields.append(("scan_type", "Vg scan"))
+        sweep_fields.append(("bias_values_v", f"{bias_label} V"))
+        for column, (key, label) in enumerate(sweep_fields):
             ttk.Label(sweep, text=label, style="Muted.TLabel").grid(row=0, column=column, sticky="w", padx=(0, 6))
-            entry(sweep, key, 1, column, width=12, padx=(0, 6 if column < 3 else 0))
+            if key == "scan_type":
+                combo(sweep, key, ("single", "double"), 1, column, width=9, padx=(0, 6 if column < len(sweep_fields) - 1 else 0))
+            else:
+                entry(sweep, key, 1, column, width=12, padx=(0, 6 if column < len(sweep_fields) - 1 else 0))
 
         protection = group("Compliance and Acquisition", 3)
         protection.columnconfigure((0, 1, 2, 3, 4), weight=1, uniform=f"b1500_protect_{card.card_id}")
@@ -2940,12 +3083,16 @@ class AutoTestPanel:
         choices = {
             "output_terminal": ("rear", "front"),
             "sweep_mode": ("voltage", "current"),
+            "scan_type": ("single", "double", "dualpolar"),
             "bidirectional": ("false", "true"),
             "output_statistics": ("true", "false"),
             "resistance_method": ("linear_fit", "median_ratio"),
             "output_off_after": ("true", "false"),
+            "measure_range": ("auto", "1e-9", "1e-8", "1e-7", "1e-6", "1e-5", "1e-4", "1e-3", "1e-2", "0.1", "1", "2", "20", "200"),
+            "plot_layout": ("horizontal", "vertical"),
+            "heatmap_values": ("true", "false"),
             "mode": ("Z", "Z-XY"),
-            "z_step_um": ("0.5", "1", "2", "4"),
+            "z_step_um": ("0.5", "1", "2", "4", "8"),
             "xy_pattern": ("square", "corners", "spiral"),
             "best_current": ("max_abs", "max", "min_abs", "min"),
             "measure_gate_leak": ("true", "false"),
@@ -2977,16 +3124,24 @@ class AutoTestPanel:
             if mode == "Z-XY":
                 parts.append(f"XY +/-{card.params.get('xy_range_um', '2')} um")
             return " | ".join(parts)
+        if card.type_id == "iv":
+            return (
+                f"{card.params.get('resource', 'GPIB0::18::INSTR')} | "
+                f"{card.params.get('sweep_mode', 'voltage')} {card.params.get('scan_type', card.params.get('bidirectional', 'single'))} | "
+                f"0..{card.params.get('stop', '1')} step {card.params.get('step', '0.05')} | "
+                f"{card.params.get('plot_layout', 'horizontal')} plot"
+            )
         if card.type_id in {"b1500_transfer", "b1500_output"}:
             axis = "Vg" if card.type_id == "b1500_transfer" else "Vd"
             bias = "Vd" if card.type_id == "b1500_transfer" else "Vg"
+            scan = f" {card.params.get('scan_type', 'single')}" if card.type_id == "b1500_transfer" else ""
             return (
                 f"{card.params.get('resource', 'GPIB0::17::INSTR')} | "
                 f"D={card.params.get('drain_smu', 'smu3').upper()} G={card.params.get('gate_smu', 'smu4').upper()} | "
-                f"{axis} {card.params.get('sweep_start_v', '0')}..{card.params.get('sweep_end_v', '0')} V, "
+                f"{axis}{scan} {card.params.get('sweep_start_v', '0')}..{card.params.get('sweep_end_v', '0')} V, "
                 f"{card.params.get('sweep_points', '201')} pts | "
                 f"{bias}: {card.params.get('bias_values_v', '')} | "
-                f"NPLC {card.params.get('staircase_nplc', '10')}"
+                f"NPLC {card.params.get('staircase_nplc', '8')}"
             )
         definition = autotest_flow_definitions_by_type()[card.type_id]
         parts = []

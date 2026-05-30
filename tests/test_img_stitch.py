@@ -20,6 +20,7 @@ from semi_auto_probe.img_stitch import (
     flat_field_correct,
     fuse_t_stack,
     fuse_z_stack,
+    mosaic_pixel_to_stage_um,
     recompose_session,
     serpentine_indices,
     stage_positions_from_um,
@@ -164,8 +165,18 @@ class ImgStitchTest(unittest.TestCase):
         positions = stage_positions_from_um(records, 2.0)
 
         self.assertEqual(positions[(0, 0)], (0.0, 0.0))
-        self.assertEqual(positions[(0, 1)], (10.0, 0.0))
-        self.assertEqual(positions[(1, 1)], (10.0, -20.0))
+        self.assertEqual(positions[(0, 1)], (-10.0, 0.0))
+        self.assertEqual(positions[(1, 1)], (-10.0, -20.0))
+
+    def test_imgstitch_recorded_x_um_keeps_reversed_scan_tiles_on_visual_right(self) -> None:
+        records = (
+            TileRecord(0, 0, 1, "a.png", 100, 200, 0, 0.0, 0.0),
+            TileRecord(0, 1, 2, "b.png", 90, 200, 0, -10.0, 0.0),
+        )
+
+        positions = stage_positions_from_um(records, 2.0)
+
+        self.assertEqual(positions[(0, 1)], (5.0, 0.0))
 
     def test_stage_positions_from_um_applies_camera_fov_rotation(self) -> None:
         records = (
@@ -176,7 +187,35 @@ class ImgStitchTest(unittest.TestCase):
         positions = stage_positions_from_um(records, 2.0, camera_fov_rotation_deg=90.0)
 
         self.assertAlmostEqual(positions[(0, 1)][0], 0.0)
-        self.assertAlmostEqual(positions[(0, 1)][1], 5.0)
+        self.assertAlmostEqual(positions[(0, 1)][1], -5.0)
+
+    def test_mosaic_pixel_to_stage_um_reverses_stage_position_mapping(self) -> None:
+        session = StitchSession(
+            rows=1,
+            cols=2,
+            tile_width=50,
+            tile_height=40,
+            um_per_px=2.0,
+            objective=20,
+            eyepiece=1.5,
+            range_mode="array",
+            step_x_um=80.0,
+            step_y_um=80.0,
+            origin_stage_x=1000,
+            origin_stage_y=2000,
+            origin_stage_z=0,
+            settings=StitchSettings(overlap_x=20, overlap_y=20, registration_weight=0.0),
+            tiles=(
+                TileRecord(0, 0, 1, "left.png", 1000, 2000, 0, 0.0, 0.0),
+                TileRecord(0, 1, 2, "right.png", 920, 2000, 0, -80.0, 0.0),
+            ),
+        )
+        positions = stage_positions_from_um(session.tiles, session.um_per_px)
+
+        stage_x_um, stage_y_um = mosaic_pixel_to_stage_um(session, positions, image_x_px=40.0, image_y_px=0.0)
+
+        self.assertAlmostEqual(stage_x_um, -80.0)
+        self.assertAlmostEqual(stage_y_um, 0.0)
 
     def test_recompose_session_zero_weight_uses_stage_positions(self) -> None:
         left = np.zeros((40, 50, 3), dtype=np.uint8)
@@ -200,7 +239,7 @@ class ImgStitchTest(unittest.TestCase):
             settings=StitchSettings(overlap_x=20, overlap_y=20, max_correction_um=10.0, registration_weight=0.0),
             tiles=(
                 TileRecord(0, 0, 1, "left.png", 0, 0, 0, 0.0, 0.0),
-                TileRecord(0, 1, 2, "right.png", 80, 0, 0, 80.0, 0.0),
+                TileRecord(0, 1, 2, "right.png", -80, 0, 0, -80.0, 0.0),
             ),
         )
 
@@ -234,7 +273,7 @@ class ImgStitchTest(unittest.TestCase):
             settings=StitchSettings(overlap_x=40, overlap_y=20, max_correction_um=5.0, registration_weight=1.0),
             tiles=(
                 TileRecord(0, 0, 1, "left.png", 0, 0, 0, 0.0, 0.0),
-                TileRecord(0, 1, 2, "right.png", 60, 0, 0, 60.0, 0.0),
+                TileRecord(0, 1, 2, "right.png", -60, 0, 0, -60.0, 0.0),
             ),
         )
 
@@ -293,9 +332,9 @@ class ImgStitchTest(unittest.TestCase):
             settings=StitchSettings(overlap_x=5, overlap_y=5, max_correction_um=0.0, registration_weight=0.0),
             tiles=(
                 TileRecord(0, 0, 1, "a.png", 0, 0, 0, 0.0, 0.0),
-                TileRecord(0, 1, 2, "b.png", 15, 0, 0, 15.0, 0.0),
-                TileRecord(1, 1, 3, "d.png", 15, 15, 0, 15.0, 15.0),
-                TileRecord(1, 0, 4, "c.png", 0, 15, 0, 0.0, 15.0),
+                TileRecord(0, 1, 2, "b.png", -15, 0, 0, -15.0, 0.0),
+                TileRecord(1, 1, 3, "d.png", -15, -15, 0, -15.0, -15.0),
+                TileRecord(1, 0, 4, "c.png", 0, -15, 0, 0.0, -15.0),
             ),
         )
 
@@ -331,9 +370,9 @@ class ImgStitchTest(unittest.TestCase):
             ),
             tiles=(
                 TileRecord(0, 0, 1, "a.png", 0, 0, 0, 0.0, 0.0),
-                TileRecord(0, 1, 2, "b.png", 10, 0, 0, 10.0, 0.0),
-                TileRecord(0, 2, 3, "c.png", 20, 0, 0, 20.0, 0.0),
-                TileRecord(0, 3, 4, "d.png", 30, 0, 0, 30.0, 0.0),
+                TileRecord(0, 1, 2, "b.png", -10, 0, 0, -10.0, 0.0),
+                TileRecord(0, 2, 3, "c.png", -20, 0, 0, -20.0, 0.0),
+                TileRecord(0, 3, 4, "d.png", -30, 0, 0, -30.0, 0.0),
             ),
         )
         shifts = {
@@ -394,10 +433,10 @@ class ImgStitchTest(unittest.TestCase):
             ),
             tiles=(
                 TileRecord(0, 0, 1, "a.png", 0, 0, 0, 0.0, 0.0),
-                TileRecord(0, 1, 2, "b.png", 10, 0, 0, 10.0, 0.0),
-                TileRecord(0, 2, 3, "c.png", 20, 0, 0, 20.0, 0.0),
-                TileRecord(1, 2, 4, "d.png", 20, 10, 0, 20.0, 10.0),
-                TileRecord(1, 1, 5, "e.png", 10, 10, 0, 10.0, 10.0),
+                TileRecord(0, 1, 2, "b.png", -10, 0, 0, -10.0, 0.0),
+                TileRecord(0, 2, 3, "c.png", -20, 0, 0, -20.0, 0.0),
+                TileRecord(1, 2, 4, "d.png", -20, -10, 0, -20.0, -10.0),
+                TileRecord(1, 1, 5, "e.png", -10, -10, 0, -10.0, -10.0),
             ),
         )
         original = img_stitch_module.estimate_overlap_shift
@@ -451,9 +490,9 @@ class ImgStitchTest(unittest.TestCase):
             ),
             tiles=(
                 TileRecord(0, 0, 1, "a.png", 0, 0, 0, 0.0, 0.0),
-                TileRecord(0, 1, 2, "b.png", 10, 0, 0, 10.0, 0.0),
-                TileRecord(0, 2, 3, "c.png", 20, 0, 0, 20.0, 0.0),
-                TileRecord(0, 3, 4, "d.png", 30, 0, 0, 30.0, 0.0),
+                TileRecord(0, 1, 2, "b.png", -10, 0, 0, -10.0, 0.0),
+                TileRecord(0, 2, 3, "c.png", -20, 0, 0, -20.0, 0.0),
+                TileRecord(0, 3, 4, "d.png", -30, 0, 0, -30.0, 0.0),
             ),
         )
         responses = [(10.0, 0.0, 0.9), (12.0, 0.0, 0.9), (40.0, 0.0, 0.0)] * 4
@@ -499,8 +538,8 @@ class ImgStitchTest(unittest.TestCase):
             ),
             tiles=(
                 TileRecord(0, 0, 1, "a.png", 0, 0, 0, 0.0, 0.0),
-                TileRecord(0, 1, 2, "b.png", 10, 0, 0, 10.0, 0.0),
-                TileRecord(0, 2, 3, "c.png", 20, 0, 0, 20.0, 0.0),
+                TileRecord(0, 1, 2, "b.png", -10, 0, 0, -10.0, 0.0),
+                TileRecord(0, 2, 3, "c.png", -20, 0, 0, -20.0, 0.0),
             ),
         )
         responses = [(10.0, 0.0, 0.9), (40.0, 0.0, 0.0)] * 4

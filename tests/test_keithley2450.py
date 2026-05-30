@@ -10,6 +10,7 @@ from semi_auto_probe.keithley2450 import (
     calculate_iv_statistics,
     constant_voltage_current_config_from_params,
     iv_sweep_config_from_params,
+    iv_sweep_configs_from_params,
 )
 
 
@@ -37,6 +38,17 @@ class Keithley2450Tests(unittest.TestCase):
 
         self.assertEqual(config.sweep_values(), (-1.0, 0.0, 1.0, 0.0, -1.0))
 
+    def test_scan_type_dualpolar_sweeps_top_negative_top_and_zero(self) -> None:
+        config = IVSweepConfig(start=0, stop=1, step=0.5, scan_type="dualpolar")
+
+        self.assertEqual(config.sweep_values(), (0.0, 0.5, 1.0, 0.5, 0.0, -0.5, -1.0, -0.5, 0.0))
+
+    def test_vtop_range_expands_to_multiple_configs(self) -> None:
+        configs = iv_sweep_configs_from_params({"stop": "1:1:3", "step": "0.5", "scan_type": "double"})
+
+        self.assertEqual([config.stop for config in configs], [1.0, 2.0, 3.0])
+        self.assertTrue(all(config.scan_type == "double" for config in configs))
+
     def test_params_parse_voltage_and_current_limits(self) -> None:
         config = iv_sweep_config_from_params(
             {
@@ -49,6 +61,7 @@ class Keithley2450Tests(unittest.TestCase):
                 "bidirectional": "yes",
                 "voltage_limit_v": "5",
                 "current_limit_a": "0.01",
+                "measure_range": "1e-4",
                 "output_statistics": "true",
                 "resistance_method": "linear_fit",
             }
@@ -59,6 +72,7 @@ class Keithley2450Tests(unittest.TestCase):
         self.assertTrue(config.bidirectional)
         self.assertAlmostEqual(config.voltage_limit_v, 5)
         self.assertAlmostEqual(config.current_limit_a, 0.01)
+        self.assertAlmostEqual(config.measure_range or 0.0, 1e-4)
         self.assertTrue(config.output_statistics)
         self.assertEqual(config.resistance_method, "linear_fit")
 
@@ -80,6 +94,17 @@ class Keithley2450Tests(unittest.TestCase):
         self.assertIn(":OUTP OFF", instrument.commands)
         self.assertAlmostEqual(result[-1].voltage_v, 0.3)
         self.assertAlmostEqual(result[-1].current_a, 3e-6)
+
+    def test_runner_configures_fixed_measurement_range(self) -> None:
+        instrument = FakeInstrument()
+        runner = Keithley2450IVRunner(instrument)
+
+        runner.run_sweep(
+            IVSweepConfig(start=0, stop=0.2, step=0.1, measure_range=1e-4, source_delay_s=0),
+        )
+
+        self.assertIn(":SENS:CURR:RANG:AUTO 0", instrument.commands)
+        self.assertIn(":SENS:CURR:RANG 0.0001", instrument.commands)
 
     def test_runner_configures_constant_voltage_current_sampling(self) -> None:
         instrument = FakeInstrument()

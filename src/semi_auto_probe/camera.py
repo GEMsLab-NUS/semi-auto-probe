@@ -37,6 +37,12 @@ class CameraSettings:
     exposure: float = 0.0
     gain_mode: str = CAMERA_CONTROL_MODE_AUTO
     gain: float = 0.0
+    white_balance_mode: str = CAMERA_CONTROL_MODE_AUTO
+    white_balance_temperature: float = 6500.0
+    saturation: float = 128.0
+    brightness: float = 0.0
+    contrast: float = 0.0
+    gamma: float = 100.0
 
 
 @dataclass(frozen=True)
@@ -245,35 +251,57 @@ class _OpenCvCameraBackend(_CameraBackend):
         cv2 = self._cv2
         exposure_mode = normalize_camera_control_mode(settings.exposure_mode)
         gain_mode = normalize_camera_control_mode(settings.gain_mode)
+        white_balance_mode = normalize_camera_control_mode(settings.white_balance_mode)
         if exposure_mode == CAMERA_CONTROL_MODE_AUTO:
-            self._set_first_supported(cv2.CAP_PROP_AUTO_EXPOSURE, (0.75, 1.0))
+            self._set_first_supported(getattr(cv2, "CAP_PROP_AUTO_EXPOSURE", None), (0.75, 1.0))
         else:
-            self._set_first_supported(cv2.CAP_PROP_AUTO_EXPOSURE, (0.25, 0.0))
-            self._set_property(cv2.CAP_PROP_EXPOSURE, float(settings.exposure))
+            self._set_first_supported(getattr(cv2, "CAP_PROP_AUTO_EXPOSURE", None), (0.25, 0.0))
+            self._set_named_property("CAP_PROP_EXPOSURE", float(settings.exposure))
 
         if gain_mode == CAMERA_CONTROL_MODE_MANUAL:
-            self._set_property(cv2.CAP_PROP_GAIN, float(settings.gain))
+            self._set_named_property("CAP_PROP_GAIN", float(settings.gain))
+
+        if white_balance_mode == CAMERA_CONTROL_MODE_AUTO:
+            self._set_named_property("CAP_PROP_AUTO_WB", 1.0)
+        else:
+            self._set_named_property("CAP_PROP_AUTO_WB", 0.0)
+            self._set_named_property("CAP_PROP_WB_TEMPERATURE", float(settings.white_balance_temperature))
+        self._set_named_property("CAP_PROP_SATURATION", float(settings.saturation))
+        self._set_named_property("CAP_PROP_BRIGHTNESS", float(settings.brightness))
+        self._set_named_property("CAP_PROP_CONTRAST", float(settings.contrast))
+        self._set_named_property("CAP_PROP_GAMMA", float(settings.gamma))
 
     def property_text(self, settings: CameraSettings) -> str:
         if not self._capture:
             return "EXP --  GAIN --"
         cv2 = self._cv2
-        exposure = self._capture.get(cv2.CAP_PROP_EXPOSURE)
-        gain = self._capture.get(cv2.CAP_PROP_GAIN)
-        auto_exposure = self._capture.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+        exposure = self._get_named_property("CAP_PROP_EXPOSURE")
+        gain = self._get_named_property("CAP_PROP_GAIN")
+        auto_exposure = self._get_named_property("CAP_PROP_AUTO_EXPOSURE")
+        white_balance = self._get_named_property("CAP_PROP_WB_TEMPERATURE")
         exposure_mode = "A" if normalize_camera_control_mode(settings.exposure_mode) == CAMERA_CONTROL_MODE_AUTO else "M"
         gain_mode = "A" if normalize_camera_control_mode(settings.gain_mode) == CAMERA_CONTROL_MODE_AUTO else "M"
+        white_balance_mode = "A" if normalize_camera_control_mode(settings.white_balance_mode) == CAMERA_CONTROL_MODE_AUTO else "M"
         return (
             f"EXP {_format_property(exposure)} {exposure_mode}  "
             f"GAIN {_format_property(gain)} {gain_mode}  "
+            f"WB {_format_property(white_balance)} {white_balance_mode}  "
             f"AUTO {_format_property(auto_exposure)}"
         )
 
-    def _set_first_supported(self, property_id: int, values: tuple[float, ...]) -> bool:
+    def _set_first_supported(self, property_id: int | None, values: tuple[float, ...]) -> bool:
+        if property_id is None:
+            return False
         for value in values:
             if self._set_property(property_id, value):
                 return True
         return False
+
+    def _set_named_property(self, property_name: str, value: float) -> bool:
+        property_id = getattr(self._cv2, property_name, None)
+        if property_id is None:
+            return False
+        return self._set_property(property_id, value)
 
     def _set_property(self, property_id: int, value: float) -> bool:
         if not self._capture:
@@ -283,10 +311,25 @@ class _OpenCvCameraBackend(_CameraBackend):
         except Exception:
             return False
 
+    def _get_named_property(self, property_name: str) -> float | None:
+        if not self._capture:
+            return None
+        property_id = getattr(self._cv2, property_name, None)
+        if property_id is None:
+            return None
+        try:
+            return float(self._capture.get(property_id))
+        except Exception:
+            return None
+
     def close(self) -> None:
         if self._capture:
-            self._capture.release()
+            capture = self._capture
             self._capture = None
+            try:
+                capture.release()
+            except Exception:
+                pass
 
 
 def _miicam_library_candidates() -> list[Path | str]:
@@ -421,6 +464,29 @@ class _MiiCamBackend(_CameraBackend):
         self._dll.Miicam_get_ExpoTime.restype = ctypes.c_int
         self._dll.Miicam_get_ExpoAGain.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ushort)]
         self._dll.Miicam_get_ExpoAGain.restype = ctypes.c_int
+        for function_name in (
+            "Miicam_put_Brightness",
+            "Miicam_put_Contrast",
+            "Miicam_put_Saturation",
+            "Miicam_put_Gamma",
+        ):
+            if hasattr(self._dll, function_name):
+                function = getattr(self._dll, function_name)
+                function.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                function.restype = ctypes.c_int
+        if hasattr(self._dll, "Miicam_put_TempTint"):
+            self._dll.Miicam_put_TempTint.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+            self._dll.Miicam_put_TempTint.restype = ctypes.c_int
+        if hasattr(self._dll, "Miicam_get_TempTint"):
+            self._dll.Miicam_get_TempTint.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+            ]
+            self._dll.Miicam_get_TempTint.restype = ctypes.c_int
+        if hasattr(self._dll, "Miicam_AwbOnce"):
+            self._dll.Miicam_AwbOnce.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+            self._dll.Miicam_AwbOnce.restype = ctypes.c_int
 
     def _get_size(self) -> tuple[int, int]:
         assert self._ctypes is not None
@@ -484,13 +550,74 @@ class _MiiCamBackend(_CameraBackend):
                 self._dll.Miicam_put_ExpoAGain(self._handle, max(0, min(65535, int(settings.gain))))
             except Exception:
                 pass
+        self._apply_video_settings(settings)
 
     def property_text(self, settings: CameraSettings) -> str:
         exposure_mode = "A" if normalize_camera_control_mode(settings.exposure_mode) == CAMERA_CONTROL_MODE_AUTO else "M"
         gain_mode = "A" if normalize_camera_control_mode(settings.gain_mode) == CAMERA_CONTROL_MODE_AUTO else "M"
+        white_balance_mode = "A" if normalize_camera_control_mode(settings.white_balance_mode) == CAMERA_CONTROL_MODE_AUTO else "M"
         exposure = self._get_uint_property("Miicam_get_ExpoTime")
         gain = self._get_ushort_property("Miicam_get_ExpoAGain")
-        return f"EXP {_format_property(exposure)} {exposure_mode}  GAIN {_format_property(gain)} {gain_mode}  SDK"
+        temp, _tint = self._get_temp_tint()
+        return (
+            f"EXP {_format_property(exposure)} {exposure_mode}  "
+            f"GAIN {_format_property(gain)} {gain_mode}  "
+            f"WB {_format_property(temp)} {white_balance_mode}  SDK"
+        )
+
+    def _apply_video_settings(self, settings: CameraSettings) -> None:
+        if not self._dll or not self._handle:
+            return
+        white_balance_mode = normalize_camera_control_mode(settings.white_balance_mode)
+        if white_balance_mode == CAMERA_CONTROL_MODE_AUTO:
+            self._call_awb_once()
+        else:
+            _temp, tint = self._get_temp_tint()
+            self._call_int2("Miicam_put_TempTint", int(round(settings.white_balance_temperature)), tint or 1000)
+        self._call_int("Miicam_put_Saturation", int(round(settings.saturation)))
+        self._call_int("Miicam_put_Brightness", int(round(settings.brightness)))
+        self._call_int("Miicam_put_Contrast", int(round(settings.contrast)))
+        self._call_int("Miicam_put_Gamma", int(round(settings.gamma)))
+
+    def _call_awb_once(self) -> bool:
+        if not self._dll or not self._handle or not hasattr(self._dll, "Miicam_AwbOnce"):
+            return False
+        try:
+            result = self._dll.Miicam_AwbOnce(self._handle, None, None)
+            return int(result) >= 0
+        except Exception:
+            return False
+
+    def _call_int(self, function_name: str, value: int) -> bool:
+        if not self._dll or not self._handle or not hasattr(self._dll, function_name):
+            return False
+        try:
+            result = getattr(self._dll, function_name)(self._handle, int(value))
+            return int(result) >= 0
+        except Exception:
+            return False
+
+    def _call_int2(self, function_name: str, first: int, second: int) -> bool:
+        if not self._dll or not self._handle or not hasattr(self._dll, function_name):
+            return False
+        try:
+            result = getattr(self._dll, function_name)(self._handle, int(first), int(second))
+            return int(result) >= 0
+        except Exception:
+            return False
+
+    def _get_temp_tint(self) -> tuple[float | None, int | None]:
+        if not self._ctypes or not self._dll or not self._handle or not hasattr(self._dll, "Miicam_get_TempTint"):
+            return None, None
+        temp = self._ctypes.c_int()
+        tint = self._ctypes.c_int()
+        try:
+            result = self._dll.Miicam_get_TempTint(self._handle, self._ctypes.byref(temp), self._ctypes.byref(tint))
+        except Exception:
+            return None, None
+        if int(result) < 0:
+            return None, None
+        return float(temp.value), int(tint.value)
 
     def _get_uint_property(self, function_name: str) -> float | None:
         if not self._ctypes or not self._dll or not self._handle:
@@ -650,13 +777,57 @@ class _ToupCamBackend(_CameraBackend):
                 self._handle.put_ExpoAGain(int(settings.gain))
             except Exception:
                 pass
+        self._apply_video_settings(settings)
 
     def property_text(self, settings: CameraSettings) -> str:
         exposure_mode = "A" if normalize_camera_control_mode(settings.exposure_mode) == CAMERA_CONTROL_MODE_AUTO else "M"
         gain_mode = "A" if normalize_camera_control_mode(settings.gain_mode) == CAMERA_CONTROL_MODE_AUTO else "M"
+        white_balance_mode = "A" if normalize_camera_control_mode(settings.white_balance_mode) == CAMERA_CONTROL_MODE_AUTO else "M"
         exposure = self._try_get("get_ExpoTime")
         gain = self._try_get("get_ExpoAGain")
-        return f"EXP {_format_property(exposure)} {exposure_mode}  GAIN {_format_property(gain)} {gain_mode}  SDK"
+        temp, _tint = self._try_get_temp_tint()
+        return (
+            f"EXP {_format_property(exposure)} {exposure_mode}  "
+            f"GAIN {_format_property(gain)} {gain_mode}  "
+            f"WB {_format_property(temp)} {white_balance_mode}  SDK"
+        )
+
+    def _apply_video_settings(self, settings: CameraSettings) -> None:
+        if not self._handle:
+            return
+        white_balance_mode = normalize_camera_control_mode(settings.white_balance_mode)
+        if white_balance_mode == CAMERA_CONTROL_MODE_AUTO:
+            self._try_call("AwbOnce")
+        else:
+            _temp, tint = self._try_get_temp_tint()
+            self._try_call("put_TempTint", int(round(settings.white_balance_temperature)), int(tint or 1000))
+        self._try_call("put_Saturation", int(round(settings.saturation)))
+        self._try_call("put_Brightness", int(round(settings.brightness)))
+        self._try_call("put_Contrast", int(round(settings.contrast)))
+        self._try_call("put_Gamma", int(round(settings.gamma)))
+
+    def _try_call(self, method_name: str, *args: object) -> bool:
+        if not self._handle or not hasattr(self._handle, method_name):
+            return False
+        try:
+            getattr(self._handle, method_name)(*args)
+            return True
+        except Exception:
+            return False
+
+    def _try_get_temp_tint(self) -> tuple[float | None, int | None]:
+        if not self._handle or not hasattr(self._handle, "get_TempTint"):
+            return None, None
+        try:
+            value = self._handle.get_TempTint()
+        except Exception:
+            return None, None
+        if not isinstance(value, (tuple, list)) or len(value) < 2:
+            return None, None
+        try:
+            return float(value[0]), int(value[1])
+        except (TypeError, ValueError):
+            return None, None
 
     def _try_get(self, method_name: str) -> float | None:
         if not self._handle or not hasattr(self._handle, method_name):
@@ -672,10 +843,12 @@ class _ToupCamBackend(_CameraBackend):
 
     def close(self) -> None:
         if self._handle:
+            handle = self._handle
+            self._handle = None
             try:
-                self._handle.Close()
-            finally:
-                self._handle = None
+                handle.Close()
+            except Exception:
+                pass
         self._buffer = None
         self._image_ready.clear()
 
@@ -888,8 +1061,17 @@ class UsbCamera:
             return
 
         self._backend.apply_settings(self.settings)
+        self._update_property_text()
+
+    def update_settings(self, settings: CameraSettings) -> None:
+        self.settings = settings
+        self._apply_settings()
 
     def close(self) -> None:
         if self._backend:
-            self._backend.close()
+            backend = self._backend
             self._backend = None
+            try:
+                backend.close()
+            except Exception:
+                pass

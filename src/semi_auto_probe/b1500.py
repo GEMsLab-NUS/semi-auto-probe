@@ -21,6 +21,10 @@ DEFAULT_B1500_GATE_SMU = "smu4"
 B1500_ADC_HIGH_SPEED = "high_speed"
 B1500_ADC_HIGH_RESOLUTION = "high_resolution"
 B1500_ADC_TYPES = (B1500_ADC_HIGH_RESOLUTION, B1500_ADC_HIGH_SPEED)
+B1500_SCAN_SINGLE = "single"
+B1500_SCAN_DOUBLE = "double"
+B1500_SCAN_TYPES = (B1500_SCAN_SINGLE, B1500_SCAN_DOUBLE)
+B1500_SWEEP_VOLTAGE_LIMIT_V = 100.0
 
 
 @dataclass(frozen=True)
@@ -38,21 +42,23 @@ class B1500SweepConfig:
     sweep_start_v: float = -40.0
     sweep_end_v: float = 40.0
     sweep_points: int = 201
+    scan_type: str = B1500_SCAN_SINGLE
     bias_values_v: tuple[float, ...] = (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
     drain_current_compliance_a: float = 10e-6
     gate_current_compliance_a: float = 1e-9
-    avg_coefficient: int = -10
-    step_delay_s: float = 0.02
+    avg_coefficient: int = -8
+    step_delay_s: float = 0.0
     pre_settle_s: float = 1.0
     post_sweep_pause_s: float = 1.0
-    measurement_adc: str = B1500_ADC_HIGH_SPEED
-    high_speed_nplc: float = 10.0
-    high_resolution_nplc: float = 10.0
+    measurement_adc: str = B1500_ADC_HIGH_RESOLUTION
+    high_speed_nplc: float = 8.0
+    high_resolution_nplc: float = 8.0
     autozero: bool = False
 
     def normalized(self) -> "B1500SweepConfig":
         test_type = normalize_b1500_test_type(self.test_type)
         measurement_adc = normalize_b1500_adc_type(self.measurement_adc)
+        scan_type = normalize_b1500_scan_type(self.scan_type)
         save_mode = str(self.save_mode or "both").strip().lower()
         if save_mode not in B1500_SAVE_MODES:
             raise ValueError("B1500 save mode must be long, wide, both, or per_curve.")
@@ -79,6 +85,8 @@ class B1500SweepConfig:
         )
         if any(not math.isfinite(float(value)) for value in numeric):
             raise ValueError("B1500 numeric parameters must be finite.")
+        if abs(float(self.sweep_start_v)) > B1500_SWEEP_VOLTAGE_LIMIT_V or abs(float(self.sweep_end_v)) > B1500_SWEEP_VOLTAGE_LIMIT_V:
+            raise ValueError(f"B1500 sweep voltages must be in range -{B1500_SWEEP_VOLTAGE_LIMIT_V:g}..{B1500_SWEEP_VOLTAGE_LIMIT_V:g} V.")
         sweep_points = int(float(self.sweep_points))
         if sweep_points < 2 or sweep_points > 100000:
             raise ValueError("B1500 sweep points must be in range 2..100000.")
@@ -107,6 +115,7 @@ class B1500SweepConfig:
             sweep_start_v=float(self.sweep_start_v),
             sweep_end_v=float(self.sweep_end_v),
             sweep_points=sweep_points,
+            scan_type=scan_type,
             bias_values_v=bias_values,
             drain_current_compliance_a=float(self.drain_current_compliance_a),
             gate_current_compliance_a=float(self.gate_current_compliance_a),
@@ -124,7 +133,7 @@ class B1500SweepConfig:
         config = self.normalized()
         mapping = f"D={config.drain_smu.upper()} G={config.gate_smu.upper()}"
         if config.test_type == B1500_TEST_TRANSFER:
-            return f"{config.resource_name} | {mapping} | Transfer Vg {config.sweep_start_v:g}->{config.sweep_end_v:g} V, Vd={format_float_list(config.bias_values_v)} V"
+            return f"{config.resource_name} | {mapping} | Transfer {config.scan_type} Vg {config.sweep_start_v:g}->{config.sweep_end_v:g} V, Vd={format_float_list(config.bias_values_v)} V"
         return f"{config.resource_name} | {mapping} | Output Vd {config.sweep_start_v:g}->{config.sweep_end_v:g} V, Vg={format_float_list(config.bias_values_v)} V"
 
 
@@ -190,6 +199,25 @@ def normalize_b1500_adc_type(value: object) -> str:
     return normalized
 
 
+def normalize_b1500_scan_type(value: object) -> str:
+    text = str(value or B1500_SCAN_SINGLE).strip().lower().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "single": B1500_SCAN_SINGLE,
+        "forward": B1500_SCAN_SINGLE,
+        "oneway": B1500_SCAN_SINGLE,
+        "one_way": B1500_SCAN_SINGLE,
+        "double": B1500_SCAN_DOUBLE,
+        "bidirectional": B1500_SCAN_DOUBLE,
+        "both": B1500_SCAN_DOUBLE,
+        "roundtrip": B1500_SCAN_DOUBLE,
+        "round_trip": B1500_SCAN_DOUBLE,
+    }
+    normalized = aliases.get(text, text)
+    if normalized not in B1500_SCAN_TYPES:
+        raise ValueError("B1500 scan type must be single or double.")
+    return normalized
+
+
 def parse_bool(value: object, *, default: bool = False) -> bool:
     if value is None:
         return default
@@ -206,14 +234,16 @@ def parse_bool(value: object, *, default: bool = False) -> bool:
 
 
 def parse_float_list(value: object) -> tuple[float, ...]:
-    text = str(value or "").strip()
+    text = str(value or "").strip().replace("：", ":")
+    if (text.startswith("[") and text.endswith("]")) or (text.startswith("(") and text.endswith(")")):
+        text = text[1:-1].strip()
     if not text:
         return ()
     if ":" in text and "," not in text:
         parts = [float(part.strip()) for part in text.split(":")]
         if len(parts) != 3:
-            raise ValueError("Range list must use start:stop:step.")
-        start, stop, step = parts
+            raise ValueError("Range list must use start:step:end.")
+        start, step, stop = parts
         if step == 0:
             raise ValueError("Range list step must be non-zero.")
         values: list[float] = []
@@ -240,8 +270,24 @@ def b1500_sweep_abort_setting(constants: Any, config: B1500SweepConfig) -> Any:
     return constants.Abort.ENABLED if config.abort_on_compliance else constants.Abort.DISABLED
 
 
+def relax_b1500_iv_sweep_voltage_validator(smu: Any, *, voltage_limit_v: float = B1500_SWEEP_VOLTAGE_LIMIT_V) -> None:
+    try:
+        import qcodes.validators as vals
+    except ImportError:
+        return
+
+    iv_sweep = getattr(smu, "iv_sweep", None)
+    if iv_sweep is None:
+        return
+    validator = vals.Numbers(-float(voltage_limit_v), float(voltage_limit_v))
+    for parameter_name in ("sweep_start", "sweep_end"):
+        parameter = getattr(iv_sweep, parameter_name, None)
+        if parameter is not None and hasattr(parameter, "vals"):
+            parameter.vals = validator
+
+
 def b1500_avg_coefficient_from_params(params: dict[str, str]) -> int:
-    nplc = int(float(params.get("staircase_nplc", "10")))
+    nplc = int(float(params.get("staircase_nplc", "8")))
     if nplc < 1 or nplc > 100:
         raise ValueError("B1500 staircase NPLC must be in range 1..100.")
     return -nplc
@@ -262,16 +308,17 @@ def b1500_config_from_params(params: dict[str, str], *, test_type: str) -> B1500
         sweep_start_v=float(params.get("sweep_start_v", params.get("start_v", "-40"))),
         sweep_end_v=float(params.get("sweep_end_v", params.get("end_v", "40"))),
         sweep_points=int(float(params.get("sweep_points", params.get("points", "201")))),
-        bias_values_v=parse_float_list(params.get("bias_values_v", "0:5:1")),
+        scan_type=params.get("scan_type", B1500_SCAN_SINGLE),
+        bias_values_v=parse_float_list(params.get("bias_values_v", "0:1:5")),
         drain_current_compliance_a=float(params.get("drain_current_compliance_a", "1e-5")),
         gate_current_compliance_a=float(params.get("gate_current_compliance_a", "1e-9")),
         avg_coefficient=b1500_avg_coefficient_from_params(params),
-        step_delay_s=float(params.get("step_delay_s", "0.02")),
+        step_delay_s=float(params.get("step_delay_s", "0")),
         pre_settle_s=float(params.get("pre_settle_s", "1.0")),
         post_sweep_pause_s=float(params.get("post_sweep_pause_s", "1.0")),
-        measurement_adc=params.get("measurement_adc", B1500_ADC_HIGH_SPEED),
-        high_speed_nplc=float(params.get("high_speed_nplc", "10")),
-        high_resolution_nplc=float(params.get("high_resolution_nplc", "10")),
+        measurement_adc=params.get("measurement_adc", B1500_ADC_HIGH_RESOLUTION),
+        high_speed_nplc=float(params.get("high_speed_nplc", "8")),
+        high_resolution_nplc=float(params.get("high_resolution_nplc", "8")),
         autozero=parse_bool(params.get("autozero"), default=False),
     ).normalized()
 
@@ -421,9 +468,10 @@ class KeysightB1500Runner:
         smu.current_measurement_range(constants.IMeasRange.AUTO)
         smu.voltage(float(vg))
 
-    def _configure_gate_sweep(self, b1500, config: B1500SweepConfig) -> None:
+    def _configure_gate_sweep(self, b1500, config: B1500SweepConfig, *, sweep_start_v: float | None = None, sweep_end_v: float | None = None) -> None:
         constants = self._constants()
         smu = self._gate_smu(b1500, config)
+        relax_b1500_iv_sweep_voltage_validator(smu)
         smu.source_config(
             output_range=constants.VOutputRange.AUTO,
             compliance=config.gate_current_compliance_a,
@@ -435,8 +483,8 @@ class KeysightB1500Runner:
         smu.voltage(0.0)
         smu.setup_staircase_sweep(
             v_src_range=constants.VOutputRange.AUTO,
-            v_start=config.sweep_start_v,
-            v_end=config.sweep_end_v,
+            v_start=config.sweep_start_v if sweep_start_v is None else float(sweep_start_v),
+            v_end=config.sweep_end_v if sweep_end_v is None else float(sweep_end_v),
             n_steps=config.sweep_points,
             av_coef=config.avg_coefficient,
             step_delay=config.step_delay_s,
@@ -449,6 +497,7 @@ class KeysightB1500Runner:
     def _configure_drain_sweep(self, b1500, config: B1500SweepConfig) -> None:
         constants = self._constants()
         smu = self._drain_smu(b1500, config)
+        relax_b1500_iv_sweep_voltage_validator(smu)
         smu.enable_outputs()
         smu.voltage(0.0)
         smu.source_config(
@@ -509,32 +558,55 @@ class KeysightB1500Runner:
     def _measure_transfer(self, b1500, config: B1500SweepConfig, *, stop_requested: Callable[[], bool], on_curve: Callable[[dict[str, object]], None] | None) -> list[dict[str, Any]]:
         self._prepare_adc_and_channels(b1500, config)
         curves: list[dict[str, Any]] = []
+        sweep_segments = ((config.sweep_start_v, config.sweep_end_v),)
+        if config.scan_type == B1500_SCAN_DOUBLE:
+            sweep_segments = (
+                (config.sweep_start_v, config.sweep_end_v),
+                (config.sweep_end_v, config.sweep_start_v),
+            )
         for index, vd in enumerate(config.bias_values_v, start=1):
             if stop_requested():
                 break
+            x_parts: list[np.ndarray] = []
+            id_parts: list[np.ndarray] = []
+            ig_parts: list[np.ndarray] = []
+            for sweep_start, sweep_end in sweep_segments:
+                if stop_requested():
+                    break
 
-            def arm_transfer_sweep() -> None:
-                self._configure_drain_fixed(b1500, config, vd)
-                self._configure_gate_sweep(b1500, config)
-                self._set_measurement_mode_transfer(b1500, config)
+                def arm_transfer_sweep(start: float = sweep_start, end: float = sweep_end) -> None:
+                    self._configure_drain_fixed(b1500, config, vd)
+                    self._configure_gate_sweep(b1500, config, sweep_start_v=start, sweep_end_v=end)
+                    self._set_measurement_mode_transfer(b1500, config)
 
-            self._preflight_for_sweep(b1500, config)
-            arm_transfer_sweep()
-            time.sleep(config.pre_settle_s)
-            result, vg = self._run_staircase_with_retry(
-                b1500,
-                config,
-                lambda: self._measurement(b1500, config),
-                arm_transfer_sweep,
-            )
-            if config.measure_gate_leak:
-                ig = _to_1d_f64(result[0])
-                current = _to_1d_f64(result[1])
-            else:
-                ig = np.array([], dtype=np.float64)
-                current = _to_1d_f64(result[0])
-            _validate_curve_lengths("Transfer", current, vg, ig)
-            curve = {"bias": float(vd), "x": vg, "id": current, "ig": ig}
+                self._preflight_for_sweep(b1500, config)
+                arm_transfer_sweep()
+                time.sleep(config.pre_settle_s)
+                result, vg = self._run_staircase_with_retry(
+                    b1500,
+                    config,
+                    lambda: self._measurement(b1500, config),
+                    arm_transfer_sweep,
+                )
+                if config.measure_gate_leak:
+                    ig = _to_1d_f64(result[0])
+                    current = _to_1d_f64(result[1])
+                else:
+                    ig = np.array([], dtype=np.float64)
+                    current = _to_1d_f64(result[0])
+                _validate_curve_lengths("Transfer", current, vg, ig)
+                x_parts.append(vg)
+                id_parts.append(current)
+                if len(ig):
+                    ig_parts.append(ig)
+            if not x_parts:
+                continue
+            curve = {
+                "bias": float(vd),
+                "x": np.concatenate(x_parts),
+                "id": np.concatenate(id_parts),
+                "ig": np.concatenate(ig_parts) if ig_parts else np.array([], dtype=np.float64),
+            }
             curves.append(curve)
             if on_curve is not None:
                 on_curve(b1500_curve_payload(config.test_type, curve, index, len(config.bias_values_v)))

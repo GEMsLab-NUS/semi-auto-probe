@@ -120,6 +120,7 @@ from .img_stitch import (
     flat_field_correct,
     fuse_t_stack,
     fuse_z_stack,
+    mosaic_pixel_to_stage_um,
     recompose_session,
     serpentine_indices,
     stitch_displacement_diagnostics,
@@ -132,10 +133,10 @@ from .keithley2450 import (
     Keithley2450IVRunner,
     calculate_iv_statistics,
     constant_voltage_current_config_from_params,
-    iv_sweep_config_from_params,
+    iv_sweep_configs_from_params,
+    parse_bool,
 )
 from .logging_utils import colorize_hex_frame, configure_logging, print_startup_banner
-from .monitor_feed import publish_camera_frame, request_web_fallback_camera_release, start_frame_publisher
 from .protocol import COMM_TEST_COMMAND, FUNCTION_READ_POSITION, RESPONSE_HEAD, Axis, AxisPosition, IoStatus, hex_bytes, parse_axis_position_response
 from .protocol import payload_contains_clear_position_command
 from .serial_client import ControllerSerialClient, CommunicationTestResult, list_serial_ports
@@ -233,14 +234,16 @@ class IVPlotWindow:
         self.parent = parent
         self.colors = colors
         self.samples: list[dict[str, object]] = []
-        self.iv_voltages: list[float] = []
-        self.iv_currents: list[float] = []
+        self.iv_curves: dict[str, dict[str, object]] = {}
         self.iv_draw_job: str | None = None
         self.last_iv_draw_at = 0.0
         self.heatmap_values: dict[tuple[int, int], float] = {}
         self.heatmap_rows = 1
         self.heatmap_cols = 1
         self.heatmap_label = "Resistance (ohm)"
+        self.plot_layout = "horizontal"
+        self.show_heatmap_values = True
+        self.heatmap_colorbar = None
         self.window = tk.Toplevel(parent)
         self.window.title("Keithley 2450 IV")
         self.window.geometry("980x560")
@@ -266,15 +269,9 @@ class IVPlotWindow:
         from matplotlib.figure import Figure
 
         self.figure = Figure(figsize=(8.8, 4.2), dpi=100, facecolor=colors["surface"])
-        self.iv_axes = self.figure.add_subplot(121)
-        self.heatmap_axes = self.figure.add_subplot(122)
-        self._style_axes(self.iv_axes)
-        self._style_axes(self.heatmap_axes)
-        self.iv_axes.set_xlabel("Voltage (V)", color=colors["text"])
-        self.iv_axes.set_ylabel("Current (A)", color=colors["text"])
-        self.iv_axes.grid(True, color=colors["border"], alpha=0.45)
-        (self.line,) = self.iv_axes.plot([], [], color=colors["accent"], marker="o", markersize=3, linewidth=1.4)
-        self._draw_empty_heatmap()
+        self.iv_axes = None
+        self.heatmap_axes = None
+        self._configure_plot_layout("horizontal")
         self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
 
@@ -283,6 +280,69 @@ class IVPlotWindow:
         axes.tick_params(colors=self.colors["muted"])
         for spine in axes.spines.values():
             spine.set_color(self.colors["border"])
+
+    @staticmethod
+    def _si_tick_label(value: float, unit: str) -> str:
+        if not math.isfinite(float(value)):
+            return ""
+        value = float(value)
+        if value == 0:
+            return f"0 {unit}"
+        prefixes = (
+            (-15, "f"),
+            (-12, "p"),
+            (-9, "n"),
+            (-6, "u"),
+            (-3, "m"),
+            (0, ""),
+            (3, "k"),
+            (6, "M"),
+            (9, "G"),
+            (12, "T"),
+        )
+        exponent = int(math.floor(math.log10(abs(value)) / 3.0) * 3)
+        exponent = max(-15, min(12, exponent))
+        prefix = dict(prefixes)[exponent]
+        scaled = value / (10**exponent)
+        if abs(scaled) >= 100:
+            text = f"{scaled:.0f}"
+        elif abs(scaled) >= 10:
+            text = f"{scaled:.1f}".rstrip("0").rstrip(".")
+        else:
+            text = f"{scaled:.2f}".rstrip("0").rstrip(".")
+        return f"{text} {prefix}{unit}"
+
+    def _format_iv_axes_ticks(self) -> None:
+        from matplotlib.ticker import FuncFormatter
+
+        self.iv_axes.xaxis.set_major_formatter(FuncFormatter(lambda value, _pos: self._si_tick_label(value, "V")))
+        self.iv_axes.yaxis.set_major_formatter(FuncFormatter(lambda value, _pos: self._si_tick_label(value, "A")))
+
+    def _configure_plot_layout(self, layout: str) -> None:
+        normalized = str(layout or "horizontal").strip().lower()
+        normalized = "vertical" if normalized.startswith("v") else "horizontal"
+        if self.iv_axes is not None and self.heatmap_axes is not None and normalized == self.plot_layout:
+            return
+        self.plot_layout = normalized
+        self.figure.clear()
+        self.heatmap_colorbar = None
+        if normalized == "vertical":
+            self.iv_axes = self.figure.add_subplot(211)
+            self.heatmap_axes = self.figure.add_subplot(212)
+        else:
+            self.iv_axes = self.figure.add_subplot(121)
+            self.heatmap_axes = self.figure.add_subplot(122)
+        self._style_axes(self.iv_axes)
+        self._style_axes(self.heatmap_axes)
+        self.iv_axes.set_xlabel("Voltage (V)", color=self.colors["text"])
+        self.iv_axes.set_ylabel("Current (A)", color=self.colors["text"])
+        self.iv_axes.grid(True, color=self.colors["border"], alpha=0.45)
+        self._format_iv_axes_ticks()
+        if normalized == "vertical":
+            self.figure.subplots_adjust(left=0.1, right=0.96, bottom=0.09, top=0.93, hspace=0.48)
+        else:
+            self.figure.subplots_adjust(left=0.08, right=0.96, bottom=0.14, top=0.9, wspace=0.34)
+        self._draw_empty_heatmap()
 
     def hide(self) -> None:
         self.window.withdraw()
@@ -301,10 +361,13 @@ class IVPlotWindow:
         rows: int | None = None,
         cols: int | None = None,
         reset_heatmap: bool = False,
+        plot_layout: str = "horizontal",
+        show_heatmap_values: bool = True,
     ) -> None:
         self.samples.clear()
-        self.iv_voltages.clear()
-        self.iv_currents.clear()
+        self.iv_curves.clear()
+        self.show_heatmap_values = bool(show_heatmap_values)
+        self._configure_plot_layout(plot_layout)
         if self.iv_draw_job is not None:
             try:
                 self.window.after_cancel(self.iv_draw_job)
@@ -313,7 +376,12 @@ class IVPlotWindow:
             self.iv_draw_job = None
         self.title_var.set(f"IV sweep: {point_name}")
         self.status_var.set(config.summary())
-        self.line.set_data([], [])
+        self.iv_axes.clear()
+        self._style_axes(self.iv_axes)
+        self.iv_axes.set_xlabel("Voltage (V)", color=self.colors["text"])
+        self.iv_axes.set_ylabel("Current (A)", color=self.colors["text"])
+        self.iv_axes.grid(True, color=self.colors["border"], alpha=0.45)
+        self._format_iv_axes_ticks()
         self.iv_axes.relim()
         self.iv_axes.autoscale_view()
         if rows is not None and cols is not None:
@@ -330,11 +398,19 @@ class IVPlotWindow:
         self.samples.append(sample)
         if not _finite_number(sample.get("voltage_v")) or not _finite_number(sample.get("current_a")):
             return
-        self.iv_voltages.append(float(sample["voltage_v"]))
-        self.iv_currents.append(float(sample["current_a"]))
+        curve_label = str(sample.get("curve_label") or "IV")
+        curve = self.iv_curves.get(curve_label)
+        if curve is None:
+            color_cycle = ["#38bdf8", "#34d399", "#facc15", "#f472b6", "#a78bfa", "#fb7185", "#22d3ee"]
+            color = color_cycle[len(self.iv_curves) % len(color_cycle)]
+            (line,) = self.iv_axes.plot([], [], color=color, marker="o", markersize=3, linewidth=1.4, label=curve_label)
+            curve = {"voltage": [], "current": [], "line": line}
+            self.iv_curves[curve_label] = curve
+        curve["voltage"].append(float(sample["voltage_v"]))  # type: ignore[index,union-attr]
+        curve["current"].append(float(sample["current_a"]))  # type: ignore[index,union-attr]
         index = int(sample.get("index", len(self.samples)))
         total = int(sample.get("total", len(self.samples)))
-        self.status_var.set(f"Point {index}/{total} | V={self.iv_voltages[-1]:.6g} V | I={self.iv_currents[-1]:.6g} A")
+        self.status_var.set(f"{curve_label} {index}/{total} | V={float(sample['voltage_v']):.6g} V | I={float(sample['current_a']):.6g} A")
         self._schedule_iv_draw(force=index >= total)
 
     def _schedule_iv_draw(self, *, force: bool = False) -> None:
@@ -357,9 +433,12 @@ class IVPlotWindow:
 
     def _draw_iv_samples(self) -> None:
         self.iv_draw_job = None
-        if not self.iv_voltages or len(self.iv_voltages) != len(self.iv_currents):
+        if not self.iv_curves:
             return
-        self.line.set_data(self.iv_voltages, self.iv_currents)
+        for curve in self.iv_curves.values():
+            curve["line"].set_data(curve["voltage"], curve["current"])
+        if len(self.iv_curves) > 1:
+            self.iv_axes.legend(facecolor=self.colors["surface_2"], edgecolor=self.colors["border"], labelcolor=self.colors["text"], fontsize=8)
         self.iv_axes.relim()
         self.iv_axes.autoscale_view()
         self.last_iv_draw_at = time.monotonic()
@@ -378,6 +457,7 @@ class IVPlotWindow:
         self.canvas.draw_idle()
 
     def _draw_empty_heatmap(self) -> None:
+        self._remove_heatmap_colorbar()
         self.heatmap_axes.clear()
         self._style_axes(self.heatmap_axes)
         self.heatmap_axes.set_title("Resistance heatmap", color=self.colors["text"])
@@ -386,29 +466,69 @@ class IVPlotWindow:
         self.heatmap_axes.set_yticks([])
 
     def _draw_heatmap(self, active: tuple[int, int] | None = None) -> None:
+        self._remove_heatmap_colorbar()
         if not self.heatmap_values:
             self._draw_empty_heatmap()
             return
         matrix = [[math.nan for _col in range(self.heatmap_cols)] for _row in range(self.heatmap_rows)]
+        positive_values: list[float] = []
         for (row, col), value in self.heatmap_values.items():
             if 0 <= row < self.heatmap_rows and 0 <= col < self.heatmap_cols:
-                matrix[row][col] = value
+                if value > 0 and math.isfinite(value):
+                    matrix[row][col] = value
+                    positive_values.append(value)
         self.heatmap_axes.clear()
         self._style_axes(self.heatmap_axes)
         self.heatmap_axes.set_title(self.heatmap_label, color=self.colors["text"])
-        image = self.heatmap_axes.imshow(matrix, cmap="viridis", interpolation="nearest")
+        if not positive_values:
+            self.heatmap_axes.text(
+                0.5,
+                0.5,
+                "No positive resistance values for log scale",
+                ha="center",
+                va="center",
+                color=self.colors["muted"],
+                transform=self.heatmap_axes.transAxes,
+            )
+            self.heatmap_axes.set_xticks(range(self.heatmap_cols))
+            self.heatmap_axes.set_yticks(range(self.heatmap_rows))
+            self.heatmap_axes.set_xlabel("Column", color=self.colors["text"])
+            self.heatmap_axes.set_ylabel("Row", color=self.colors["text"])
+            return
+        from matplotlib.colors import LogNorm
+
+        vmin = min(positive_values)
+        vmax = max(positive_values)
+        if vmin == vmax:
+            vmin = max(vmin / 10.0, 1e-30)
+            vmax *= 10.0
+        image = self.heatmap_axes.imshow(matrix, cmap="viridis", interpolation="nearest", origin="lower", norm=LogNorm(vmin=vmin, vmax=vmax))
         image.cmap.set_bad(color=self.colors["surface_3"])
+        self.heatmap_colorbar = self.figure.colorbar(image, ax=self.heatmap_axes, fraction=0.046, pad=0.04)
+        self.heatmap_colorbar.set_label(self.heatmap_label, color=self.colors["text"])
+        self.heatmap_colorbar.ax.tick_params(colors=self.colors["muted"])
+        self.heatmap_colorbar.outline.set_edgecolor(self.colors["border"])
         self.heatmap_axes.set_xticks(range(self.heatmap_cols))
         self.heatmap_axes.set_yticks(range(self.heatmap_rows))
         self.heatmap_axes.set_xlabel("Column", color=self.colors["text"])
         self.heatmap_axes.set_ylabel("Row", color=self.colors["text"])
-        for (row, col), value in self.heatmap_values.items():
-            if 0 <= row < self.heatmap_rows and 0 <= col < self.heatmap_cols:
-                self.heatmap_axes.text(col, row, f"{value:.3g}", ha="center", va="center", color="#f8fafc", fontsize=8)
+        if self.show_heatmap_values:
+            for (row, col), value in self.heatmap_values.items():
+                if 0 <= row < self.heatmap_rows and 0 <= col < self.heatmap_cols:
+                    self.heatmap_axes.text(col, row, f"{value:.3g}", ha="center", va="center", color="#f8fafc", fontsize=8)
         if active is not None:
             row, col = active
             if 0 <= row < self.heatmap_rows and 0 <= col < self.heatmap_cols:
                 self.heatmap_axes.plot(col, row, marker="s", markersize=18, markerfacecolor="none", markeredgecolor="#facc15", markeredgewidth=1.5)
+
+    def _remove_heatmap_colorbar(self) -> None:
+        if self.heatmap_colorbar is None:
+            return
+        try:
+            self.heatmap_colorbar.remove()
+        except Exception:
+            pass
+        self.heatmap_colorbar = None
 
     def finish(self, message: str) -> None:
         self._schedule_iv_draw(force=True)
@@ -647,6 +767,47 @@ class B1500PlotWindow:
         except (TypeError, ValueError):
             return []
 
+    @staticmethod
+    def _positive_abs_series(values: object) -> list[float]:
+        series = B1500PlotWindow._float_series(values)
+        result: list[float] = []
+        for value in series:
+            abs_value = abs(value)
+            result.append(abs_value if abs_value > 0.0 and math.isfinite(abs_value) else math.nan)
+        return result
+
+    @staticmethod
+    def _current_tick_label(value: float) -> str:
+        if not math.isfinite(float(value)) or float(value) <= 0:
+            return ""
+        value = float(value)
+        prefixes = (
+            (-15, "f"),
+            (-12, "p"),
+            (-9, "n"),
+            (-6, "u"),
+            (-3, "m"),
+            (0, ""),
+            (3, "k"),
+        )
+        exponent = int(math.floor(math.log10(value) / 3.0) * 3)
+        exponent = max(-15, min(3, exponent))
+        scaled = value / (10**exponent)
+        if scaled >= 100:
+            text = f"{scaled:.0f}"
+        elif scaled >= 10:
+            text = f"{scaled:.1f}".rstrip("0").rstrip(".")
+        else:
+            text = f"{scaled:.2f}".rstrip("0").rstrip(".")
+        return f"{text} {dict(prefixes)[exponent]}A"
+
+    def _format_current_axes_ticks(self) -> None:
+        from matplotlib.ticker import FuncFormatter
+
+        formatter = FuncFormatter(lambda value, _pos: self._current_tick_label(value))
+        self.axes.yaxis.set_major_formatter(formatter)
+        self.gate_axes.yaxis.set_major_formatter(formatter)
+
     def _curve_color(self, index: int, total: int):
         cmap_name = "plasma" if self.test_type == B1500_TEST_TRANSFER else "viridis"
         try:
@@ -672,9 +833,10 @@ class B1500PlotWindow:
         title = "Transfer: Id-Vg" if is_transfer else "Output: Id-Vd"
         self.axes.set_title(title, color=self.colors["text"])
         self.axes.set_xlabel(x_label, color=self.colors["text"])
-        self.axes.set_ylabel("Id (A)", color=self.colors["text"])
-        self.gate_axes.set_ylabel("Ig (A)" if is_transfer else "|Ig| (A)", color="#94a3b8")
+        self.axes.set_ylabel("|Id| (A)" if is_transfer else "Id (A)", color=self.colors["text"])
+        self.gate_axes.set_ylabel("|Ig| (A)", color="#94a3b8")
         self.gate_axes.tick_params(colors="#94a3b8")
+        self._format_current_axes_ticks()
 
         if not self.curves:
             self.axes.text(0.5, 0.5, "No B1500 curves", ha="center", va="center", color=self.colors["muted"], transform=self.axes.transAxes)
@@ -687,21 +849,18 @@ class B1500PlotWindow:
         for index, curve in enumerate(self.curves):
             color = self._curve_color(index, total)
             x_values = curve["x"]
-            id_values = curve["id"]
+            id_values = self._positive_abs_series(curve["id"]) if is_transfer else curve["id"]
             bias = float(curve["bias_v"])
             self.axes.plot(x_values, id_values, color=color, linewidth=1.8, label=f"{bias_label}={bias:+.3g} V")
             ig_values = curve.get("ig")
             if ig_values:
-                gate_values = ig_values if is_transfer else [abs(float(value)) for value in ig_values]
+                gate_values = self._positive_abs_series(ig_values)
                 self.gate_axes.plot(x_values, gate_values, color=color, linewidth=1.0, linestyle="--", alpha=0.55)
 
         if is_transfer:
-            self.axes.set_yscale("symlog", linthresh=1e-12)
+            self.axes.set_yscale("log")
         if has_gate:
-            if is_transfer:
-                self.gate_axes.set_yscale("symlog", linthresh=1e-12)
-            else:
-                self.gate_axes.set_yscale("log")
+            self.gate_axes.set_yscale("log")
         else:
             self.gate_axes.set_yticks([])
             self.gate_axes.set_ylabel("")
@@ -794,6 +953,10 @@ class ProbeApp(tk.Tk):
         self.imgmatrix_progress_total = 0
         self.autotest_progress_current = 0
         self.autotest_progress_total = 0
+        self.autotest_grid_rows = 1
+        self.autotest_grid_cols = 1
+        self.autotest_started_at: float | None = None
+        self.autotest_completed_point_times: list[float] = []
         self.last_autotest_wobble_status_at = 0.0
         self.last_iv_sample_status_at = 0.0
         self.current_page = "Main"
@@ -994,6 +1157,12 @@ class ProbeApp(tk.Tk):
         self.camera_exposure_var = tk.StringVar(value=f"{self.probe_config.camera_exposure:g}")
         self.camera_gain_mode_var = tk.StringVar(value=self._camera_control_mode_label(self.probe_config.camera_gain_mode))
         self.camera_gain_var = tk.StringVar(value=f"{self.probe_config.camera_gain:g}")
+        self.camera_white_balance_mode_var = tk.StringVar(value=self._camera_control_mode_label(self.probe_config.camera_white_balance_mode))
+        self.camera_white_balance_temperature_var = tk.StringVar(value=f"{self.probe_config.camera_white_balance_temperature:g}")
+        self.camera_color_saturation_var = tk.StringVar(value=f"{self.probe_config.camera_color_saturation:g}")
+        self.camera_color_brightness_var = tk.StringVar(value=f"{self.probe_config.camera_color_brightness:g}")
+        self.camera_color_contrast_var = tk.StringVar(value=f"{self.probe_config.camera_color_contrast:g}")
+        self.camera_color_gamma_var = tk.StringVar(value=f"{self.probe_config.camera_color_gamma:g}")
         self.camera_resolution_var = tk.StringVar(value=self._camera_resolution_label(self.probe_config.camera_resolution_width))
         self.camera_target_fps_var = tk.StringVar(value=str(self.probe_config.camera_target_fps))
         self.cc_accel_time_var = tk.StringVar(value=f"{self.probe_config.cc_accel_time_s:g}")
@@ -1029,7 +1198,6 @@ class ProbeApp(tk.Tk):
         self._configure_theme()
         self._build_ui()
         self._bind_keyboard_controls()
-        start_frame_publisher()
         self.bind("<Configure>", self._on_window_configure)
         self.port_combo["values"] = (DEFAULT_SERIAL_PORT,)
         self.start_camera()
@@ -1624,6 +1792,7 @@ class ProbeApp(tk.Tk):
             move_to_stage_xyz_um=self.move_gds_mapper_stage_target,
             get_focus_z_um=self._gds_mapper_focus_z_um,
             get_microscope_preview=lambda: self.panel_microscope_preview("LayoutBond"),
+            get_camera_fov_rotation_deg=self._camera_fov_rotation_deg,
             fov_width_var=self.layoutbond_fov_width_var,
             fov_height_var=self.layoutbond_fov_height_var,
             use_focus_z_var=self.main_focusmap_plane_var,
@@ -1643,6 +1812,7 @@ class ProbeApp(tk.Tk):
             get_microscope_preview=lambda: self.panel_microscope_preview("ImgMatrix"),
             fov_width_var=self.layoutbond_fov_width_var,
             fov_height_var=self.layoutbond_fov_height_var,
+            get_camera_fov_rotation_deg=self._camera_fov_rotation_deg,
             tile_acquisition_var=self.imgstitch_tile_acquisition_var,
             t_stack_frame_count_var=self.t_stack_frame_count_var,
             t_stack_fusion_var=self.t_stack_fusion_var,
@@ -1672,6 +1842,7 @@ class ProbeApp(tk.Tk):
             get_microscope_preview=lambda: self.panel_microscope_preview("AutoTest"),
             fov_width_var=self.layoutbond_fov_width_var,
             fov_height_var=self.layoutbond_fov_height_var,
+            get_camera_fov_rotation_deg=self._camera_fov_rotation_deg,
             start_run=self.start_autotest,
             stop_run=self.stop_autotest,
             set_status=self.status_var.set,
@@ -3154,6 +3325,7 @@ class ProbeApp(tk.Tk):
         self.imgstitch_mosaic_canvas.bind("<MouseWheel>", self._on_imgstitch_preview_wheel)
         self.imgstitch_mosaic_canvas.bind("<Button-4>", self._on_imgstitch_preview_wheel)
         self.imgstitch_mosaic_canvas.bind("<Button-5>", self._on_imgstitch_preview_wheel)
+        self.imgstitch_mosaic_canvas.bind("<Shift-ButtonPress-1>", self._on_imgstitch_preview_shift_click)
         self.imgstitch_mosaic_canvas.bind("<ButtonPress-1>", self._on_imgstitch_preview_press)
         self.imgstitch_mosaic_canvas.bind("<B1-Motion>", self._on_imgstitch_preview_drag)
         self.imgstitch_mosaic_canvas.bind("<Configure>", lambda _event: self._render_imgstitch_preview())
@@ -3355,49 +3527,69 @@ class ProbeApp(tk.Tk):
         self._update_imgstitch_mode_fields()
 
     def _build_config_page(self, parent: ttk.Frame) -> None:
-        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure((0, 1, 2), weight=1, uniform="config_columns")
         parent.rowconfigure(0, weight=1)
 
-        canvas = tk.Canvas(parent, bg=self.colors["bg"], highlightthickness=0)
-        scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview, style="Slim.Vertical.TScrollbar")
-        content = ttk.Frame(canvas, style="App.TFrame")
-        content_window = canvas.create_window((0, 0), window=content, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns")
-
-        def _sync_scroll_region(_event: tk.Event | None = None) -> None:
-            canvas.configure(scrollregion=canvas.bbox("all"))
-
-        def _sync_content_width(event: tk.Event) -> None:
-            canvas.itemconfigure(content_window, width=event.width)
-
-        def _scroll_config(event: tk.Event) -> str:
+        def _scroll_config_column(canvas: tk.Canvas, event: tk.Event) -> str:
             delta = getattr(event, "delta", 0)
-            if delta:
+            if getattr(event, "num", None) == 4:
+                canvas.yview_scroll(-3, "units")
+            elif getattr(event, "num", None) == 5:
+                canvas.yview_scroll(3, "units")
+            elif delta:
                 canvas.yview_scroll(int(-delta / 120), "units")
             return "break"
 
-        content.bind("<Configure>", _sync_scroll_region)
-        canvas.bind("<Configure>", _sync_content_width)
-        canvas.bind("<MouseWheel>", _scroll_config)
-        content.bind("<MouseWheel>", _scroll_config)
+        def _bind_config_column_scroll(widget: tk.Widget, canvas: tk.Canvas) -> None:
+            widget.bind("<MouseWheel>", lambda event, c=canvas: _scroll_config_column(c, event), add="+")
+            widget.bind("<Button-4>", lambda event, c=canvas: _scroll_config_column(c, event), add="+")
+            widget.bind("<Button-5>", lambda event, c=canvas: _scroll_config_column(c, event), add="+")
+            for child in widget.winfo_children():
+                _bind_config_column_scroll(child, canvas)
 
-        content.columnconfigure((0, 1, 2), weight=1, uniform="config_columns")
-        content.rowconfigure(0, weight=1)
+        def _build_config_column(column: int, padx: tuple[int, int]) -> tuple[ttk.Frame, tk.Canvas]:
+            shell = ttk.Frame(parent, style="App.TFrame")
+            shell.grid(row=0, column=column, sticky="nsew", padx=padx)
+            shell.columnconfigure(0, weight=1)
+            shell.rowconfigure(0, weight=1)
 
-        optical_panel = ttk.Frame(content, style="Panel.TFrame", padding=16)
-        optical_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+            canvas = tk.Canvas(
+                shell,
+                bg=self.colors["surface"],
+                highlightthickness=1,
+                highlightbackground=self.colors["border"],
+                bd=0,
+                yscrollincrement=12,
+            )
+            scrollbar = ttk.Scrollbar(shell, orient=tk.VERTICAL, command=canvas.yview, style="Slim.Vertical.TScrollbar")
+            panel = ttk.Frame(canvas, style="Panel.TFrame", padding=16)
+            panel_window = canvas.create_window((0, 0), window=panel, anchor="nw")
+            canvas.configure(yscrollcommand=scrollbar.set)
+            canvas.grid(row=0, column=0, sticky="nsew")
+            scrollbar.grid(row=0, column=1, sticky="ns", padx=(4, 0))
+
+            def _sync_scroll_region(_event: tk.Event | None = None) -> None:
+                canvas.configure(scrollregion=canvas.bbox("all"))
+
+            def _sync_panel_width(event: tk.Event) -> None:
+                canvas.itemconfigure(panel_window, width=event.width)
+
+            panel.bind("<Configure>", _sync_scroll_region)
+            canvas.bind("<Configure>", _sync_panel_width)
+            canvas.bind("<MouseWheel>", lambda event, c=canvas: _scroll_config_column(c, event), add="+")
+            canvas.bind("<Button-4>", lambda event, c=canvas: _scroll_config_column(c, event), add="+")
+            canvas.bind("<Button-5>", lambda event, c=canvas: _scroll_config_column(c, event), add="+")
+            return panel, canvas
+
+        optical_panel, optical_canvas = _build_config_column(0, (0, 8))
         optical_panel.columnconfigure(0, weight=1)
         optical_panel.columnconfigure(1, weight=1)
 
-        motion_panel = ttk.Frame(content, style="Panel.TFrame", padding=16)
-        motion_panel.grid(row=0, column=1, sticky="nsew", padx=(4, 4))
+        motion_panel, motion_canvas = _build_config_column(1, (4, 4))
         motion_panel.columnconfigure(0, weight=1)
         motion_panel.columnconfigure(1, weight=1)
 
-        system_panel = ttk.Frame(content, style="Panel.TFrame", padding=16)
-        system_panel.grid(row=0, column=2, sticky="nsew", padx=(8, 0))
+        system_panel, system_canvas = _build_config_column(2, (8, 0))
         system_panel.columnconfigure((1, 2), weight=1, uniform="af_thresholds")
 
         ttk.Label(optical_panel, text="OPTICAL CALIBRATION", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
@@ -3501,7 +3693,61 @@ class ProbeApp(tk.Tk):
             maximum=1_000_000,
             width=8,
         ).grid(row=3, column=3, sticky="ew", padx=(8, 0), pady=2, ipady=5)
-        ttk.Button(camera_control_panel, text="Apply Camera", style="Accent.TButton", command=self.apply_camera_config).grid(row=4, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        ttk.Label(camera_control_panel, text="ADVANCED VIDEO", style="Section.TLabel").grid(row=4, column=0, columnspan=4, sticky="w", pady=(14, 6))
+        ttk.Label(camera_control_panel, text="White balance", style="Muted.TLabel").grid(row=5, column=0, sticky="w", pady=2)
+        white_balance_combo = ttk.Combobox(
+            camera_control_panel,
+            values=camera_mode_values,
+            textvariable=self.camera_white_balance_mode_var,
+            state="readonly",
+        )
+        white_balance_combo.grid(row=5, column=1, sticky="ew", padx=(8, 0), pady=2)
+        ttk.Label(camera_control_panel, text="Temp (K)", style="Muted.TLabel").grid(row=5, column=2, sticky="w", pady=2, padx=(8, 0))
+        self._numeric_entry(
+            camera_control_panel,
+            self.camera_white_balance_temperature_var,
+            kind="float",
+            minimum=2000,
+            maximum=15000,
+            width=8,
+        ).grid(row=5, column=3, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+        ttk.Label(camera_control_panel, text="Saturation", style="Muted.TLabel").grid(row=6, column=0, sticky="w", pady=2)
+        self._numeric_entry(
+            camera_control_panel,
+            self.camera_color_saturation_var,
+            kind="float",
+            minimum=0,
+            maximum=255,
+            width=8,
+        ).grid(row=6, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+        ttk.Label(camera_control_panel, text="Brightness", style="Muted.TLabel").grid(row=6, column=2, sticky="w", pady=2, padx=(8, 0))
+        self._numeric_entry(
+            camera_control_panel,
+            self.camera_color_brightness_var,
+            kind="float",
+            minimum=-255,
+            maximum=255,
+            width=8,
+        ).grid(row=6, column=3, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+        ttk.Label(camera_control_panel, text="Contrast", style="Muted.TLabel").grid(row=7, column=0, sticky="w", pady=2)
+        self._numeric_entry(
+            camera_control_panel,
+            self.camera_color_contrast_var,
+            kind="float",
+            minimum=-255,
+            maximum=255,
+            width=8,
+        ).grid(row=7, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+        ttk.Label(camera_control_panel, text="Gamma", style="Muted.TLabel").grid(row=7, column=2, sticky="w", pady=2, padx=(8, 0))
+        self._numeric_entry(
+            camera_control_panel,
+            self.camera_color_gamma_var,
+            kind="float",
+            minimum=20,
+            maximum=300,
+            width=8,
+        ).grid(row=7, column=3, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+        ttk.Button(camera_control_panel, text="Apply Camera", style="Accent.TButton", command=self.apply_camera_config).grid(row=8, column=0, columnspan=4, sticky="ew", pady=(10, 0))
 
         ttk.Label(motion_panel, text="MOTOR MAPPING", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
 
@@ -3566,7 +3812,8 @@ class ProbeApp(tk.Tk):
 
         d5_panel = ttk.Frame(motion_panel, style="Panel.TFrame")
         d5_panel.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(22, 0))
-        d5_panel.columnconfigure((1, 2, 3), weight=1, uniform="d5_params")
+        d5_panel.columnconfigure(0, minsize=40)
+        d5_panel.columnconfigure((1, 2, 3), weight=1, uniform="d5_params", minsize=72)
         ttk.Label(d5_panel, text="D5 CONTROLLER READBACK", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
         ttk.Label(d5_panel, text="Axis", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
         for column, label in enumerate(("Min", "Work", "Accel"), start=1):
@@ -3574,15 +3821,17 @@ class ProbeApp(tk.Tk):
         for row_index, axis in enumerate(JOG_STEP_AXES, start=2):
             ttk.Label(d5_panel, text=axis, style="Panel.TLabel").grid(row=row_index, column=0, sticky="w", pady=2)
             for column, field_name in enumerate(("minimum_speed", "work_speed", "acceleration"), start=1):
-                self._numeric_entry(
+                entry = self._numeric_entry(
                     d5_panel,
                     self.controller_motion_parameter_vars[axis][field_name],
                     minimum=0,
                     maximum=65535,
-                    width=5,
-                ).grid(row=row_index, column=column, sticky="ew", padx=(8 if column > 1 else 0, 0), pady=2, ipady=5)
+                    width=7,
+                )
+                entry.configure(state="readonly")
+                entry.grid(row=row_index, column=column, sticky="ew", padx=(8 if column > 1 else 0, 0), pady=2, ipady=5)
         ttk.Button(d5_panel, text="Read D5 X/Y/Z", command=self.read_controller_motion_parameters).grid(row=5, column=0, columnspan=4, sticky="ew", pady=(10, 0))
-        ttk.Label(d5_panel, textvariable=self.controller_motion_status_var, style="Status.TLabel", wraplength=360, padding=8).grid(row=6, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        ttk.Label(d5_panel, textvariable=self.controller_motion_status_var, style="Status.TLabel", wraplength=440, padding=8).grid(row=6, column=0, columnspan=4, sticky="ew", pady=(8, 0))
 
         ttk.Label(motion_panel, text="CONVERSION", style="Section.TLabel").grid(row=10, column=0, columnspan=2, sticky="w", pady=(24, 6))
         ttk.Label(motion_panel, textvariable=self.motor_conversion_var, style="Value.TLabel", wraplength=360, padding=10).grid(row=11, column=0, columnspan=2, sticky="ew")
@@ -3660,6 +3909,10 @@ class ProbeApp(tk.Tk):
         ).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
         ttk.Button(admin_panel, text="Enable Admin", style="Accent.TButton", command=self.enable_admin_mode).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         ttk.Label(admin_panel, textvariable=self.admin_mode_status_var, style="Status.TLabel", wraplength=360, padding=10).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+
+        _bind_config_column_scroll(optical_panel, optical_canvas)
+        _bind_config_column_scroll(motion_panel, motion_canvas)
+        _bind_config_column_scroll(system_panel, system_canvas)
 
     def _update_comm_note(self) -> None:
         if self.comm_input_mode_var.get() == "Hex":
@@ -3857,7 +4110,7 @@ class ProbeApp(tk.Tk):
 
         self.admin_mode_enabled = True
         self.admin_token_var.set("")
-        self.admin_mode_status_var.set("Admin mode enabled for this session. Set-zero commands and CC accel/decel edits are unlocked.")
+        self.admin_mode_status_var.set("Admin mode enabled for this session. Set-zero commands are unlocked.")
         self.status_var.set("Admin mode enabled.")
         self._update_admin_mode_controls()
 
@@ -3867,13 +4120,10 @@ class ProbeApp(tk.Tk):
             button = getattr(self, button_name, None)
             if button is not None:
                 button.configure(state=state)
-        cc_accel_entry = self.__dict__.get("cc_accel_time_entry")
-        if cc_accel_entry is not None:
-            cc_accel_entry.configure(state=state)
         if self.serial_client is not None:
             self.serial_client.set_admin_mode_enabled(self.admin_mode_enabled)
         if not self.admin_mode_enabled and self.admin_mode_status_var.get() == "Admin mode locked":
-            self.admin_mode_status_var.set("Admin mode locked. Set-zero commands and CC accel/decel edits are disabled.")
+            self.admin_mode_status_var.set("Admin mode locked. Set-zero commands are disabled.")
 
     def _require_admin_mode(self, action: str) -> bool:
         if self.admin_mode_enabled:
@@ -3883,13 +4133,6 @@ class ProbeApp(tk.Tk):
         logger.warning(message)
         self._update_admin_mode_controls()
         return False
-
-    def _cc_accel_time_change_pending(self) -> bool:
-        try:
-            candidate = float(self.cc_accel_time_var.get())
-        except (TypeError, ValueError):
-            return False
-        return abs(candidate - float(self.probe_config.cc_accel_time_s)) > 1e-9
 
     @staticmethod
     def _motor_speed_profile_label(profile: str) -> str:
@@ -4326,10 +4569,6 @@ class ProbeApp(tk.Tk):
         return f"P6 {out_width} {out_height} 255\n".encode("ascii") + rgb.tobytes()
 
     def apply_config(self, save: bool = True) -> bool:
-        if self._cc_accel_time_change_pending() and not self._require_admin_mode("Change CC accel/decel"):
-            self._sync_config_vars_from_config()
-            self.config_status_var.set("Config not saved: CC accel/decel requires Admin mode.")
-            return False
         try:
             updated = ProbeConfig(
                 objective=int(self.objective_var.get()),
@@ -4344,10 +4583,7 @@ class ProbeApp(tk.Tk):
                 probe_safe_z_margin_um=float(self.probe_safe_z_margin_um_var.get()),
                 active_motor_speed_profile=self._motor_speed_profile_from_label(self.motor_speed_profile_var.get()),
                 controller_motion_parameters={
-                    axis: {
-                        field_name: int(self.controller_motion_parameter_vars[axis][field_name].get())
-                        for field_name in ("minimum_speed", "work_speed", "acceleration")
-                    }
+                    axis: dict(self.probe_config.controller_motion_parameters[axis])
                     for axis in JOG_STEP_AXES
                 },
                 motor_axis_polarity=self._motor_axis_polarity_from_config_vars(),
@@ -4356,6 +4592,12 @@ class ProbeApp(tk.Tk):
                 camera_exposure=float(self.camera_exposure_var.get() or 0.0),
                 camera_gain_mode=self._camera_control_mode_from_label(self.camera_gain_mode_var.get()),
                 camera_gain=float(self.camera_gain_var.get() or 0.0),
+                camera_white_balance_mode=self._camera_control_mode_from_label(self.camera_white_balance_mode_var.get()),
+                camera_white_balance_temperature=float(self.camera_white_balance_temperature_var.get() or 6500.0),
+                camera_color_saturation=float(self.camera_color_saturation_var.get() or 128.0),
+                camera_color_brightness=float(self.camera_color_brightness_var.get() or 0.0),
+                camera_color_contrast=float(self.camera_color_contrast_var.get() or 0.0),
+                camera_color_gamma=float(self.camera_color_gamma_var.get() or 100.0),
                 camera_source=normalize_camera_source(self.camera_index_var.get()),
                 camera_resolution_width=self._camera_resolution_from_label(self.camera_resolution_var.get()),
                 camera_target_fps=normalize_camera_target_fps(self.camera_target_fps_var.get()),
@@ -4403,7 +4645,10 @@ class ProbeApp(tk.Tk):
         self.main_gds_overlay_cache_key = None
         vision_panel = getattr(self, "vision_panel", None)
         if vision_panel is not None:
-            vision_panel.draw_overlay()
+            try:
+                vision_panel.draw_overlay()
+            except Exception as exc:
+                logger.error("Failed to redraw main vision overlay after config apply: %s", exc)
         if save:
             try:
                 save_probe_config(self.probe_config, self.config_path)
@@ -4429,6 +4674,12 @@ class ProbeApp(tk.Tk):
             exposure=self.probe_config.camera_exposure,
             gain_mode=self.probe_config.camera_gain_mode,
             gain=self.probe_config.camera_gain,
+            white_balance_mode=self.probe_config.camera_white_balance_mode,
+            white_balance_temperature=self.probe_config.camera_white_balance_temperature,
+            saturation=self.probe_config.camera_color_saturation,
+            brightness=self.probe_config.camera_color_brightness,
+            contrast=self.probe_config.camera_color_contrast,
+            gamma=self.probe_config.camera_color_gamma,
         )
 
     def _sync_config_vars_from_config(self) -> None:
@@ -4453,6 +4704,12 @@ class ProbeApp(tk.Tk):
         self.camera_exposure_var.set(f"{self.probe_config.camera_exposure:g}")
         self.camera_gain_mode_var.set(self._camera_control_mode_label(self.probe_config.camera_gain_mode))
         self.camera_gain_var.set(f"{self.probe_config.camera_gain:g}")
+        self.camera_white_balance_mode_var.set(self._camera_control_mode_label(self.probe_config.camera_white_balance_mode))
+        self.camera_white_balance_temperature_var.set(f"{self.probe_config.camera_white_balance_temperature:g}")
+        self.camera_color_saturation_var.set(f"{self.probe_config.camera_color_saturation:g}")
+        self.camera_color_brightness_var.set(f"{self.probe_config.camera_color_brightness:g}")
+        self.camera_color_contrast_var.set(f"{self.probe_config.camera_color_contrast:g}")
+        self.camera_color_gamma_var.set(f"{self.probe_config.camera_color_gamma:g}")
         self.camera_resolution_var.set(self._camera_resolution_label(self.probe_config.camera_resolution_width))
         self.camera_target_fps_var.set(str(self.probe_config.camera_target_fps))
         self.camera_index_var.set(normalize_camera_source(self.probe_config.camera_source))
@@ -4528,7 +4785,13 @@ class ProbeApp(tk.Tk):
                 f"exposure {self._camera_control_mode_label(self.probe_config.camera_exposure_mode)} "
                 f"{self.probe_config.camera_exposure:g}, "
                 f"gain {self._camera_control_mode_label(self.probe_config.camera_gain_mode)} "
-                f"{self.probe_config.camera_gain:g}"
+                f"{self.probe_config.camera_gain:g}, "
+                f"WB {self._camera_control_mode_label(self.probe_config.camera_white_balance_mode)} "
+                f"{self.probe_config.camera_white_balance_temperature:g}K, "
+                f"sat {self.probe_config.camera_color_saturation:g}, "
+                f"bri {self.probe_config.camera_color_brightness:g}, "
+                f"con {self.probe_config.camera_color_contrast:g}, "
+                f"gamma {self.probe_config.camera_color_gamma:g}"
             ),
             f"Camera FOV rotation: {self.probe_config.camera_fov_rotation_deg:g} deg",
             f"CC accel/decel: {self.probe_config.cc_accel_time_s:.3g}s ({self.probe_config.cc_acceleration_units()} units)",
@@ -7256,7 +7519,7 @@ class ProbeApp(tk.Tk):
     def _imgstitch_scan_origin_override(self) -> tuple[int, int] | None:
         if self.imgstitch_range_mode_var.get() != "Two Points" or self.imgstitch_point1 is None or self.imgstitch_point2 is None:
             return None
-        return min(self.imgstitch_point1[0], self.imgstitch_point2[0]), min(self.imgstitch_point1[1], self.imgstitch_point2[1])
+        return max(self.imgstitch_point1[0], self.imgstitch_point2[0]), max(self.imgstitch_point1[1], self.imgstitch_point2[1])
 
     def _prepare_imgstitch_session_dir(self) -> None:
         resolved = self.imgstitch_session_dir.resolve()
@@ -7304,7 +7567,7 @@ class ProbeApp(tk.Tk):
                 self.imgmatrix_panel.set_status("No camera frame available for ImgMatrix.")
             return
         try:
-            points = generate_imgmatrix_points(settings, self.gds_stage_mapper_panel.mapper)
+            points = generate_imgmatrix_points(settings, self.gds_stage_mapper_panel.mapper, self._camera_fov_rotation_deg())
             session_dir = self._prepare_imgmatrix_session_dir()
             tile_acquisition_mode = self.imgstitch_tile_acquisition_var.get()
             stack_params = self._imgstack_params_from_ui(tile_acquisition_mode if tile_acquisition_mode != "Single Frame" else "")
@@ -7802,7 +8065,11 @@ class ProbeApp(tk.Tk):
             return
         try:
             normalized_settings = settings.normalized()
-            points = tuple(points_override) if points_override is not None else generate_autotest_points(normalized_settings, self.gds_stage_mapper_panel.mapper)
+            points = (
+                tuple(points_override)
+                if points_override is not None
+                else generate_autotest_points(normalized_settings, self.gds_stage_mapper_panel.mapper, self._camera_fov_rotation_deg())
+            )
             if not points:
                 raise ValueError("AutoTest point list is empty.")
         except Exception as exc:
@@ -7833,12 +8100,16 @@ class ProbeApp(tk.Tk):
         self.motion_busy = True
         self.autotest_progress_current = 0
         self.autotest_progress_total = len(points)
+        self.autotest_grid_rows, self.autotest_grid_cols = self._autotest_grid_shape(points, normalized_settings)
+        self.autotest_started_at = time.monotonic()
+        self.autotest_completed_point_times = []
         self.last_autotest_wobble_status_at = 0.0
         self.last_iv_sample_status_at = 0.0
         self.autotest_stop_event.clear()
         if self.autotest_panel is not None:
             self.autotest_panel.set_running(True)
             self.autotest_panel.set_status(f"AutoTest running: {len(points)} point(s).")
+            self.autotest_panel.set_progress(0, len(points), "Preparing AutoTest", estimate_text="ETA: waiting for first completed device")
         self.status_var.set(f"AutoTest running: {len(points)} point(s).")
         self.autotest_thread = threading.Thread(
             target=self._autotest_worker,
@@ -7851,6 +8122,15 @@ class ProbeApp(tk.Tk):
     def _autotest_requires_session_dir(settings: AutoTestSettings) -> bool:
         flow_types = {step.type_id for step in settings.measurement_flow}
         return "photo" in settings.measurement_steps or bool({"photo", "iv", "wobb_test", "b1500_transfer", "b1500_output"} & flow_types)
+
+    @staticmethod
+    def _autotest_grid_shape(points: tuple[AutoTestPoint, ...], settings: AutoTestSettings) -> tuple[int, int]:
+        rows = max(int(settings.rows), 1)
+        cols = max(int(settings.cols), 1)
+        for point in points:
+            rows = max(rows, int(point.row) + 1)
+            cols = max(cols, int(point.col) + 1)
+        return rows, cols
 
     def stop_autotest(self) -> None:
         self.autotest_stop_event.set()
@@ -8058,8 +8338,8 @@ class ProbeApp(tk.Tk):
             self._capture_autotest_photo(point, session_dir, cv2_module)
             return
         if step.type_id == "iv":
-            config = iv_sweep_config_from_params(params)
-            self._run_autotest_iv_sweep(point, settings, config, session_dir)
+            configs = iv_sweep_configs_from_params(params)
+            self._run_autotest_iv_sweep(point, settings, configs, session_dir, params)
             return
         if step.type_id == "wobb_test":
             self._run_autotest_wobb_test(point, settings, params, session_dir)
@@ -8378,27 +8658,69 @@ class ProbeApp(tk.Tk):
             encoding="utf-8",
         )
 
-    def _run_autotest_iv_sweep(self, point: AutoTestPoint, settings: AutoTestSettings, config: IVSweepConfig, session_dir: Path | None) -> None:
-        self.result_queue.put(("iv_started", point.name, config, point.row, point.col, settings.rows, settings.cols, point.order == 1))
-        self.result_queue.put(("autotest_status", f"IV started at {point.name}: {config.summary()}"))
-        runner = Keithley2450IVRunner()
-
-        def handle_sample(sample: IVSweepSample) -> None:
-            payload = sample.to_dict()
-            payload["point_name"] = point.name
-            self.result_queue.put(("iv_sample", point.name, payload))
-
-        samples = runner.run_sweep(
-            config,
-            stop_requested=self.autotest_stop_event.is_set,
-            on_sample=handle_sample,
+    def _run_autotest_iv_sweep(
+        self,
+        point: AutoTestPoint,
+        settings: AutoTestSettings,
+        configs: tuple[IVSweepConfig, ...],
+        session_dir: Path | None,
+        params: dict[str, str] | None = None,
+    ) -> None:
+        if not configs:
+            raise ValueError("IV sweep config list is empty.")
+        params = params or {}
+        plot_layout = str(params.get("plot_layout", "horizontal"))
+        show_heatmap_values = parse_bool(params.get("heatmap_values", "true"), default=True)
+        self.result_queue.put(
+            (
+                "iv_started",
+                point.name,
+                configs[0],
+                point.row,
+                point.col,
+                self.autotest_grid_rows,
+                self.autotest_grid_cols,
+                point.order == 1,
+                plot_layout,
+                show_heatmap_values,
+            )
         )
-        statistics = calculate_iv_statistics(samples, config)
-        output_path = None
-        if session_dir is not None:
-            output_path = session_dir / "iv" / f"{self._safe_autotest_name(point.name)}_iv.csv"
-            self._write_iv_samples_csv(output_path, point, config, samples, statistics)
-        self.result_queue.put(("iv_done", point.name, len(samples), output_path, statistics.to_dict(), point.row, point.col, settings.rows, settings.cols))
+        self.result_queue.put(("autotest_status", f"IV started at {point.name}: {len(configs)} sweep(s), {configs[0].summary()}"))
+        total_samples = 0
+        output_paths: list[Path] = []
+        latest_statistics: IVSweepStatistics | None = None
+        for curve_index, config in enumerate(configs, start=1):
+            if self.autotest_stop_event.is_set():
+                break
+            runner = Keithley2450IVRunner()
+            curve_label = f"Vtop={config.stop:g}" if len(configs) > 1 else config.scan_type
+
+            def handle_sample(sample: IVSweepSample, label: str = curve_label, index: int = curve_index) -> None:
+                payload = sample.to_dict()
+                payload["point_name"] = point.name
+                payload["curve_label"] = label
+                payload["curve_index"] = index
+                payload["curve_total"] = len(configs)
+                self.result_queue.put(("iv_sample", point.name, payload))
+
+            self.result_queue.put(("autotest_status", f"IV sweep {curve_index}/{len(configs)} at {point.name}: {config.summary()}"))
+            samples = runner.run_sweep(
+                config,
+                stop_requested=self.autotest_stop_event.is_set,
+                on_sample=handle_sample,
+            )
+            statistics = calculate_iv_statistics(samples, config)
+            latest_statistics = statistics
+            total_samples += len(samples)
+            if session_dir is not None:
+                output_path = self._autotest_iv_output_path(session_dir, point, config, multi_vtop=len(configs) > 1)
+                self._write_iv_samples_csv(output_path, point, config, samples, statistics)
+                output_paths.append(output_path)
+        output_payload: Path | tuple[Path, ...] | None = None
+        if output_paths:
+            output_payload = tuple(output_paths) if len(output_paths) > 1 else output_paths[0]
+        statistics_payload = latest_statistics.to_dict() if latest_statistics is not None else None
+        self.result_queue.put(("iv_done", point.name, total_samples, output_payload, statistics_payload, point.row, point.col, self.autotest_grid_rows, self.autotest_grid_cols))
 
     def _run_autotest_b1500_sweep(self, point: AutoTestPoint, settings: AutoTestSettings, config: B1500SweepConfig, session_dir: Path | None) -> None:
         if session_dir is None:
@@ -8418,6 +8740,7 @@ class ProbeApp(tk.Tk):
             sweep_start_v=config.sweep_start_v,
             sweep_end_v=config.sweep_end_v,
             sweep_points=config.sweep_points,
+            scan_type=config.scan_type,
             bias_values_v=config.bias_values_v,
             drain_current_compliance_a=config.drain_current_compliance_a,
             gate_current_compliance_a=config.gate_current_compliance_a,
@@ -8474,6 +8797,7 @@ class ProbeApp(tk.Tk):
                         "sweep_start_v": config.sweep_start_v,
                         "sweep_end_v": config.sweep_end_v,
                         "sweep_points": config.sweep_points,
+                        "scan_type": config.scan_type,
                         "bias_values_v": list(config.bias_values_v),
                         "drain_current_compliance_a": config.drain_current_compliance_a,
                         "gate_current_compliance_a": config.gate_current_compliance_a,
@@ -8502,6 +8826,27 @@ class ProbeApp(tk.Tk):
         message += "."
         self.result_queue.put(("b1500_done", point.name, message))
         self.result_queue.put(("autotest_status", message))
+
+    @staticmethod
+    def _autotest_iv_output_path(session_dir: Path, point: AutoTestPoint, config: IVSweepConfig, *, multi_vtop: bool) -> Path:
+        stem = f"{ProbeApp._safe_autotest_name(point.name)}_iv"
+        if multi_vtop:
+            stem += f"_vtop_{ProbeApp._safe_filename_token(config.stop)}"
+        candidate = session_dir / "iv" / f"{stem}.csv"
+        if not candidate.exists():
+            return candidate
+        index = 2
+        while True:
+            numbered = session_dir / "iv" / f"{stem}_{index}.csv"
+            if not numbered.exists():
+                return numbered
+            index += 1
+
+    @staticmethod
+    def _safe_filename_token(value: object) -> str:
+        token = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{value:g}" if isinstance(value, (float, int)) else str(value))
+        token = token.strip("._")
+        return token or "value"
 
     @staticmethod
     def _write_iv_samples_csv(output_path: Path, point: AutoTestPoint, config: IVSweepConfig, samples: list[IVSweepSample], statistics: IVSweepStatistics) -> None:
@@ -8561,8 +8906,10 @@ class ProbeApp(tk.Tk):
                 "stop": config.stop,
                 "step": config.step,
                 "bidirectional": config.bidirectional,
+                "scan_type": config.scan_type,
                 "voltage_limit_v": config.voltage_limit_v,
                 "current_limit_a": config.current_limit_a,
+                "measure_range": config.measure_range,
                 "source_delay_s": config.source_delay_s,
                 "nplc": config.nplc,
                 "output_statistics": config.output_statistics,
@@ -8596,6 +8943,32 @@ class ProbeApp(tk.Tk):
             return
         self.imgstitch_progress_current = int(match.group(1))
         self.imgstitch_progress_total = int(match.group(2))
+
+    def _autotest_estimate_text(self, current: int, total: int, state: str | None) -> str:
+        total = max(0, int(total))
+        current = max(0, min(int(current), total)) if total else max(0, int(current))
+        if state == "done" and current > len(self.autotest_completed_point_times):
+            self.autotest_completed_point_times.append(time.monotonic())
+        completed = len(self.autotest_completed_point_times)
+        base = f"Progress: {completed}/{total} completed"
+        if total <= 0:
+            return base
+        if completed <= 0 or self.autotest_started_at is None:
+            return f"{base} | ETA: waiting for first completed device"
+        elapsed = self.autotest_completed_point_times[-1] - self.autotest_started_at
+        average_s = max(0.0, elapsed / completed)
+        remaining_s = average_s * max(0, total - completed)
+        end_timestamp = time.time() + remaining_s
+        return f"{base} | Remaining: {self._format_duration(remaining_s)} | Ends: {time.strftime('%H:%M:%S', time.localtime(end_timestamp))}"
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        total_seconds = max(0, int(round(float(seconds))))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours:d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
 
     def _imgstitch_displacement_status(self, edges: list[StitchEdgeQuality], correction_enabled: bool | None = None) -> str:
         if not edges:
@@ -9139,8 +9512,8 @@ class ProbeApp(tk.Tk):
         if range_mode == "Array":
             col_offset = col - (cols - 1) / 2.0
             row_offset = row - (rows - 1) / 2.0
-            return int(round(origin_x + col_offset * step_x)), int(round(origin_y + row_offset * step_y))
-        return origin_x + col * step_x, origin_y + row * step_y
+            return int(round(origin_x - col_offset * step_x)), int(round(origin_y - row_offset * step_y))
+        return origin_x - col * step_x, origin_y - row * step_y
 
     def _imgstitch_corner_targets(
         self,
@@ -9468,6 +9841,33 @@ class ProbeApp(tk.Tk):
         canvas.create_line(8, split_y, canvas_w - 8, split_y, fill="#334155")
         draw_group("Vertical", grouped_points["Vertical"], split_y + 2, canvas_h)
 
+    def _imgstitch_canvas_point_to_mosaic_pixel(self, canvas_x: float, canvas_y: float) -> tuple[float, float] | None:
+        if self.imgstitch_preview_bgr is None:
+            return None
+        scale = max(0.05, min(float(self.imgstitch_preview_scale), 20.0))
+        image_x = (float(canvas_x) - float(self.imgstitch_preview_pan[0])) / scale
+        image_y = (float(canvas_y) - float(self.imgstitch_preview_pan[1])) / scale
+        image_h, image_w = self.imgstitch_preview_bgr.shape[:2]
+        if image_x < 0 or image_y < 0 or image_x >= image_w or image_y >= image_h:
+            return None
+        return image_x, image_y
+
+    def _imgstitch_stage_target_from_mosaic_pixel(self, image_x: float, image_y: float) -> tuple[int, int, int]:
+        session = self.imgstitch_session
+        if session is None:
+            raise ValueError("No stitch session is loaded.")
+        stage_x_um, stage_y_um = mosaic_pixel_to_stage_um(session, self.imgstitch_latest_positions, image_x, image_y)
+        target_x = int(round(session.origin_stage_x + stage_x_um / self.probe_config.um_per_pulse("X")))
+        target_y = int(round(session.origin_stage_y + stage_y_um / self.probe_config.um_per_pulse("Y")))
+        target_z = int(self.current_position_values.get("Z", session.origin_stage_z))
+        return target_x, target_y, target_z
+
+    def _imgstitch_stage_target_from_canvas_point(self, canvas_x: float, canvas_y: float) -> tuple[int, int, int] | None:
+        image_point = self._imgstitch_canvas_point_to_mosaic_pixel(canvas_x, canvas_y)
+        if image_point is None:
+            return None
+        return self._imgstitch_stage_target_from_mosaic_pixel(*image_point)
+
     def _on_imgstitch_preview_wheel(self, event: tk.Event) -> str:
         if self.imgstitch_preview_bgr is None:
             return "break"
@@ -9488,7 +9888,34 @@ class ProbeApp(tk.Tk):
         self._render_imgstitch_preview()
         return "break"
 
+    def _on_imgstitch_preview_shift_click(self, event: tk.Event) -> str:
+        if self.imgstitch_running or self.motion_busy or self.keyboard_motion_busy:
+            self.status_var.set("Motion is busy; ImgStitch click move skipped.")
+            return "break"
+        try:
+            target = self._imgstitch_stage_target_from_canvas_point(event.x, event.y)
+        except Exception as exc:
+            self.status_var.set(f"ImgStitch click target unavailable: {exc}")
+            logger.warning("ImgStitch click target unavailable: %s", exc)
+            return "break"
+        if target is None:
+            self.status_var.set("Shift-click inside the stitched image to move the view center.")
+            return "break"
+        if not self.serial_client:
+            self.connect_serial()
+        if not self.serial_client:
+            self.status_var.set("Serial is not connected; ImgStitch click move skipped.")
+            return "break"
+        target_x, target_y, target_z = target
+        self.motion_busy = True
+        self._show_target_positions({"X": target_x, "Y": target_y, "Z": target_z})
+        self.status_var.set(f"Moving view center to stitched point X={target_x} Y={target_y} Z={target_z}.")
+        threading.Thread(target=self._imgstitch_click_move_worker, args=(target_x, target_y, target_z), daemon=True).start()
+        return "break"
+
     def _on_imgstitch_preview_press(self, event: tk.Event) -> str:
+        if getattr(event, "state", 0) & 0x0001:
+            return self._on_imgstitch_preview_shift_click(event)
         self.imgstitch_preview_drag_start = (event.x, event.y, self.imgstitch_preview_pan[0], self.imgstitch_preview_pan[1])
         return "break"
 
@@ -9499,6 +9926,14 @@ class ProbeApp(tk.Tk):
         self.imgstitch_preview_pan = [pan_x + event.x - start_x, pan_y + event.y - start_y]
         self._render_imgstitch_preview()
         return "break"
+
+    def _imgstitch_click_move_worker(self, target_x: int, target_y: int, target_z: int) -> None:
+        try:
+            self._move_absolute_stage(target_x, target_y, target_z, source="imgstitch")
+        except Exception as exc:
+            self.result_queue.put(("motor_error", "IMGSTITCH_CLICK", exc))
+        finally:
+            self.result_queue.put(("motor_done",))
 
     def toggle_realtime_position(self) -> None:
         if self.realtime_enabled:
@@ -10376,28 +10811,18 @@ class ProbeApp(tk.Tk):
                 self._append_hex_history("TX", command_hex)
                 self._append_hex_history("RX", response_hex)
                 axis_name = parameters.axis.name
-                self.probe_config.controller_motion_parameters[axis_name] = {
-                    "minimum_speed": int(parameters.minimum_speed),
-                    "work_speed": int(parameters.work_speed),
-                    "acceleration": int(parameters.acceleration),
-                }
+                self.controller_motion_parameter_vars[axis_name]["minimum_speed"].set(str(int(parameters.minimum_speed)))
+                self.controller_motion_parameter_vars[axis_name]["work_speed"].set(str(int(parameters.work_speed)))
+                self.controller_motion_parameter_vars[axis_name]["acceleration"].set(str(int(parameters.acceleration)))
                 summary_parts.append(
                     f"{axis_name} min {parameters.minimum_speed}, work {parameters.work_speed}, accel {parameters.acceleration}"
                 )
             self.tx_var.set(last_command_hex)
             self.rx_var.set(last_response_hex)
-            self._sync_config_vars_from_config()
-            self._update_config_display()
             message = "D5 readback: " + "; ".join(summary_parts) + "."
             self.controller_motion_status_var.set(message)
-            self.status_var.set("Controller D5 parameters updated." if source == "startup" else message)
-            try:
-                save_probe_config(self.probe_config, self.config_path)
-                self.config_status_var.set(f"Saved {self.config_path.name}")
-            except Exception as exc:
-                self.config_status_var.set(f"Save failed: {exc}")
-                logger.error("Failed to save D5 controller parameters: %s", exc)
-            logger.info("Controller D5 parameters updated. %s", message)
+            self.status_var.set("Controller D5 parameters read." if source == "startup" else message)
+            logger.info("Controller D5 parameters read. %s", message)
             return
 
         if event_type == "controller_motion_parameters_error":
@@ -10833,6 +11258,8 @@ class ProbeApp(tk.Tk):
                 rows = int(payload[2]) if len(payload) >= 3 else None
                 cols = int(payload[3]) if len(payload) >= 4 else None
                 reset_heatmap = bool(payload[4]) if len(payload) >= 5 else False
+                plot_layout = str(payload[5]) if len(payload) >= 6 else "horizontal"
+                show_heatmap_values = bool(payload[6]) if len(payload) >= 7 else True
                 self._ensure_iv_plot_window().start(
                     str(point_name),
                     config,
@@ -10841,6 +11268,8 @@ class ProbeApp(tk.Tk):
                     rows=rows,
                     cols=cols,
                     reset_heatmap=reset_heatmap,
+                    plot_layout=plot_layout,
+                    show_heatmap_values=show_heatmap_values,
                 )
                 self.status_var.set(f"IV started at {point_name}.")
             return
@@ -10863,7 +11292,13 @@ class ProbeApp(tk.Tk):
             col = int(payload[2]) if len(payload) >= 3 else None
             if statistics is not None and row is not None and col is not None:
                 self._ensure_iv_plot_window().add_statistics(row, col, statistics)
-            suffix = f"; saved {Path(output_path).name}" if output_path else ""
+            if isinstance(output_path, (tuple, list)):
+                names = [Path(path).name for path in output_path]
+                suffix = f"; saved {', '.join(names[:3])}"
+                if len(names) > 3:
+                    suffix += f", +{len(names) - 3} more"
+            else:
+                suffix = f"; saved {Path(output_path).name}" if output_path else ""
             message = f"IV completed at {point_name}: {count} sample(s){suffix}."
             if statistics is not None and _finite_number(statistics.get("resistance_ohm")):
                 message += f" R={float(statistics['resistance_ohm']):.6g} ohm."
@@ -10955,8 +11390,9 @@ class ProbeApp(tk.Tk):
                 row = int(state_payload[0])
                 col = int(state_payload[1])
                 state = str(state_payload[2])
+            estimate_text = self._autotest_estimate_text(int(current), int(total), state)
             if self.autotest_panel is not None:
-                self.autotest_panel.set_progress(int(current), int(total), str(message), row=row, col=col, state=state)
+                self.autotest_panel.set_progress(int(current), int(total), str(message), row=row, col=col, state=state, estimate_text=estimate_text)
             self.status_var.set(str(message))
             logger.info("AutoTest: %s (%s/%s)", message, current, total)
             return
@@ -10965,6 +11401,7 @@ class ProbeApp(tk.Tk):
             _, count = event
             message = f"AutoTest completed {count} point(s)."
             if self.autotest_panel is not None:
+                self.autotest_panel.set_progress(int(count), int(count), message, estimate_text=f"Progress: {count}/{count} completed | Remaining: 00:00 | Ends: {time.strftime('%H:%M:%S')}")
                 self.autotest_panel.set_status(message)
             self.status_var.set(message)
             logger.info(message)
@@ -10982,6 +11419,8 @@ class ProbeApp(tk.Tk):
         if event_type == "autotest_finished":
             self.autotest_running = False
             self.motion_busy = False
+            self.autotest_started_at = None
+            self.autotest_completed_point_times = []
             if self.autotest_panel is not None:
                 self.autotest_panel.set_running(False)
             if self.autotest_restore_realtime and not self.realtime_enabled and self.serial_client:
@@ -11114,16 +11553,10 @@ class ProbeApp(tk.Tk):
 
     def _camera_worker(self, session_id: int, camera: UsbCamera) -> None:
         reported_ready = False
-        release_attempted = False
         while self.camera_running and session_id == self.camera_session_id:
             try:
                 frame = camera.read(calculate_focus_scores=self._should_process_focus_scores())
             except Exception as exc:
-                if not release_attempted:
-                    release_attempted = True
-                    if request_web_fallback_camera_release():
-                        time.sleep(0.5)
-                        continue
                 self.result_queue.put(("camera_error", session_id, exc))
                 return
             if frame:
@@ -11169,7 +11602,6 @@ class ProbeApp(tk.Tk):
             self.latest_camera_frame = None
 
         if frame:
-            publish_camera_frame(frame.image_bgr)
             if self.current_page == "Main" and self.vision_panel:
                 self.vision_panel.set_image_bgr(self._bgr_with_scalebar(frame.image_bgr))
                 self.camera_image = self.vision_panel.photo

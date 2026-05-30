@@ -7,13 +7,15 @@ from pathlib import Path
 
 import numpy as np
 
-from semi_auto_probe.b1500 import B1500_TEST_OUTPUT, B1500_TEST_TRANSFER, B1500SweepConfig, KeysightB1500Runner, b1500_avg_coefficient_from_params, b1500_config_from_params, b1500_curve_payload, b1500_sweep_abort_setting, is_b1500_sweep_aborted_error, parse_float_list
+from semi_auto_probe.b1500 import B1500_TEST_OUTPUT, B1500_TEST_TRANSFER, B1500SweepConfig, KeysightB1500Runner, b1500_avg_coefficient_from_params, b1500_config_from_params, b1500_curve_payload, b1500_sweep_abort_setting, is_b1500_sweep_aborted_error, parse_float_list, relax_b1500_iv_sweep_voltage_validator
 
 
 class B1500ConfigTests(unittest.TestCase):
     def test_float_list_accepts_range_and_csv_values(self) -> None:
-        self.assertEqual(parse_float_list("0:2:1"), (0.0, 1.0, 2.0))
+        self.assertEqual(parse_float_list("0:1:2"), (0.0, 1.0, 2.0))
+        self.assertEqual(parse_float_list("0:1：2"), (0.0, 1.0, 2.0))
         self.assertEqual(parse_float_list("-1, 0, 1"), (-1.0, 0.0, 1.0))
+        self.assertEqual(parse_float_list("[-8,-4,4,8]"), (-8.0, -4.0, 4.0, 8.0))
 
     def test_transfer_params_default_to_gpib_17(self) -> None:
         config = b1500_config_from_params({}, test_type=B1500_TEST_TRANSFER)
@@ -22,10 +24,12 @@ class B1500ConfigTests(unittest.TestCase):
         self.assertEqual(config.test_type, B1500_TEST_TRANSFER)
         self.assertEqual(config.drain_smu, "smu3")
         self.assertEqual(config.gate_smu, "smu4")
-        self.assertEqual(config.measurement_adc, "high_speed")
-        self.assertEqual(config.avg_coefficient, -10)
+        self.assertEqual(config.scan_type, "single")
+        self.assertEqual(config.measurement_adc, "high_resolution")
+        self.assertEqual(config.avg_coefficient, -8)
+        self.assertEqual(config.step_delay_s, 0.0)
         self.assertFalse(config.abort_on_compliance)
-        self.assertAlmostEqual(config.high_speed_nplc, 10.0)
+        self.assertAlmostEqual(config.high_resolution_nplc, 8.0)
         self.assertEqual(config.bias_values_v, (0.0, 1.0, 2.0, 3.0, 4.0, 5.0))
         self.assertTrue(config.measure_gate_leak)
 
@@ -85,11 +89,52 @@ class B1500ConfigTests(unittest.TestCase):
         config = b1500_config_from_params({"staircase_nplc": "20"}, test_type=B1500_TEST_OUTPUT)
 
         self.assertEqual(config.avg_coefficient, -20)
-        self.assertEqual(config.measurement_adc, "high_speed")
+        self.assertEqual(config.measurement_adc, "high_resolution")
+
+    def test_transfer_config_accepts_double_scan_type_and_custom_vd_list(self) -> None:
+        config = b1500_config_from_params(
+            {
+                "scan_type": "double",
+                "bias_values_v": "[-8,-4,4,8]",
+            },
+            test_type=B1500_TEST_TRANSFER,
+        )
+
+        self.assertEqual(config.scan_type, "double")
+        self.assertEqual(config.bias_values_v, (-8.0, -4.0, 4.0, 8.0))
 
     def test_staircase_nplc_rejects_out_of_range_values(self) -> None:
         with self.assertRaisesRegex(ValueError, "1..100"):
             b1500_avg_coefficient_from_params({"staircase_nplc": "0"})
+
+    def test_sweep_voltage_accepts_values_up_to_100v(self) -> None:
+        config = B1500SweepConfig(test_type=B1500_TEST_TRANSFER, sweep_start_v=-80.0, sweep_end_v=80.0).normalized()
+
+        self.assertEqual(config.sweep_start_v, -80.0)
+        self.assertEqual(config.sweep_end_v, 80.0)
+
+    def test_sweep_voltage_rejects_values_above_100v(self) -> None:
+        with self.assertRaisesRegex(ValueError, "-100..100"):
+            B1500SweepConfig(test_type=B1500_TEST_TRANSFER, sweep_start_v=-101.0).normalized()
+
+    def test_relaxes_qcodes_iv_sweep_start_end_validator_to_100v(self) -> None:
+        from qcodes.parameters import Parameter
+        import qcodes.validators as vals
+
+        class IVSweep:
+            sweep_start = Parameter("sweep_start", vals=vals.Numbers(-25, 25))
+            sweep_end = Parameter("sweep_end", vals=vals.Numbers(-25, 25))
+
+        class SMU:
+            iv_sweep = IVSweep()
+
+        smu = SMU()
+        relax_b1500_iv_sweep_voltage_validator(smu)
+
+        smu.iv_sweep.sweep_start.validate(-100.0)
+        smu.iv_sweep.sweep_end.validate(100.0)
+        with self.assertRaises(ValueError):
+            smu.iv_sweep.sweep_start.validate(-100.1)
 
     def test_save_curves_writes_long_wide_and_gate_leak_csvs(self) -> None:
         runner = KeysightB1500Runner(instrument=object())
@@ -123,6 +168,40 @@ class B1500ConfigTests(unittest.TestCase):
         self.assertEqual(payload["x"], (0.0, 1.0))
         self.assertEqual(payload["id"], (1e-9, 2e-9))
         self.assertEqual(payload["ig"], (1e-12, 2e-12))
+
+    def test_transfer_double_scan_runs_forward_and_reverse_vg(self) -> None:
+        class DoubleScanRunner(KeysightB1500Runner):
+            def __init__(self) -> None:
+                super().__init__(instrument=object())
+                self.last_sweep = (0.0, 0.0)
+
+            def _prepare_adc_and_channels(self, b1500, config):
+                return None
+
+            def _preflight_for_sweep(self, b1500, config):
+                return None
+
+            def _configure_drain_fixed(self, b1500, config, vd):
+                return None
+
+            def _configure_gate_sweep(self, b1500, config, *, sweep_start_v=None, sweep_end_v=None):
+                self.last_sweep = (float(sweep_start_v), float(sweep_end_v))
+
+            def _set_measurement_mode_transfer(self, b1500, config):
+                return None
+
+            def _measurement(self, b1500, config):
+                return object()
+
+            def _run_staircase_with_retry(self, b1500, config, measurement_factory, prepare_retry):
+                start, end = self.last_sweep
+                vg = np.array([start, end])
+                return (np.array([1e-12, 2e-12]), np.array([start * 1e-9, end * 1e-9])), vg
+
+        config = B1500SweepConfig(test_type=B1500_TEST_TRANSFER, scan_type="double", sweep_start_v=-1, sweep_end_v=1, bias_values_v=(0.0,)).normalized()
+        curves = DoubleScanRunner()._measure_transfer(object(), config, stop_requested=lambda: False, on_curve=None)
+
+        self.assertEqual(tuple(curves[0]["x"]), (-1.0, 1.0, 1.0, -1.0))
 
     def test_aborted_error_detection_handles_qcodes_wrapped_non_runtime_error(self) -> None:
         exc = ValueError('(While setting this parameter received error: +227,"Sweep measurement was aborted.", getting b1500_run_iv_staircase_sweep)')

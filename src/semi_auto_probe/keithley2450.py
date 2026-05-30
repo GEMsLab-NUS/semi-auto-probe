@@ -10,6 +10,10 @@ DEFAULT_KEITHLEY2450_RESOURCE = "GPIB0::18::INSTR"
 IV_SWEEP_MODE_VOLTAGE = "voltage"
 IV_SWEEP_MODE_CURRENT = "current"
 IV_SWEEP_MODES = (IV_SWEEP_MODE_VOLTAGE, IV_SWEEP_MODE_CURRENT)
+IV_SCAN_TYPE_SINGLE = "single"
+IV_SCAN_TYPE_DOUBLE = "double"
+IV_SCAN_TYPE_DUALPOLAR = "dualpolar"
+IV_SCAN_TYPES = (IV_SCAN_TYPE_SINGLE, IV_SCAN_TYPE_DOUBLE, IV_SCAN_TYPE_DUALPOLAR)
 OUTPUT_TERMINAL_FRONT = "front"
 OUTPUT_TERMINAL_REAR = "rear"
 OUTPUT_TERMINALS = (OUTPUT_TERMINAL_FRONT, OUTPUT_TERMINAL_REAR)
@@ -117,8 +121,10 @@ class IVSweepConfig:
     stop: float = 1.0
     step: float = 0.05
     bidirectional: bool = False
+    scan_type: str = IV_SCAN_TYPE_SINGLE
     voltage_limit_v: float = 20.0
     current_limit_a: float = 0.001
+    measure_range: float | None = None
     source_delay_s: float = 0.02
     nplc: float = 1.0
     output_statistics: bool = True
@@ -127,6 +133,8 @@ class IVSweepConfig:
 
     def normalized(self) -> "IVSweepConfig":
         mode = normalize_sweep_mode(self.sweep_mode)
+        raw_scan_type = "" if self.bidirectional and self.scan_type == IV_SCAN_TYPE_SINGLE else self.scan_type
+        scan_type = normalize_scan_type(raw_scan_type, bidirectional=self.bidirectional)
         output_terminal = normalize_output_terminal(self.output_terminal)
         resistance_method = normalize_resistance_method(self.resistance_method)
         values = (
@@ -135,6 +143,7 @@ class IVSweepConfig:
             self.step,
             self.voltage_limit_v,
             self.current_limit_a,
+            1.0 if self.measure_range is None else self.measure_range,
             self.source_delay_s,
             self.nplc,
         )
@@ -148,6 +157,8 @@ class IVSweepConfig:
             raise ValueError("IV voltage limit must be positive.")
         if float(self.current_limit_a) <= 0:
             raise ValueError("IV current limit must be positive.")
+        if self.measure_range is not None and float(self.measure_range) <= 0:
+            raise ValueError("IV measurement range must be positive or auto.")
         if float(self.source_delay_s) < 0 or float(self.source_delay_s) > 60:
             raise ValueError("IV source delay must be in range 0..60 seconds.")
         if float(self.nplc) <= 0 or float(self.nplc) > 25:
@@ -162,9 +173,11 @@ class IVSweepConfig:
             start=float(self.start),
             stop=float(self.stop),
             step=float(self.step),
-            bidirectional=bool(self.bidirectional),
+            bidirectional=scan_type == IV_SCAN_TYPE_DOUBLE,
+            scan_type=scan_type,
             voltage_limit_v=float(self.voltage_limit_v),
             current_limit_a=float(self.current_limit_a),
+            measure_range=None if self.measure_range is None else float(self.measure_range),
             source_delay_s=float(self.source_delay_s),
             nplc=float(self.nplc),
             output_statistics=bool(self.output_statistics),
@@ -175,16 +188,23 @@ class IVSweepConfig:
     def sweep_values(self) -> tuple[float, ...]:
         config = self.normalized()
         forward = tuple(_inclusive_sweep_values(config.start, config.stop, config.step))
-        if not config.bidirectional or len(forward) <= 1:
+        if config.scan_type == IV_SCAN_TYPE_SINGLE or len(forward) <= 1:
             return forward
-        reverse_step = -abs(config.step) if config.stop >= config.start else abs(config.step)
-        reverse = tuple(_inclusive_sweep_values(config.stop + reverse_step, config.start, reverse_step))
-        return forward + reverse
+        if config.scan_type == IV_SCAN_TYPE_DOUBLE:
+            reverse_step = -abs(config.step) if config.stop >= config.start else abs(config.step)
+            reverse = tuple(_inclusive_sweep_values(config.stop + reverse_step, config.start, reverse_step))
+            return forward + reverse
+        values = list(forward)
+        values.extend(_inclusive_sweep_values_excluding_start(config.stop, -config.stop, abs(config.step)))
+        values.extend(_inclusive_sweep_values_excluding_start(-config.stop, config.start, abs(config.step)))
+        return tuple(values)
 
     def summary(self) -> str:
-        direction = "bidirectional" if self.bidirectional else "single"
         unit = "V" if normalize_sweep_mode(self.sweep_mode) == IV_SWEEP_MODE_VOLTAGE else "A"
-        return f"{self.resource_name} | {self.output_terminal} terminal | {self.sweep_mode} {direction} {self.start:g}->{self.stop:g} step {self.step:g} {unit}"
+        raw_scan_type = "" if self.bidirectional and self.scan_type == IV_SCAN_TYPE_SINGLE else self.scan_type
+        scan_type = normalize_scan_type(raw_scan_type, bidirectional=self.bidirectional)
+        range_text = "auto range" if self.measure_range is None else f"range {self.measure_range:g}"
+        return f"{self.resource_name} | {self.output_terminal} terminal | {self.sweep_mode} {scan_type} {self.start:g}->{self.stop:g} step {self.step:g} {unit} | {range_text}"
 
 
 def normalize_sweep_mode(value: object) -> str:
@@ -204,6 +224,28 @@ def normalize_sweep_mode(value: object) -> str:
     normalized = aliases.get(text, text)
     if normalized not in IV_SWEEP_MODES:
         raise ValueError("IV sweep mode must be voltage or current.")
+    return normalized
+
+
+def normalize_scan_type(value: object, *, bidirectional: bool = False) -> str:
+    text = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "": IV_SCAN_TYPE_DOUBLE if bidirectional else IV_SCAN_TYPE_SINGLE,
+        "single": IV_SCAN_TYPE_SINGLE,
+        "forward": IV_SCAN_TYPE_SINGLE,
+        "0_to_vtop": IV_SCAN_TYPE_SINGLE,
+        "double": IV_SCAN_TYPE_DOUBLE,
+        "bidirectional": IV_SCAN_TYPE_DOUBLE,
+        "both": IV_SCAN_TYPE_DOUBLE,
+        "return": IV_SCAN_TYPE_DOUBLE,
+        "dual": IV_SCAN_TYPE_DUALPOLAR,
+        "dualpolar": IV_SCAN_TYPE_DUALPOLAR,
+        "dual_polar": IV_SCAN_TYPE_DUALPOLAR,
+        "bipolar": IV_SCAN_TYPE_DUALPOLAR,
+    }
+    normalized = aliases.get(text, text)
+    if normalized not in IV_SCAN_TYPES:
+        raise ValueError("IV scan type must be single, double, or dualpolar.")
     return normalized
 
 
@@ -256,24 +298,79 @@ def parse_bool(value: object, *, default: bool = False) -> bool:
     raise ValueError(f"Cannot parse boolean value: {value!r}.")
 
 
+def parse_optional_range(value: object) -> float | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text or text in {"auto", "automatic", "autorange"}:
+        return None
+    return float(text)
+
+
 def iv_sweep_config_from_params(params: dict[str, str]) -> IVSweepConfig:
+    return iv_sweep_configs_from_params(params)[0]
+
+
+def iv_sweep_configs_from_params(params: dict[str, str]) -> tuple[IVSweepConfig, ...]:
     mode = normalize_sweep_mode(params.get("sweep_mode", params.get("mode", "voltage")))
-    return IVSweepConfig(
-        resource_name=params.get("resource", params.get("resource_name", DEFAULT_KEITHLEY2450_RESOURCE)),
-        output_terminal=params.get("output_terminal", params.get("terminal", OUTPUT_TERMINAL_REAR)),
-        sweep_mode=mode,
-        start=float(params.get("start", params.get("start_v" if mode == IV_SWEEP_MODE_VOLTAGE else "start_a", 0.0))),
-        stop=float(params.get("stop", params.get("stop_v" if mode == IV_SWEEP_MODE_VOLTAGE else "stop_a", 1.0))),
-        step=float(params.get("step", params.get("step_v" if mode == IV_SWEEP_MODE_VOLTAGE else "step_a", 0.05))),
-        bidirectional=parse_bool(params.get("bidirectional", params.get("direction", "single"))),
-        voltage_limit_v=float(params.get("voltage_limit_v", params.get("limit_v", 20.0))),
-        current_limit_a=float(params.get("current_limit_a", params.get("limit_a", params.get("compliance_a", 0.001)))),
-        source_delay_s=float(params.get("source_delay_s", params.get("delay_s", 0.02))),
-        nplc=float(params.get("nplc", 1.0)),
-        output_statistics=parse_bool(params.get("output_statistics", "true"), default=True),
-        resistance_method=params.get("resistance_method", RESISTANCE_METHOD_LINEAR_FIT),
-        output_off_after=parse_bool(params.get("output_off_after", "true"), default=True),
-    ).normalized()
+    stop_key = "stop_v" if mode == IV_SWEEP_MODE_VOLTAGE else "stop_a"
+    raw_stop = params.get("vtop", params.get("stop", params.get(stop_key, 1.0)))
+    stop_values = parse_vtop_values(raw_stop)
+    legacy_bidirectional = parse_bool(params.get("bidirectional"), default=False)
+    scan_type = normalize_scan_type(params.get("scan_type", params.get("direction", "")), bidirectional=legacy_bidirectional)
+    configs = []
+    for stop in stop_values:
+        configs.append(
+            IVSweepConfig(
+                resource_name=params.get("resource", params.get("resource_name", DEFAULT_KEITHLEY2450_RESOURCE)),
+                output_terminal=params.get("output_terminal", params.get("terminal", OUTPUT_TERMINAL_REAR)),
+                sweep_mode=mode,
+                start=float(params.get("start", params.get("start_v" if mode == IV_SWEEP_MODE_VOLTAGE else "start_a", 0.0))),
+                stop=float(stop),
+                step=float(params.get("step", params.get("step_v" if mode == IV_SWEEP_MODE_VOLTAGE else "step_a", 0.05))),
+                bidirectional=scan_type == IV_SCAN_TYPE_DOUBLE,
+                scan_type=scan_type,
+                voltage_limit_v=float(params.get("voltage_limit_v", params.get("limit_v", 20.0))),
+                current_limit_a=float(params.get("current_limit_a", params.get("limit_a", params.get("compliance_a", 0.001)))),
+                measure_range=parse_optional_range(params.get("measure_range", params.get("measurement_range", params.get("range", "auto")))),
+                source_delay_s=float(params.get("source_delay_s", params.get("delay_s", 0.02))),
+                nplc=float(params.get("nplc", 1.0)),
+                output_statistics=parse_bool(params.get("output_statistics", "true"), default=True),
+                resistance_method=params.get("resistance_method", RESISTANCE_METHOD_LINEAR_FIT),
+                output_off_after=parse_bool(params.get("output_off_after", "true"), default=True),
+            ).normalized()
+        )
+    return tuple(configs)
+
+
+def parse_vtop_values(value: object) -> tuple[float, ...]:
+    text = str(value).strip().replace(chr(0xFF1A), ":")
+    if not text:
+        raise ValueError("IV Vtop cannot be empty.")
+    if "," in text:
+        values = tuple(float(part.strip()) for part in text.split(",") if part.strip())
+        if not values:
+            raise ValueError("IV Vtop list cannot be empty.")
+        return values
+    if ":" not in text:
+        return (float(text),)
+    parts = [float(part.strip()) for part in text.split(":") if part.strip()]
+    if len(parts) != 3:
+        raise ValueError("IV Vtop range must use start:step:end.")
+    start, step, end = parts
+    if step == 0:
+        raise ValueError("IV Vtop range step must be non-zero.")
+    direction = 1 if end >= start else -1
+    step = abs(step) * direction
+    values: list[float] = []
+    current = start
+    tolerance = abs(step) * 1e-9
+    while (current - end) * direction <= tolerance:
+        values.append(float(current))
+        current += step
+    if not values or abs(values[-1] - end) > abs(step) * 1e-6:
+        values.append(float(end))
+    return tuple(values)
 
 
 def constant_voltage_current_config_from_params(params: dict[str, str]) -> ConstantVoltageCurrentConfig:
@@ -355,6 +452,11 @@ def _inclusive_sweep_values(start: float, stop: float, step: float) -> Iterable[
         value = float(start) + index * step_value
     if abs((value - step_value) - stop) > abs(step_value) * 1e-6:
         yield float(stop)
+
+
+def _inclusive_sweep_values_excluding_start(start: float, stop: float, step: float) -> Iterable[float]:
+    values = tuple(_inclusive_sweep_values(start, stop, step))
+    yield from values[1:]
 
 
 class Keithley2450IVRunner:
@@ -473,7 +575,11 @@ class Keithley2450IVRunner:
             instrument.write(":SOUR:VOLT:RANG:AUTO 1")
             instrument.write(':SENS:FUNC "CURR"')
             instrument.write(f":SENS:CURR:PROT:LEV {config.current_limit_a:.12g}")
-            instrument.write(":SENS:CURR:RANG:AUTO 1")
+            if config.measure_range is None:
+                instrument.write(":SENS:CURR:RANG:AUTO 1")
+            else:
+                instrument.write(":SENS:CURR:RANG:AUTO 0")
+                instrument.write(f":SENS:CURR:RANG {config.measure_range:.12g}")
             instrument.write(f":SENS:CURR:NPLC {config.nplc:.12g}")
         else:
             instrument.write(":SOUR:FUNC:MODE CURR")
@@ -481,7 +587,11 @@ class Keithley2450IVRunner:
             instrument.write(":SOUR:CURR:RANG:AUTO 1")
             instrument.write(':SENS:FUNC "VOLT"')
             instrument.write(f":SENS:VOLT:PROT:LEV {config.voltage_limit_v:.12g}")
-            instrument.write(":SENS:VOLT:RANG:AUTO 1")
+            if config.measure_range is None:
+                instrument.write(":SENS:VOLT:RANG:AUTO 1")
+            else:
+                instrument.write(":SENS:VOLT:RANG:AUTO 0")
+                instrument.write(f":SENS:VOLT:RANG {config.measure_range:.12g}")
             instrument.write(f":SENS:VOLT:NPLC {config.nplc:.12g}")
 
     def _configure_constant_voltage_current(self, instrument: VisaInstrument, config: ConstantVoltageCurrentConfig) -> None:

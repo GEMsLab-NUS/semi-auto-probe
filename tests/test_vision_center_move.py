@@ -37,7 +37,7 @@ class VisionCenterMoveTests(unittest.TestCase):
             um_per_px=0.5,
         )
 
-        self.assertEqual(move["X"], (15.0, 15, False))
+        self.assertEqual(move["X"], (-15.0, 15, True))
         self.assertEqual(move["Y"], (10.0, 10, False))
 
     def test_sub_half_pulse_offset_does_not_force_motion(self) -> None:
@@ -52,7 +52,7 @@ class VisionCenterMoveTests(unittest.TestCase):
         )
 
         stage_um, pulses, reverse = move["X"]
-        self.assertAlmostEqual(stage_um, 0.04)
+        self.assertAlmostEqual(stage_um, -0.04)
         self.assertEqual(pulses, 0)
         self.assertFalse(reverse)
 
@@ -74,9 +74,9 @@ class VisionCenterMoveTests(unittest.TestCase):
             image_height=450,
         )
 
-        self.assertEqual(plan["axis_params"], {1: (False, 15, 100, 30), 2: (True, 10, 100, 30)})
-        self.assertEqual(plan["signed_pulses"], {"X": 15, "Y": -10})
-        self.assertEqual(plan["target_positions"], {"X": 115, "Y": 190})
+        self.assertEqual(plan["axis_params"], {1: (True, 15, 100, 30), 2: (True, 10, 100, 30)})
+        self.assertEqual(plan["signed_pulses"], {"X": -15, "Y": -10})
+        self.assertEqual(plan["target_positions"], {"X": 85, "Y": 190})
         self.assertEqual(preview, plan["preview_text"])
 
     def test_image_centering_uses_resolution_scaled_calibration(self) -> None:
@@ -94,8 +94,8 @@ class VisionCenterMoveTests(unittest.TestCase):
             um_per_px=app.probe_config.current_um_per_px(),
         )
 
-        self.assertEqual(plan["signed_pulses"], {"X": 30, "Y": 0})
-        self.assertEqual(plan["target_positions"], {"X": 130})
+        self.assertEqual(plan["signed_pulses"], {"X": -30, "Y": 0})
+        self.assertEqual(plan["target_positions"], {"X": 70})
 
     def test_cc_plan_uses_configured_speed_and_acceleration(self) -> None:
         app = self.make_app_shell()
@@ -110,7 +110,7 @@ class VisionCenterMoveTests(unittest.TestCase):
             um_per_px=0.5,
         )
 
-        self.assertEqual(plan["axis_params"], {1: (False, 15, 60, 25), 2: (False, 0, 0, 25)})
+        self.assertEqual(plan["axis_params"], {1: (True, 15, 60, 25), 2: (False, 0, 0, 25)})
 
     def test_x_axis_polarity_reverses_controller_direction_not_logical_preview(self) -> None:
         app = self.make_app_shell()
@@ -124,9 +124,9 @@ class VisionCenterMoveTests(unittest.TestCase):
             um_per_px=0.5,
         )
 
-        self.assertEqual(plan["signed_pulses"], {"X": 15, "Y": 10})
-        self.assertEqual(plan["target_positions"], {"X": 115, "Y": 210})
-        self.assertEqual(plan["axis_params"], {1: (True, 15, 100, 30), 2: (False, 10, 100, 30)})
+        self.assertEqual(plan["signed_pulses"], {"X": -15, "Y": 10})
+        self.assertEqual(plan["target_positions"], {"X": 85, "Y": 210})
+        self.assertEqual(plan["axis_params"], {1: (False, 15, 100, 30), 2: (False, 10, 100, 30)})
 
     def test_camera_fov_rotation_rotates_image_centering_delta(self) -> None:
         app = self.make_app_shell()

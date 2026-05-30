@@ -38,6 +38,7 @@ assets/run.ps1
 imgstitch_session/
 imgmatrix_session/
 autotest_session/
+autotest_session*.zip
 last_autofocus_history*.csv
 tmp_check*
 tmp_output*

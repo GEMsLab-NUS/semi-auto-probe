@@ -9,6 +9,7 @@ from pathlib import Path
 from semi_auto_probe.auto_test import (
     AutoTestFlowStep,
     AutoTestPanel,
+    AutoTestPoint,
     AutoTestPointSpec,
     AutoTestSettings,
     PROBE_ASSIST_PROBES,
@@ -164,6 +165,15 @@ class AutoTestTests(unittest.TestCase):
         self.assertEqual(round_trip[0], AutoTestPointSpec("DevA1_A1", 0.0, 0.0, 0, 0))
         self.assertEqual(round_trip[-1].name, "DevB1_B2")
 
+    def test_autotest_grid_shape_uses_actual_secondary_array_points(self) -> None:
+        settings = AutoTestSettings(0, 0, 1, 0, 0, 1, 1, 1, 10, 10, 100, 50, 50, 2, "Dev{i}{j}")
+        points = (
+            AutoTestPoint(0, 0, 1, "A", 0, 0, 0, 0, ()),
+            AutoTestPoint(3, 4, 2, "B", 0, 0, 0, 0, ()),
+        )
+
+        self.assertEqual(ProbeApp._autotest_grid_shape(points, settings), (4, 5))
+
     def test_iv_csv_has_json_sidecar_metadata(self) -> None:
         point = generate_autotest_points(
             AutoTestSettings(1, 2, 1, 0, 0, 1, 1, 1, 10, 10, 100, 50, 50, 2, "Dev{i}{j}"),
@@ -185,6 +195,21 @@ class AutoTestTests(unittest.TestCase):
         self.assertEqual(metadata["device"]["name"], point.name)
         self.assertEqual(metadata["coordinates"]["gds"], {"u": point.u, "v": point.v})
         self.assertEqual(metadata["csv_file"], "DevA1_iv.csv")
+
+    def test_iv_output_paths_keep_multiple_vtops_and_repeated_cards(self) -> None:
+        point = generate_autotest_points(
+            AutoTestSettings(1, 2, 1, 0, 0, 1, 1, 1, 10, 10, 100, 50, 50, 2, "Dev{i}{j}"),
+            self.mapper(),
+        )[0]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_dir = Path(temp_dir)
+            (session_dir / "iv").mkdir()
+            first = ProbeApp._autotest_iv_output_path(session_dir, point, IVSweepConfig(stop=1), multi_vtop=True)
+            first.touch()
+            second = ProbeApp._autotest_iv_output_path(session_dir, point, IVSweepConfig(stop=1), multi_vtop=True)
+
+        self.assertEqual(first.name, "DevA1_iv_vtop_1.csv")
+        self.assertEqual(second.name, "DevA1_iv_vtop_1_2.csv")
 
     def test_flow_summary_and_legacy_steps(self) -> None:
         cards = [
@@ -210,16 +235,22 @@ class AutoTestTests(unittest.TestCase):
         self.assertEqual(steps[2].params["resource"], "GPIB0::18::INSTR")
         self.assertEqual(steps[2].params["output_terminal"], "rear")
         self.assertEqual(steps[2].params["sweep_mode"], "voltage")
+        self.assertEqual(steps[2].params["scan_type"], "single")
+        self.assertEqual(steps[2].params["measure_range"], "auto")
         self.assertEqual(steps[2].params["output_statistics"], "true")
         self.assertEqual(steps[2].params["resistance_method"], "linear_fit")
+        self.assertEqual(steps[2].params["plot_layout"], "horizontal")
+        self.assertEqual(steps[2].params["heatmap_values"], "true")
         self.assertEqual(steps[3].params["resource"], "GPIB0::17::INSTR")
         self.assertEqual(steps[3].params["drain_smu"], "smu3")
         self.assertEqual(steps[3].params["gate_smu"], "smu4")
         self.assertEqual(steps[3].params["sweep_start_v"], "-40")
-        self.assertEqual(steps[3].params["bias_values_v"], "0:5:1")
+        self.assertEqual(steps[3].params["scan_type"], "single")
+        self.assertEqual(steps[3].params["bias_values_v"], "0:1:5")
         self.assertEqual(steps[3].params["abort_on_compliance"], "false")
-        self.assertEqual(steps[3].params["staircase_nplc"], "10")
-        self.assertEqual(steps[3].params["measurement_adc"], "high_speed")
+        self.assertEqual(steps[3].params["staircase_nplc"], "8")
+        self.assertEqual(steps[3].params["step_delay_s"], "0")
+        self.assertEqual(steps[3].params["measurement_adc"], "high_resolution")
         self.assertNotIn("avg_coefficient", steps[3].params)
 
     def test_wobbtest_requires_session_dir_and_best_z_uses_median_current(self) -> None:
@@ -298,7 +329,7 @@ class AutoTestTests(unittest.TestCase):
         panel._flow_zoom = 1.0
         card = create_autotest_flow_card("iv", "card_1", expanded=True)
 
-        self.assertGreaterEqual(panel._flow_card_height_for_card(card), 382)
+        self.assertGreaterEqual(panel._flow_card_height_for_card(card), 532)
 
     def test_expanded_b1500_card_height_accounts_for_grouped_params(self) -> None:
         panel = object.__new__(AutoTestPanel)

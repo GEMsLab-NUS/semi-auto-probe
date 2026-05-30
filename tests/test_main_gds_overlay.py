@@ -61,17 +61,17 @@ class MainGDSOverlayTests(unittest.TestCase):
         app.main_gds_overlay_cache_polygons = []
         return app
 
-    def test_gds_overlay_projects_positive_stage_x_to_image_right(self) -> None:
+    def test_gds_overlay_uses_main_view_stage_projection(self) -> None:
         app = self.make_app_shell()
 
         polygons = ProbeApp.main_view_gds_overlay_polygons(app, image_width=100, image_height=80)
 
         self.assertEqual(len(polygons), 1)
         xs = [point[0] for point in polygons[0]]
-        self.assertEqual(xs, [60.0, 70.0, 70.0, 60.0])
-        self.assertGreater(min(xs), 50.0)
+        self.assertEqual(xs, [40.0, 30.0, 30.0, 40.0])
+        self.assertLess(max(xs), 50.0)
 
-    def test_stage_to_main_image_projection_is_inverse_of_centering_move(self) -> None:
+    def test_centering_move_uses_same_view_motion_as_projection(self) -> None:
         app = self.make_app_shell()
 
         image_x, image_y = app._stage_xy_um_to_main_image_point(
@@ -92,7 +92,7 @@ class MainGDSOverlayTests(unittest.TestCase):
             um_per_px=2.0,
         )
 
-        self.assertEqual((image_x, image_y), (55.0, 30.0))
+        self.assertEqual((image_x, image_y), (45.0, 30.0))
         self.assertEqual(move["X"][0], 10.0)
         self.assertEqual(move["Y"][0], 20.0)
 
@@ -119,11 +119,11 @@ class MainGDSOverlayTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(image_x, 50.0)
-        self.assertAlmostEqual(image_y, 45.0)
+        self.assertAlmostEqual(image_y, 35.0)
         self.assertAlmostEqual(move["X"][0], 10.0)
         self.assertAlmostEqual(move["Y"][0], 0.0)
 
-    def test_gds_overlay_keeps_diagonal_rotation_sign_after_stage_projection(self) -> None:
+    def test_gds_overlay_preserves_diagonal_after_stage_projection(self) -> None:
         app = self.make_app_shell()
         app.gds_stage_mapper_panel.model = GDSLayoutModel(
             path=Path("fake.gds"),
@@ -146,7 +146,7 @@ class MainGDSOverlayTests(unittest.TestCase):
         self.assertEqual(len(polygons), 1)
         first, second = polygons[0][0], polygons[0][1]
         left_point, right_point = sorted((first, second), key=lambda point: point[0])
-        self.assertGreater(left_point[1], right_point[1])
+        self.assertLess(left_point[1], right_point[1])
 
     def test_probe_assist_uses_same_main_camera_projection_as_gds_overlay(self) -> None:
         app = self.make_app_shell()
@@ -155,7 +155,7 @@ class MainGDSOverlayTests(unittest.TestCase):
 
         points = ProbeApp.main_view_probe_assist_points(app, image_width=100, image_height=80)
 
-        self.assertEqual(points, [(60.0, 40.0, "Drain", "#ef4444")])
+        self.assertEqual(points, [(40.0, 40.0, "Drain", "#ef4444")])
 
 
 if __name__ == "__main__":

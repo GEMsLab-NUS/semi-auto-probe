@@ -323,6 +323,12 @@ class ProbeConfig:
     camera_exposure: float = 0.0
     camera_gain_mode: str = CAMERA_CONTROL_MODE_AUTO
     camera_gain: float = 0.0
+    camera_white_balance_mode: str = CAMERA_CONTROL_MODE_AUTO
+    camera_white_balance_temperature: float = 6500.0
+    camera_color_saturation: float = 128.0
+    camera_color_brightness: float = 0.0
+    camera_color_contrast: float = 0.0
+    camera_color_gamma: float = 100.0
     camera_source: str = "auto"
     camera_resolution_width: str = CAMERA_RESOLUTION_HALF
     camera_target_fps: int = 30
@@ -333,8 +339,8 @@ class ProbeConfig:
     imgstitch_settle_ms: int = 100
     imgstitch_seam_response_yellow: float = 0.10
     imgstitch_seam_response_green: float = 0.25
-    layoutbond_fov_width_um: float = 200.0
-    layoutbond_fov_height_um: float = 150.0
+    layoutbond_fov_width_um: float = 540.0
+    layoutbond_fov_height_um: float = 450.0
     keyboard_motion_scheme: str = KEYBOARD_MOTION_SCHEME_ARROW_PAGE
     jog_step_levels: dict[str, tuple[int, ...]] = field(default_factory=lambda: dict(DEFAULT_JOG_STEP_LEVELS))
     focus_threshold_yellow: dict[str, float] = field(default_factory=lambda: {"Laplacian": 1000.0, "Tenengrad": 20000.0, "Brenner": 1000.0})
@@ -374,6 +380,12 @@ class ProbeConfig:
         self.camera_gain_mode = normalize_camera_control_mode(self.camera_gain_mode)
         self.camera_exposure = float(self.camera_exposure)
         self.camera_gain = float(self.camera_gain)
+        self.camera_white_balance_mode = normalize_camera_control_mode(self.camera_white_balance_mode)
+        self.camera_white_balance_temperature = float(self.camera_white_balance_temperature)
+        self.camera_color_saturation = float(self.camera_color_saturation)
+        self.camera_color_brightness = float(self.camera_color_brightness)
+        self.camera_color_contrast = float(self.camera_color_contrast)
+        self.camera_color_gamma = float(self.camera_color_gamma)
         self.camera_source = str(self.camera_source or "auto").strip().lower()
         if not self.camera_source:
             raise ValueError("Camera source cannot be empty.")
@@ -383,6 +395,20 @@ class ProbeConfig:
             raise ValueError("Camera exposure must be a finite number in range -1000000..1000000.")
         if not math.isfinite(self.camera_gain) or self.camera_gain < 0 or self.camera_gain > 1_000_000:
             raise ValueError("Camera gain must be a finite number in range 0..1000000.")
+        if (
+            not math.isfinite(self.camera_white_balance_temperature)
+            or self.camera_white_balance_temperature < 2000
+            or self.camera_white_balance_temperature > 15000
+        ):
+            raise ValueError("Camera white balance temperature must be a finite number in range 2000..15000 K.")
+        if not math.isfinite(self.camera_color_saturation) or self.camera_color_saturation < 0 or self.camera_color_saturation > 255:
+            raise ValueError("Camera saturation must be a finite number in range 0..255.")
+        if not math.isfinite(self.camera_color_brightness) or self.camera_color_brightness < -255 or self.camera_color_brightness > 255:
+            raise ValueError("Camera brightness must be a finite number in range -255..255.")
+        if not math.isfinite(self.camera_color_contrast) or self.camera_color_contrast < -255 or self.camera_color_contrast > 255:
+            raise ValueError("Camera contrast must be a finite number in range -255..255.")
+        if not math.isfinite(self.camera_color_gamma) or self.camera_color_gamma < 20 or self.camera_color_gamma > 300:
+            raise ValueError("Camera gamma must be a finite number in range 20..300.")
         if self.cc_accel_time_s < 0.05 or self.cc_accel_time_s > 2.55:
             raise ValueError("CC acceleration time must be in range 0.05..2.55 seconds.")
         if self.autofocus_settle_ms < 0 or self.autofocus_settle_ms > 10000:
@@ -512,6 +538,12 @@ class ProbeConfig:
             "camera_exposure": self.camera_exposure,
             "camera_gain_mode": self.camera_gain_mode,
             "camera_gain": self.camera_gain,
+            "camera_white_balance_mode": self.camera_white_balance_mode,
+            "camera_white_balance_temperature": self.camera_white_balance_temperature,
+            "camera_color_saturation": self.camera_color_saturation,
+            "camera_color_brightness": self.camera_color_brightness,
+            "camera_color_contrast": self.camera_color_contrast,
+            "camera_color_gamma": self.camera_color_gamma,
             "camera_source": self.camera_source,
             "camera_resolution_width": self.camera_resolution_width,
             "camera_target_fps": self.camera_target_fps,
@@ -570,6 +602,12 @@ class ProbeConfig:
             camera_exposure=float(data.get("camera_exposure", cls.camera_exposure)),
             camera_gain_mode=normalize_camera_control_mode(data.get("camera_gain_mode", CAMERA_CONTROL_MODE_AUTO)),
             camera_gain=float(data.get("camera_gain", cls.camera_gain)),
+            camera_white_balance_mode=normalize_camera_control_mode(data.get("camera_white_balance_mode", CAMERA_CONTROL_MODE_AUTO)),
+            camera_white_balance_temperature=float(data.get("camera_white_balance_temperature", cls.camera_white_balance_temperature)),
+            camera_color_saturation=float(data.get("camera_color_saturation", cls.camera_color_saturation)),
+            camera_color_brightness=float(data.get("camera_color_brightness", cls.camera_color_brightness)),
+            camera_color_contrast=float(data.get("camera_color_contrast", cls.camera_color_contrast)),
+            camera_color_gamma=float(data.get("camera_color_gamma", cls.camera_color_gamma)),
             camera_source=str(data.get("camera_source", cls.camera_source)),
             camera_resolution_width=normalize_camera_resolution_width(data.get("camera_resolution_width", cls.camera_resolution_width)),
             camera_target_fps=normalize_camera_target_fps(data.get("camera_target_fps", cls.camera_target_fps)),
