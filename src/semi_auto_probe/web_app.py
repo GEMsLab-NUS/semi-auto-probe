@@ -14,14 +14,16 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 
 WEB_DIR = Path(__file__).parent / "web"
 STATIC_DIR = WEB_DIR / "static"
+DEFAULT_HOMEPAGE_DIR = Path(__file__).parent / "homepage" / "public"
 ACCESS_TOKEN_ENV = "SEMI_AUTO_PROBE_WEB_TOKEN"
 AUTOTEST_SESSION_DIR_ENV = "SEMI_AUTO_PROBE_AUTOTEST_SESSION_DIR"
+HOMEPAGE_DIR_ENV = "SEMI_AUTO_PROBE_HOMEPAGE_DIR"
 PID_FILE_ENV = "SEMI_AUTO_PROBE_WEB_PID_FILE"
 DEFAULT_PID_FILE = Path.cwd() / ".runtime" / "semi-auto-probe-web.pid"
 DEFAULT_AUTOTEST_SESSION_DIR = Path.cwd() / "autotest_session"
@@ -580,6 +582,16 @@ if cors_origins:
     )
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+homepage_static_dir = Path(os.environ.get(HOMEPAGE_DIR_ENV, str(DEFAULT_HOMEPAGE_DIR))).expanduser().resolve()
+if (homepage_static_dir / "index.html").is_file():
+    app.add_api_route(
+        "/homepage",
+        lambda: RedirectResponse(url="/homepage/", status_code=307),
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    app.mount("/homepage", StaticFiles(directory=homepage_static_dir, html=True), name="homepage")
 
 
 @app.middleware("http")

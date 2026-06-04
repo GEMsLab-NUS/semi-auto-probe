@@ -46,3 +46,6 @@ tmp_output*
 .runtime/
 assets/20260524_EdgeTraceTest.gds
 assets/TEST_NEW_DEVICE.gds
+
+# Local landing homepage assets served from /homepage.
+src/semi_auto_probe/homepage/
