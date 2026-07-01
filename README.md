@@ -245,6 +245,8 @@ Run the command-line communication test:
 uv run python -m semi_auto_probe.cli test --port COM3
 ```
 
+The desktop app also supports the Raspberry Pi serial bridge. Install the Windows OpenSSH client and configure key/agent authentication for `icalculate@100.77.247.59`, then select `Remote / SSH` in the `SERIAL` toolbar and click `Connect`. Selecting remote mode or clicking `Refresh` checks the Pi service, physical motor serial connection, and bridge-session availability through SSH without opening a control session. The app owns a loopback-only local forward to the Pi's `127.0.0.1:9500` bridge and closes it when serial is disconnected.
+
 Run the read-only web dashboard:
 
 ```powershell
@@ -462,6 +464,7 @@ For GDS viewer tests or manual GDS loading, the interpreter also needs `gdstk`.
 - Confirm the selected COM port
 - Confirm controller power and RS-232 wiring
 - Verify the controller uses `115200, N, 8, 1`
+- In `Remote / SSH` mode, verify key-based SSH login works and that another remote session is not already using the Raspberry Pi bridge
 
 ### Camera preview is unavailable
 

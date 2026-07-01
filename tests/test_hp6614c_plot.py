@@ -98,18 +98,56 @@ class HP6614CPlotTests(unittest.TestCase):
         transfer_config = HP6614CSweepConfig(test_type=HP6614C_TEST_TRANSFER)
         output_config = HP6614CSweepConfig(test_type=HP6614C_TEST_OUTPUT, bias_values_v=(0.0,))
 
-        plot.start("P1", transfer_config, combined_plot=True)
+        plot.start("P1", transfer_config, combined_plot=True, reset_heatmap=True)
         plot.records.append({"drain_voltage_v": -1.0})
-        plot.start("P1", output_config, combined_plot=True)
+        plot.heatmap_values[(0, 0)] = 0.75
+        plot.start("P1", output_config, combined_plot=True, reset_heatmap=False, combined_heatmap_metric="vth")
 
         self.assertEqual(plot.records_by_test[HP6614C_TEST_TRANSFER], [{"drain_voltage_v": -1.0}])
         self.assertEqual(plot.records, plot.records_by_test[HP6614C_TEST_OUTPUT])
+        self.assertEqual(plot.heatmap_values[(0, 0)], 0.75)
 
         plot.records.append({"gate_voltage_v": 1.0})
         plot.start("P2", transfer_config, combined_plot=True)
 
         self.assertEqual(plot.records_by_test[HP6614C_TEST_TRANSFER], [])
         self.assertEqual(plot.records_by_test[HP6614C_TEST_OUTPUT], [])
+
+    def test_combined_output_keeps_transfer_heatmap_and_does_not_update_it(self) -> None:
+        plot = make_plot()
+        output_config = HP6614CSweepConfig(test_type=HP6614C_TEST_OUTPUT, bias_values_v=(0.0,))
+
+        plot.start(
+            "P1",
+            output_config,
+            row=0,
+            col=0,
+            combined_plot=True,
+            combined_heatmap_metric="ss",
+            combined_heatmap_values=False,
+        )
+        plot.records.append({"drain_current_a": 2e-5})
+        plot.heatmap_values[(0, 0)] = 123.0
+
+        parameter_text = plot._update_heatmap_from_completed_point()
+
+        self.assertEqual(plot.heatmap_key, (HP6614C_TEST_TRANSFER, "ss"))
+        self.assertEqual(plot.heatmap_label, "SS (mV/dec)")
+        self.assertFalse(plot.show_heatmap_values)
+        self.assertEqual(plot.heatmap_values[(0, 0)], 123.0)
+        self.assertEqual(parameter_text, "")
+
+    def test_output_only_updates_max_id_heatmap(self) -> None:
+        plot = make_plot()
+        output_config = HP6614CSweepConfig(test_type=HP6614C_TEST_OUTPUT, bias_values_v=(0.0,))
+
+        plot.start("P1", output_config, row=0, col=0, combined_plot=False)
+        plot.records.extend(({"drain_current_a": -2e-5}, {"drain_current_a": 1e-5}))
+        plot._update_heatmap_from_completed_point()
+
+        self.assertEqual(plot.heatmap_key, (HP6614C_TEST_OUTPUT, "max_abs_id"))
+        self.assertEqual(plot.heatmap_label, "Max |Id| (A)")
+        self.assertEqual(plot.heatmap_values[(0, 0)], 2e-5)
 
 
 if __name__ == "__main__":

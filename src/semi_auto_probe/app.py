@@ -156,6 +156,7 @@ from .logging_utils import colorize_hex_frame, configure_logging, print_startup_
 from .protocol import COMM_TEST_COMMAND, FUNCTION_READ_POSITION, RESPONSE_HEAD, Axis, AxisPosition, IoStatus, hex_bytes, parse_axis_position_response
 from .protocol import payload_contains_clear_position_command
 from .serial_client import ControllerSerialClient, CommunicationTestResult, list_serial_ports
+from .ssh_tunnel import RemoteBridgeStatus, SshSerialTunnel, probe_remote_bridge_status
 from .ui.calibration_dialog import PixelCalibrationDialog
 from .ui.fov_rotation_dialog import FOVRotationCalibrationDialog
 from .ui.agent_panel import AgentPanel
@@ -164,6 +165,9 @@ from .ui.vision import VisionPanel
 
 logger = configure_logging()
 DEFAULT_SERIAL_PORT = "COM7"
+SERIAL_MODE_LOCAL = "Local"
+SERIAL_MODE_REMOTE_SSH = "Remote / SSH"
+REMOTE_SSH_TARGET = "icalculate@100.77.247.59"
 RESULT_POLL_INTERVAL_MS = 25
 RESULT_POLL_MAX_EVENTS = 30
 RESULT_POLL_MAX_SECONDS = 0.012
@@ -991,6 +995,8 @@ class HP6614CPlotWindow:
         cols: int | None = None,
         reset_heatmap: bool = False,
         combined_plot: bool = False,
+        combined_heatmap_metric: str | None = None,
+        combined_heatmap_values: bool | None = None,
     ) -> None:
         layout_changed = self.combined_plot != bool(combined_plot)
         new_point = self.current_point_name != point_name
@@ -1011,17 +1017,23 @@ class HP6614CPlotWindow:
             self.next_curve_color_index = 0
         self.current_point_name = point_name
         self.test_type = config.test_type
-        self.heatmap_metric = config.heatmap_metric if config.test_type == HP6614C_TEST_TRANSFER else "max_abs_id"
-        self.heatmap_key = (config.test_type, self.heatmap_metric)
+        if combined_plot:
+            self.heatmap_metric = combined_heatmap_metric or (config.heatmap_metric if config.test_type == HP6614C_TEST_TRANSFER else "vth")
+            self.heatmap_key = (HP6614C_TEST_TRANSFER, self.heatmap_metric)
+            self.show_heatmap_values = bool(config.heatmap_values if combined_heatmap_values is None else combined_heatmap_values)
+            self.heatmap_label = hp6614c_transfer_heatmap_label(self.heatmap_metric)
+        else:
+            self.heatmap_metric = config.heatmap_metric if config.test_type == HP6614C_TEST_TRANSFER else "max_abs_id"
+            self.heatmap_key = (config.test_type, self.heatmap_metric)
+            self.show_heatmap_values = bool(config.heatmap_values)
+            self.heatmap_label = hp6614c_transfer_heatmap_label(self.heatmap_metric) if config.test_type == HP6614C_TEST_TRANSFER else "Max |Id| (A)"
         self.heatmap_values = self.heatmap_values_by_key.setdefault(self.heatmap_key, {})
-        self.show_heatmap_values = bool(config.heatmap_values)
         self.active_cell = (row, col) if row is not None and col is not None else None
         if rows is not None and cols is not None:
             self.heatmap_rows = max(1, int(rows))
             self.heatmap_cols = max(1, int(cols))
         if reset_heatmap:
             self.heatmap_values.clear()
-        self.heatmap_label = hp6614c_transfer_heatmap_label(self.heatmap_metric) if config.test_type == HP6614C_TEST_TRANSFER else "Max |Id| (A)"
         label = "Transfer + Output" if combined_plot else ("Transfer" if config.test_type == HP6614C_TEST_TRANSFER else "Output")
         self.title_var.set(f"6614C {label}: {point_name}")
         self.status_var.set(config.summary())
@@ -1109,6 +1121,8 @@ class HP6614CPlotWindow:
         return color
 
     def _update_heatmap_from_completed_point(self, analysis: dict[str, object] | None = None) -> str:
+        if self.combined_plot and self.test_type == HP6614C_TEST_OUTPUT:
+            return ""
         if self.active_cell is None or not self.records:
             return ""
         if self.test_type == HP6614C_TEST_TRANSFER:
@@ -1321,6 +1335,7 @@ class ProbeApp(tk.Tk):
         self.after_idle(self._maximize_default_window)
 
         self.serial_client: ControllerSerialClient | None = None
+        self.ssh_serial_tunnel: SshSerialTunnel | None = None
         self.camera: UsbCamera | None = None
         self.camera_running = False
         self.camera_rendering = False
@@ -1403,7 +1418,14 @@ class ProbeApp(tk.Tk):
             logger.error("Failed to load probe config from %s: %s", self.config_path, exc)
         self.agent_planner = self._build_agent_planner()
 
+        self.connection_mode_var = tk.StringVar(value=SERIAL_MODE_LOCAL)
         self.port_var = tk.StringVar(value=DEFAULT_SERIAL_PORT)
+        self._local_port_selection = DEFAULT_SERIAL_PORT
+        self._local_serial_ports = [DEFAULT_SERIAL_PORT]
+        self.remote_bridge_check_pending = False
+        self.remote_bridge_check_generation = 0
+        self.remote_bridge_status: RemoteBridgeStatus | None = None
+        self.remote_bridge_status_checked_at = 0.0
         self.camera_index_var = tk.StringVar(value=normalize_camera_source(os.environ.get("SEMI_AUTO_PROBE_CAMERA_SOURCE") or self.probe_config.camera_source))
         self.status_var = tk.StringVar(value="Ready")
         self.rx_var = tk.StringVar(value="-")
@@ -1997,11 +2019,20 @@ class ProbeApp(tk.Tk):
         serial_group = ttk.Frame(toolbar, style="Toolbar.TFrame")
         serial_group.grid(row=0, column=1, sticky="w", padx=(0, 14))
         ttk.Label(serial_group, text="SERIAL", style="Muted.TLabel").grid(row=0, column=0, padx=(0, 6))
+        self.connection_mode_combo = ttk.Combobox(
+            serial_group,
+            textvariable=self.connection_mode_var,
+            values=(SERIAL_MODE_LOCAL, SERIAL_MODE_REMOTE_SSH),
+            width=12,
+            state="readonly",
+        )
+        self.connection_mode_combo.grid(row=0, column=1, padx=(0, 6), ipady=1)
+        self.connection_mode_combo.bind("<<ComboboxSelected>>", self._on_connection_mode_changed)
         self.port_combo = ttk.Combobox(serial_group, textvariable=self.port_var, width=10, state="readonly")
-        self.port_combo.grid(row=0, column=1, padx=(0, 6), ipady=1)
-        ttk.Button(serial_group, text="Refresh", style="Ghost.TButton", command=self.refresh_ports).grid(row=0, column=2, padx=(0, 6))
-        ttk.Button(serial_group, text="Connect", style="Accent.TButton", command=self.connect_and_test_serial).grid(row=0, column=3, padx=(0, 6))
-        ttk.Button(serial_group, text="Test", command=self.run_comm_test).grid(row=0, column=4)
+        self.port_combo.grid(row=0, column=2, padx=(0, 6), ipady=1)
+        ttk.Button(serial_group, text="Refresh", style="Ghost.TButton", command=self.refresh_ports).grid(row=0, column=3, padx=(0, 6))
+        ttk.Button(serial_group, text="Connect", style="Accent.TButton", command=self.connect_and_test_serial).grid(row=0, column=4, padx=(0, 6))
+        ttk.Button(serial_group, text="Test", command=self.run_comm_test).grid(row=0, column=5)
         self._update_serial_port_style()
 
         camera_group = ttk.Frame(toolbar, style="Toolbar.TFrame")
@@ -8814,6 +8845,24 @@ class ProbeApp(tk.Tk):
         flow_types = {step.type_id for step in settings.measurement_flow}
         return {"hp6614c_transfer", "hp6614c_output"}.issubset(flow_types)
 
+    @staticmethod
+    def _autotest_combined_hp6614c_heatmap(settings: AutoTestSettings) -> tuple[str | None, bool | None]:
+        if not ProbeApp._autotest_uses_combined_hp6614c_plot(settings):
+            return None, None
+        transfer_step = next(step for step in settings.measurement_flow if step.type_id == "hp6614c_transfer")
+        transfer_config = hp6614c_sweep_config_from_params(dict(transfer_step.params), test_type=HP6614C_TEST_TRANSFER)
+        return transfer_config.heatmap_metric, transfer_config.heatmap_values
+
+    @staticmethod
+    def _autotest_should_reset_hp6614c_heatmap(point: AutoTestPoint, settings: AutoTestSettings, step: AutoTestFlowStep) -> bool:
+        if point.order != 1:
+            return False
+        first_hp_step = next(
+            (candidate for candidate in settings.measurement_flow if candidate.type_id in {"hp6614c_transfer", "hp6614c_output"}),
+            None,
+        )
+        return first_hp_step is step
+
     def _execute_autotest_flow_step(self, point: AutoTestPoint, settings: AutoTestSettings, step: AutoTestFlowStep, session_dir: Path | None, cv2_module) -> None:
         params = dict(step.params)
         if step.type_id == "wait":
@@ -8835,20 +8884,28 @@ class ProbeApp(tk.Tk):
             return
         if step.type_id == "hp6614c_transfer":
             config = hp6614c_sweep_config_from_params(params, test_type=HP6614C_TEST_TRANSFER)
+            heatmap_metric, heatmap_values = self._autotest_combined_hp6614c_heatmap(settings)
             self._run_autotest_hp6614c_sweep(
                 point,
                 config,
                 session_dir,
                 combined_plot=self._autotest_uses_combined_hp6614c_plot(settings),
+                combined_heatmap_metric=heatmap_metric,
+                combined_heatmap_values=heatmap_values,
+                reset_heatmap=self._autotest_should_reset_hp6614c_heatmap(point, settings, step),
             )
             return
         if step.type_id == "hp6614c_output":
             config = hp6614c_sweep_config_from_params(params, test_type=HP6614C_TEST_OUTPUT)
+            heatmap_metric, heatmap_values = self._autotest_combined_hp6614c_heatmap(settings)
             self._run_autotest_hp6614c_sweep(
                 point,
                 config,
                 session_dir,
                 combined_plot=self._autotest_uses_combined_hp6614c_plot(settings),
+                combined_heatmap_metric=heatmap_metric,
+                combined_heatmap_values=heatmap_values,
+                reset_heatmap=self._autotest_should_reset_hp6614c_heatmap(point, settings, step),
             )
             return
         if step.type_id == "b1500_transfer":
@@ -9236,6 +9293,9 @@ class ProbeApp(tk.Tk):
         session_dir: Path | None,
         *,
         combined_plot: bool = False,
+        combined_heatmap_metric: str | None = None,
+        combined_heatmap_values: bool | None = None,
+        reset_heatmap: bool | None = None,
     ) -> list[dict[str, object]]:
         if session_dir is None:
             raise RuntimeError("AutoTest 6614C session directory is unavailable.")
@@ -9252,8 +9312,10 @@ class ProbeApp(tk.Tk):
                 point.col,
                 self.autotest_grid_rows,
                 self.autotest_grid_cols,
-                point.order == 1,
+                point.order == 1 if reset_heatmap is None else bool(reset_heatmap),
                 bool(combined_plot),
+                combined_heatmap_metric,
+                combined_heatmap_values,
             )
         )
         self.result_queue.put(("autotest_status", f"{label} started at {point.name}: {config.summary()}"))
@@ -11284,11 +11346,17 @@ class ProbeApp(tk.Tk):
         return controller_axis
 
     def refresh_ports(self) -> None:
+        if self._using_remote_ssh():
+            self._start_remote_bridge_status_check()
+            return
         logger.info("Scanning available serial ports...")
         ports = list_serial_ports()
         self._apply_serial_ports(ports)
 
     def _apply_serial_ports(self, ports: list[str]) -> None:
+        self._local_serial_ports = list(ports)
+        if self._using_remote_ssh():
+            return
         if self.serial_client and self.serial_client.is_open and self.serial_client.port not in ports:
             ports.insert(0, self.serial_client.port)
 
@@ -11307,26 +11375,129 @@ class ProbeApp(tk.Tk):
             logger.info("Available serial ports: %s", ", ".join(ports))
         self._update_serial_port_style()
 
+    def _using_remote_ssh(self) -> bool:
+        mode_var = getattr(self, "connection_mode_var", None)
+        return bool(mode_var and mode_var.get() == SERIAL_MODE_REMOTE_SSH)
+
+    def _on_connection_mode_changed(self, _event=None) -> None:
+        if self.serial_client or self.ssh_serial_tunnel:
+            self.disconnect_serial()
+        self._apply_connection_mode_ui()
+
+    def _apply_connection_mode_ui(self, *, announce: bool = True) -> None:
+        if self._using_remote_ssh():
+            current_port = self.port_var.get().strip()
+            if current_port and current_port != REMOTE_SSH_TARGET:
+                self._local_port_selection = current_port
+            self.port_var.set(REMOTE_SSH_TARGET)
+            self.port_combo.configure(values=(REMOTE_SSH_TARGET,), width=27, state="disabled")
+            if announce:
+                self._start_remote_bridge_status_check()
+            return
+
+        ports = list(self._local_serial_ports)
+        selected = self._local_port_selection
+        if ports and selected not in ports:
+            selected = ports[0]
+        self.port_var.set(selected if ports else "")
+        self.port_combo.configure(values=ports, width=10, state="readonly")
+        if announce:
+            self.status_var.set("Local serial mode selected.")
+
+    def _start_remote_bridge_status_check(self) -> None:
+        if self.remote_bridge_check_pending:
+            return
+        self.remote_bridge_check_pending = True
+        self.remote_bridge_check_generation += 1
+        generation = self.remote_bridge_check_generation
+        self.status_var.set(f"Checking Raspberry Pi controller availability through SSH {REMOTE_SSH_TARGET}...")
+        threading.Thread(target=self._remote_bridge_status_worker, args=(generation,), daemon=True).start()
+        self.after(12_000, self._expire_remote_bridge_status_check, generation)
+
+    def _remote_bridge_status_worker(self, generation: int) -> None:
+        try:
+            status = probe_remote_bridge_status(REMOTE_SSH_TARGET)
+            self.result_queue.put(("remote_bridge_status", generation, status, None))
+        except Exception as exc:
+            self.result_queue.put(("remote_bridge_status", generation, None, str(exc)))
+
+    def _expire_remote_bridge_status_check(self, generation: int) -> None:
+        if not self.remote_bridge_check_pending or generation != self.remote_bridge_check_generation:
+            return
+        self.remote_bridge_check_pending = False
+        self.remote_bridge_status = None
+        self.remote_bridge_status_checked_at = time.monotonic()
+        if self._using_remote_ssh() and not self.serial_client:
+            self.status_var.set("Raspberry Pi remote controller check timed out; click Refresh to retry.")
+
+    @staticmethod
+    def _remote_bridge_status_message(status: RemoteBridgeStatus) -> str:
+        if status.bridge_active:
+            return "Raspberry Pi is reachable, but its remote serial bridge is already in use."
+        if not status.controller_connected:
+            return "Raspberry Pi is reachable, but its motor serial device is not connected."
+        if not status.available:
+            return "Raspberry Pi remote serial bridge is currently unavailable."
+        port_suffix = f" on {status.serial_port}" if status.serial_port else ""
+        return f"Raspberry Pi remote controller is available{port_suffix}."
+
     def connect_serial(self) -> bool:
+        remote = self._using_remote_ssh()
         port = self.port_var.get().strip()
-        if not port:
+        if not remote and not port:
             self.status_var.set("Select a serial port first.")
             logger.warning("Serial connection skipped because no port is selected.")
             return False
 
+        self._close_serial_transport()
+        tunnel: SshSerialTunnel | None = None
         try:
-            self.serial_client = ControllerSerialClient(port)
-            self.serial_client.set_admin_mode_enabled(self.admin_mode_enabled)
-            self.serial_client.open()
+            if remote:
+                if self.remote_bridge_check_pending:
+                    self.status_var.set("Raspberry Pi availability check is still running; connect after it reports ready.")
+                    self._update_serial_port_style()
+                    return False
+                status = self.remote_bridge_status
+                status_age = time.monotonic() - self.remote_bridge_status_checked_at
+                if status is None or status_age > 15.0:
+                    self._start_remote_bridge_status_check()
+                    self.status_var.set("Refreshing Raspberry Pi availability; connect after it reports ready.")
+                    self._update_serial_port_style()
+                    return False
+                if not status.available or not status.controller_connected or status.bridge_active:
+                    self.status_var.set(self._remote_bridge_status_message(status))
+                    logger.warning("Remote controller preflight failed: %s", self.status_var.get())
+                    self._update_serial_port_style()
+                    return False
+                tunnel = SshSerialTunnel(REMOTE_SSH_TARGET)
+                tunnel.start()
+                client = ControllerSerialClient(tunnel.serial_url)
+                client.set_admin_mode_enabled(self.admin_mode_enabled)
+                tunnel.wait_for_serial_open(client)
+            else:
+                client = ControllerSerialClient(port)
+                client.set_admin_mode_enabled(self.admin_mode_enabled)
+                client.open()
         except Exception as exc:
-            self.status_var.set(f"Serial connection failed: {exc}")
-            logger.error("Serial connection failed on %s: %s", port, exc)
-            threading.Thread(target=self._refresh_ports_after_connect_failure, daemon=True).start()
+            if tunnel is not None:
+                tunnel.close()
+            prefix = "Remote SSH connection failed" if remote else "Serial connection failed"
+            self.status_var.set(f"{prefix}: {exc}")
+            logger.error("%s for %s: %s", prefix, REMOTE_SSH_TARGET if remote else port, exc)
+            if not remote:
+                threading.Thread(target=self._refresh_ports_after_connect_failure, daemon=True).start()
             self._update_serial_port_style()
             return False
 
-        self.status_var.set(f"Connected to {port} at 115200,N,8,1.")
-        logger.info("Connected to %s at 115200,N,8,1.", port)
+        self.serial_client = client
+        self.ssh_serial_tunnel = tunnel
+        if remote:
+            self.status_var.set(f"SSH tunnel connected to {REMOTE_SSH_TARGET}; checking controller availability.")
+            logger.info("Connected through SSH %s using %s.", REMOTE_SSH_TARGET, client.port)
+        else:
+            self._local_port_selection = port
+            self.status_var.set(f"Connected to {port} at 115200,N,8,1.")
+            logger.info("Connected to %s at 115200,N,8,1.", port)
         self._update_serial_port_style()
         return True
 
@@ -11342,13 +11513,19 @@ class ProbeApp(tk.Tk):
         self.home_signal_stop_event.set()
         self.home_signal_enabled = False
         self.home_signal_button_var.set("Home Signals")
+        self._close_serial_transport()
+        self.status_var.set("Serial disconnected.")
+        logger.info("Serial disconnected.")
+        self._update_serial_port_style()
+
+    def _close_serial_transport(self) -> None:
         if self.serial_client:
             logger.info("Disconnecting serial port %s.", self.serial_client.port)
             self.serial_client.close()
         self.serial_client = None
-        self.status_var.set("Serial disconnected.")
-        logger.info("Serial disconnected.")
-        self._update_serial_port_style()
+        if self.ssh_serial_tunnel:
+            self.ssh_serial_tunnel.close()
+        self.ssh_serial_tunnel = None
 
     def run_comm_test(self) -> None:
         if not self.serial_client:
@@ -11361,11 +11538,25 @@ class ProbeApp(tk.Tk):
         threading.Thread(target=self._comm_test_worker, daemon=True).start()
 
     def _comm_test_worker(self) -> None:
-        assert self.serial_client is not None
+        client = self.serial_client
+        assert client is not None
+        remote = client.port.startswith("socket://")
         try:
-            self.result_queue.put(self.serial_client.communication_test())
+            result = client.communication_test()
+            if remote and not result.ok:
+                received = result.response_hex or "no response"
+                result.message = f"Remote controller communication test failed ({result.message}; RX: {received})."
+            self.result_queue.put(result)
         except Exception as exc:
-            self.result_queue.put(exc)
+            if remote:
+                self.result_queue.put(
+                    RuntimeError(
+                        "Remote controller unavailable: the SSH tunnel or Raspberry Pi serial bridge disconnected, "
+                        f"or another remote session is active ({exc})."
+                    )
+                )
+            else:
+                self.result_queue.put(exc)
 
     def _ensure_iv_plot_window(self) -> IVPlotWindow:
         if self.iv_plot_window is None:
@@ -11423,6 +11614,9 @@ class ProbeApp(tk.Tk):
                 if isinstance(result, Exception):
                     self.status_var.set(f"Communication test failed: {result}")
                     logger.error("Communication test failed: %s", result)
+                    if self.serial_client and self.serial_client.port.startswith("socket://"):
+                        self._close_serial_transport()
+                        self._update_serial_port_style()
                     continue
                 if isinstance(result, tuple):
                     self._handle_worker_event(result)
@@ -11442,6 +11636,9 @@ class ProbeApp(tk.Tk):
                     threading.Thread(target=self._read_current_position_worker, args=("comm_test", False), daemon=True).start()
                 else:
                     logger.warning("Communication test did not pass. %s %s Detail=%s", colorize_hex_frame(result.request_hex, "TX"), colorize_hex_frame(result.response_hex or "-", "RX"), result.message)
+                    if self.serial_client and self.serial_client.port.startswith("socket://"):
+                        self._close_serial_transport()
+                        self._update_serial_port_style()
         except queue.Empty:
             pass
         if self.result_queue.empty():
@@ -11574,6 +11771,22 @@ class ProbeApp(tk.Tk):
         if event_type == "ports_refreshed":
             _, ports = event
             self._apply_serial_ports(ports)
+            return
+
+        if event_type == "remote_bridge_status":
+            _, generation, status, error = event
+            if generation != self.remote_bridge_check_generation:
+                return
+            self.remote_bridge_check_pending = False
+            self.remote_bridge_status = status
+            self.remote_bridge_status_checked_at = time.monotonic()
+            if not self._using_remote_ssh() or self.serial_client:
+                return
+            if error:
+                self.status_var.set(f"Raspberry Pi remote controller check failed: {error}")
+                logger.warning("Raspberry Pi remote controller check failed: %s", error)
+            else:
+                self.status_var.set(self._remote_bridge_status_message(status))
             return
 
         if event_type == "zero_z_command":
@@ -12165,6 +12378,8 @@ class ProbeApp(tk.Tk):
                 cols = int(payload[3]) if len(payload) >= 4 and payload[3] is not None else None
                 reset_heatmap = bool(payload[4]) if len(payload) >= 5 else False
                 combined_plot = bool(payload[5]) if len(payload) >= 6 else False
+                combined_heatmap_metric = str(payload[6]) if len(payload) >= 7 and payload[6] is not None else None
+                combined_heatmap_values = bool(payload[7]) if len(payload) >= 8 and payload[7] is not None else None
                 self._ensure_hp6614c_plot_window().start(
                     str(point_name),
                     config,
@@ -12174,6 +12389,8 @@ class ProbeApp(tk.Tk):
                     cols=cols,
                     reset_heatmap=reset_heatmap,
                     combined_plot=combined_plot,
+                    combined_heatmap_metric=combined_heatmap_metric,
+                    combined_heatmap_values=combined_heatmap_values,
                 )
                 self.status_var.set(f"6614C {config.test_type} started at {point_name}.")
             return
@@ -12515,8 +12732,7 @@ class ProbeApp(tk.Tk):
             except Exception:
                 logger.exception("Failed to disable realtime position during shutdown.")
         self.stop_camera()
-        if self.serial_client:
-            self.serial_client.close()
+        self._close_serial_transport()
         super().destroy()
 
 

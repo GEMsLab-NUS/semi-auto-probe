@@ -70,8 +70,9 @@ class ControllerSerialClient:
             if self.is_open:
                 return
 
-            self._serial = serial.Serial(
-                port=self.port,
+            serial_factory = serial.serial_for_url if "://" in self.port else serial.Serial
+            self._serial = serial_factory(
+                self.port,
                 baudrate=self.baudrate,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,

@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from semi_auto_probe.protocol import FRAME_TAIL, RESPONSE_HEAD, Axis, build_clear_position_command, build_read_motion_parameters_command, checksum
 from semi_auto_probe.serial_client import ControllerSerialClient
@@ -57,6 +58,44 @@ def motion_parameters_response(axis: Axis, minimum_speed: int, work_speed: int, 
 
 
 class SerialClientTest(unittest.TestCase):
+    @patch("serial.serial_for_url")
+    @patch("serial.Serial")
+    def test_socket_url_uses_pyserial_url_handler(self, serial_constructor, serial_for_url) -> None:
+        serial_for_url.return_value = FakeSerial(b"")
+        client = ControllerSerialClient("socket://127.0.0.1:9500", timeout=0.25)
+
+        client.open()
+
+        serial_constructor.assert_not_called()
+        serial_for_url.assert_called_once_with(
+            "socket://127.0.0.1:9500",
+            baudrate=115200,
+            bytesize=8,
+            parity="N",
+            stopbits=1,
+            timeout=0.25,
+            write_timeout=0.25,
+        )
+
+    @patch("serial.serial_for_url")
+    @patch("serial.Serial")
+    def test_local_port_keeps_standard_serial_handler(self, serial_constructor, serial_for_url) -> None:
+        serial_constructor.return_value = FakeSerial(b"")
+        client = ControllerSerialClient("COM_TEST", timeout=0.25)
+
+        client.open()
+
+        serial_for_url.assert_not_called()
+        serial_constructor.assert_called_once_with(
+            "COM_TEST",
+            baudrate=115200,
+            bytesize=8,
+            parity="N",
+            stopbits=1,
+            timeout=0.25,
+            write_timeout=0.25,
+        )
+
     def test_position_reader_resynchronizes_after_fragment(self) -> None:
         client = ControllerSerialClient("COM_TEST", timeout=0.05)
         expected = position_response(Axis.Y, 20)
