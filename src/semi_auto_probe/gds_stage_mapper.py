@@ -2682,14 +2682,19 @@ class GDSStageMapperPanel:
         if not path:
             return
         try:
-            data = json.loads(Path(path).read_text(encoding="utf-8"))
-            self._apply_calibration_payload(data)
+            self.load_calibration_from_path(Path(path))
         except Exception as exc:
             messagebox.showerror("GDS Calibration", f"Load failed: {exc}", parent=self.frame)
             return
-        self.motion_status_var.set(f"Calibration loaded: {Path(path).name}")
 
-    def _apply_calibration_payload(self, data: dict[str, object]) -> None:
+    def load_calibration_from_path(self, path: Path, *, show_missing_gds_warning: bool = True) -> None:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("GDS calibration JSON root must be an object.")
+        self._apply_calibration_payload(data, show_missing_gds_warning=show_missing_gds_warning)
+        self.motion_status_var.set(f"Calibration loaded: {path.name}")
+
+    def _apply_calibration_payload(self, data: dict[str, object], *, show_missing_gds_warning: bool = True) -> None:
         points = dict(data.get("calibration_points", {}))
         for name in self.POINT_NAMES:
             point_data = dict(points.get(name, {}))
@@ -2715,7 +2720,11 @@ class GDSStageMapperPanel:
             if path.exists():
                 self.start_gds_load(path, str(top_cell_name) if top_cell_name else None)
             else:
-                messagebox.showwarning("GDS Calibration", f"Saved GDS file was not found. Reload it manually:\n{path}", parent=self.frame)
+                message = f"Saved GDS file was not found. Reload it manually: {path}"
+                self.load_status_var.set(message)
+                self._set_status(message)
+                if show_missing_gds_warning:
+                    messagebox.showwarning("GDS Calibration", f"Saved GDS file was not found. Reload it manually:\n{path}", parent=self.frame)
 
     def _set_status(self, message: str) -> None:
         if self.set_app_status is not None:

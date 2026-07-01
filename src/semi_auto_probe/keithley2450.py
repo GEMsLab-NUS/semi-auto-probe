@@ -76,17 +76,20 @@ class ConstantVoltageCurrentConfig:
     output_terminal: str = OUTPUT_TERMINAL_REAR
     voltage_v: float = 0.1
     current_limit_a: float = 1e-5
+    measure_range: float | None = None
     sample_count: int = 5
     nplc: float = 10.0
     output_off_after: bool = True
 
     def normalized(self) -> "ConstantVoltageCurrentConfig":
         output_terminal = normalize_output_terminal(self.output_terminal)
-        values = (self.voltage_v, self.current_limit_a, self.nplc)
+        values = (self.voltage_v, self.current_limit_a, 1.0 if self.measure_range is None else self.measure_range, self.nplc)
         if any(not math.isfinite(float(value)) for value in values):
             raise ValueError("Constant voltage current parameters must be finite.")
         if float(self.current_limit_a) <= 0:
             raise ValueError("Constant voltage current limit must be positive.")
+        if self.measure_range is not None and float(self.measure_range) <= 0:
+            raise ValueError("Constant voltage current measurement range must be positive or auto.")
         if float(self.nplc) <= 0 or float(self.nplc) > 25:
             raise ValueError("Constant voltage NPLC must be in range 0..25.")
         sample_count = int(float(self.sample_count))
@@ -100,6 +103,7 @@ class ConstantVoltageCurrentConfig:
             output_terminal=output_terminal,
             voltage_v=float(self.voltage_v),
             current_limit_a=float(self.current_limit_a),
+            measure_range=None if self.measure_range is None else float(self.measure_range),
             sample_count=sample_count,
             nplc=float(self.nplc),
             output_off_after=bool(self.output_off_after),
@@ -379,6 +383,7 @@ def constant_voltage_current_config_from_params(params: dict[str, str]) -> Const
         output_terminal=params.get("output_terminal", params.get("terminal", OUTPUT_TERMINAL_REAR)),
         voltage_v=float(params.get("bias_v", params.get("voltage_v", params.get("voltage", 0.1)))),
         current_limit_a=float(params.get("current_limit_a", params.get("limit_a", params.get("compliance_a", 1e-5)))),
+        measure_range=parse_optional_range(params.get("measure_range", params.get("measurement_range", params.get("range", "auto")))),
         sample_count=int(float(params.get("sample_count", params.get("samples", 5)))),
         nplc=float(params.get("nplc", 10.0)),
         output_off_after=parse_bool(params.get("output_off_after", "true"), default=True),
@@ -463,6 +468,11 @@ class Keithley2450IVRunner:
     def __init__(self, instrument: VisaInstrument | None = None) -> None:
         self.instrument = instrument
         self._owns_instrument = instrument is None
+        self._sweep_config: IVSweepConfig | None = None
+        self._sweep_started_at = 0.0
+        self._constant_config: ConstantVoltageCurrentConfig | None = None
+        self._constant_source_value = 0.0
+        self._constant_started_at = 0.0
 
     def run_sweep(
         self,
@@ -471,46 +481,101 @@ class Keithley2450IVRunner:
         stop_requested: Callable[[], bool] | None = None,
         on_sample: Callable[[IVSweepSample], None] | None = None,
     ) -> list[IVSweepSample]:
+        self.begin_sweep(config)
+        try:
+            return self.sample_sweep(stop_requested=stop_requested, on_sample=on_sample)
+        finally:
+            self.end_sweep()
+
+    def begin_sweep(self, config: IVSweepConfig) -> IVSweepConfig:
+        if self._sweep_config is not None or self._constant_config is not None:
+            raise RuntimeError("Keithley measurement session is already active.")
         normalized = config.normalized()
         instrument = self.instrument or self._open_resource(normalized.resource_name)
         self.instrument = instrument
-        values = normalized.sweep_values()
-        samples: list[IVSweepSample] = []
-        started_at = time.monotonic()
         try:
             self._configure_instrument(instrument, normalized)
+            self._set_source_value(instrument, normalized.sweep_mode, normalized.start)
             instrument.write(":OUTP ON")
-            for index, source_value in enumerate(values, start=1):
-                if stop_requested is not None and stop_requested():
-                    break
-                self._set_source_value(instrument, normalized.sweep_mode, source_value)
-                if normalized.source_delay_s > 0:
-                    time.sleep(normalized.source_delay_s)
-                raw = instrument.query(":READ?")
-                sample = self._sample_from_reading(
-                    raw,
-                    index=index,
-                    total=len(values),
-                    elapsed_s=time.monotonic() - started_at,
-                    source_value=source_value,
-                    sweep_mode=normalized.sweep_mode,
-                )
-                samples.append(sample)
-                if on_sample is not None:
-                    on_sample(sample)
-        finally:
-            if normalized.output_off_after:
-                try:
-                    instrument.write(":OUTP OFF")
-                except Exception:
-                    pass
+        except Exception:
             if self._owns_instrument:
                 try:
                     instrument.close()
                 except Exception:
                     pass
                 self.instrument = None
+            raise
+        self._sweep_config = normalized
+        self._sweep_started_at = time.monotonic()
+        return normalized
+
+    def set_sweep_source_value(self, source_value: float) -> None:
+        config = self._sweep_config
+        instrument = self.instrument
+        if config is None or instrument is None:
+            raise RuntimeError("Keithley sweep session is not active.")
+        value = float(source_value)
+        if not math.isfinite(value):
+            raise ValueError("Keithley sweep source value must be finite.")
+        self._set_source_value(instrument, config.sweep_mode, value)
+
+    def sample_sweep(
+        self,
+        *,
+        samples_per_point: int = 1,
+        stop_requested: Callable[[], bool] | None = None,
+        on_sample: Callable[[IVSweepSample], None] | None = None,
+    ) -> list[IVSweepSample]:
+        config = self._sweep_config
+        instrument = self.instrument
+        if config is None or instrument is None:
+            raise RuntimeError("Keithley sweep session is not active.")
+        repeat_count = int(samples_per_point)
+        if repeat_count <= 0 or repeat_count > 10000:
+            raise ValueError("Keithley samples per sweep point must be in range 1..10000.")
+        values = config.sweep_values()
+        total = len(values) * repeat_count
+        samples: list[IVSweepSample] = []
+        for source_value in values:
+            if stop_requested is not None and stop_requested():
+                break
+            self._set_source_value(instrument, config.sweep_mode, source_value)
+            if config.source_delay_s > 0:
+                time.sleep(config.source_delay_s)
+            for _repeat_index in range(repeat_count):
+                if stop_requested is not None and stop_requested():
+                    break
+                raw = instrument.query(":READ?")
+                sample = self._sample_from_reading(
+                    raw,
+                    index=len(samples) + 1,
+                    total=total,
+                    elapsed_s=time.monotonic() - self._sweep_started_at,
+                    source_value=source_value,
+                    sweep_mode=config.sweep_mode,
+                )
+                samples.append(sample)
+                if on_sample is not None:
+                    on_sample(sample)
         return samples
+
+    def end_sweep(self) -> None:
+        config = self._sweep_config
+        instrument = self.instrument
+        self._sweep_config = None
+        if config is None or instrument is None:
+            return
+        if config.output_off_after:
+            try:
+                instrument.write(":OUTP OFF")
+            except Exception:
+                pass
+        if self._owns_instrument:
+            try:
+                instrument.close()
+            except Exception:
+                pass
+            self.instrument = None
 
     def run_constant_voltage_current(
         self,
@@ -519,42 +584,88 @@ class Keithley2450IVRunner:
         stop_requested: Callable[[], bool] | None = None,
         on_sample: Callable[[IVSweepSample], None] | None = None,
     ) -> list[IVSweepSample]:
+        self.begin_constant_voltage_current(config)
+        try:
+            return self.sample_constant_voltage_current(stop_requested=stop_requested, on_sample=on_sample)
+        finally:
+            self.end_constant_voltage_current()
+
+    def begin_constant_voltage_current(self, config: ConstantVoltageCurrentConfig) -> ConstantVoltageCurrentConfig:
+        if self._constant_config is not None or self._sweep_config is not None:
+            raise RuntimeError("Keithley measurement session is already active.")
         normalized = config.normalized()
         instrument = self.instrument or self._open_resource(normalized.resource_name)
         self.instrument = instrument
-        samples: list[IVSweepSample] = []
-        started_at = time.monotonic()
         try:
             self._configure_constant_voltage_current(instrument, normalized)
             instrument.write(":OUTP ON")
-            for index in range(1, normalized.sample_count + 1):
-                if stop_requested is not None and stop_requested():
-                    break
-                raw = instrument.query(":READ?")
-                sample = self._sample_from_reading(
-                    raw,
-                    index=index,
-                    total=normalized.sample_count,
-                    elapsed_s=time.monotonic() - started_at,
-                    source_value=normalized.voltage_v,
-                    sweep_mode=IV_SWEEP_MODE_VOLTAGE,
-                )
-                samples.append(sample)
-                if on_sample is not None:
-                    on_sample(sample)
-        finally:
-            if normalized.output_off_after:
-                try:
-                    instrument.write(":OUTP OFF")
-                except Exception:
-                    pass
+        except Exception:
             if self._owns_instrument:
                 try:
                     instrument.close()
                 except Exception:
                     pass
                 self.instrument = None
+            raise
+        self._constant_config = normalized
+        self._constant_source_value = normalized.voltage_v
+        self._constant_started_at = time.monotonic()
+        return normalized
+
+    def set_constant_voltage(self, voltage_v: float) -> None:
+        if self._constant_config is None or self.instrument is None:
+            raise RuntimeError("Constant-voltage current session is not active.")
+        voltage = float(voltage_v)
+        if not math.isfinite(voltage):
+            raise ValueError("Constant voltage level must be finite.")
+        self.instrument.write(f":SOUR:VOLT:LEV {voltage:.12g}")
+        self._constant_source_value = voltage
+
+    def sample_constant_voltage_current(
+        self,
+        *,
+        stop_requested: Callable[[], bool] | None = None,
+        on_sample: Callable[[IVSweepSample], None] | None = None,
+    ) -> list[IVSweepSample]:
+        config = self._constant_config
+        instrument = self.instrument
+        if config is None or instrument is None:
+            raise RuntimeError("Constant-voltage current session is not active.")
+        samples: list[IVSweepSample] = []
+        for index in range(1, config.sample_count + 1):
+            if stop_requested is not None and stop_requested():
+                break
+            raw = instrument.query(":READ?")
+            sample = self._sample_from_reading(
+                raw,
+                index=index,
+                total=config.sample_count,
+                elapsed_s=time.monotonic() - self._constant_started_at,
+                source_value=self._constant_source_value,
+                sweep_mode=IV_SWEEP_MODE_VOLTAGE,
+            )
+            samples.append(sample)
+            if on_sample is not None:
+                on_sample(sample)
         return samples
+
+    def end_constant_voltage_current(self) -> None:
+        config = self._constant_config
+        instrument = self.instrument
+        self._constant_config = None
+        if config is None or instrument is None:
+            return
+        if config.output_off_after:
+            try:
+                instrument.write(":OUTP OFF")
+            except Exception:
+                pass
+        if self._owns_instrument:
+            try:
+                instrument.close()
+            except Exception:
+                pass
+            self.instrument = None
 
     def _open_resource(self, resource_name: str) -> VisaInstrument:
         try:
@@ -571,26 +682,22 @@ class Keithley2450IVRunner:
         instrument.write(f":ROUT:TERM {'FRON' if config.output_terminal == OUTPUT_TERMINAL_FRONT else 'REAR'}")
         if config.sweep_mode == IV_SWEEP_MODE_VOLTAGE:
             instrument.write(":SOUR:FUNC:MODE VOLT")
-            instrument.write(":SOUR:VOLT:MODE FIX")
-            instrument.write(":SOUR:VOLT:RANG:AUTO 1")
+            instrument.write(":SOUR:VOLT:RANG:AUTO ON")
             instrument.write(':SENS:FUNC "CURR"')
-            instrument.write(f":SENS:CURR:PROT:LEV {config.current_limit_a:.12g}")
+            instrument.write(f":SOUR:VOLT:ILIM {config.current_limit_a:.12g}")
             if config.measure_range is None:
-                instrument.write(":SENS:CURR:RANG:AUTO 1")
+                instrument.write(":SENS:CURR:RANG:AUTO ON")
             else:
-                instrument.write(":SENS:CURR:RANG:AUTO 0")
                 instrument.write(f":SENS:CURR:RANG {config.measure_range:.12g}")
             instrument.write(f":SENS:CURR:NPLC {config.nplc:.12g}")
         else:
             instrument.write(":SOUR:FUNC:MODE CURR")
-            instrument.write(":SOUR:CURR:MODE FIX")
-            instrument.write(":SOUR:CURR:RANG:AUTO 1")
+            instrument.write(":SOUR:CURR:RANG:AUTO ON")
             instrument.write(':SENS:FUNC "VOLT"')
-            instrument.write(f":SENS:VOLT:PROT:LEV {config.voltage_limit_v:.12g}")
+            instrument.write(f":SOUR:CURR:VLIM {config.voltage_limit_v:.12g}")
             if config.measure_range is None:
-                instrument.write(":SENS:VOLT:RANG:AUTO 1")
+                instrument.write(":SENS:VOLT:RANG:AUTO ON")
             else:
-                instrument.write(":SENS:VOLT:RANG:AUTO 0")
                 instrument.write(f":SENS:VOLT:RANG {config.measure_range:.12g}")
             instrument.write(f":SENS:VOLT:NPLC {config.nplc:.12g}")
 
@@ -598,12 +705,14 @@ class Keithley2450IVRunner:
         instrument.write("*RST")
         instrument.write(f":ROUT:TERM {'FRON' if config.output_terminal == OUTPUT_TERMINAL_FRONT else 'REAR'}")
         instrument.write(":SOUR:FUNC:MODE VOLT")
-        instrument.write(":SOUR:VOLT:MODE FIX")
-        instrument.write(":SOUR:VOLT:RANG:AUTO 1")
+        instrument.write(":SOUR:VOLT:RANG:AUTO ON")
         instrument.write(f":SOUR:VOLT:LEV {config.voltage_v:.12g}")
         instrument.write(':SENS:FUNC "CURR"')
-        instrument.write(f":SENS:CURR:PROT:LEV {config.current_limit_a:.12g}")
-        instrument.write(":SENS:CURR:RANG:AUTO 1")
+        instrument.write(f":SOUR:VOLT:ILIM {config.current_limit_a:.12g}")
+        if config.measure_range is None:
+            instrument.write(":SENS:CURR:RANG:AUTO ON")
+        else:
+            instrument.write(f":SENS:CURR:RANG {config.measure_range:.12g}")
         instrument.write(f":SENS:CURR:NPLC {config.nplc:.12g}")
 
     def _set_source_value(self, instrument: VisaInstrument, sweep_mode: str, source_value: float) -> None:

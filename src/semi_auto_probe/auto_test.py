@@ -21,6 +21,7 @@ PROBE_ASSIST_PROBES: tuple[tuple[str, str, str, str, str], ...] = (
 WOBBTEST_FLOW_CARD_HEIGHT_Z = 464
 WOBBTEST_FLOW_CARD_HEIGHT_ZXY = 544
 IV_FLOW_CARD_HEIGHT = 532
+HP6614C_FLOW_CARD_HEIGHT = 610
 
 
 @dataclass(frozen=True)
@@ -209,6 +210,60 @@ AUTOTEST_FLOW_DEFINITIONS: tuple[AutoTestFlowDefinition, ...] = (
             AutoTestFlowParam("resistance_method", "Resistance method", "linear_fit"),
             AutoTestFlowParam("output_off_after", "Output off after", "true"),
             AutoTestFlowParam("plot_layout", "Plot layout", "horizontal"),
+            AutoTestFlowParam("heatmap_values", "Heatmap values", "true"),
+        ),
+    ),
+    AutoTestFlowDefinition(
+        "hp6614c_transfer",
+        "6614C Transfer",
+        "Sweep HP 6614C gate voltage while Keithley holds drain voltage and measures Id.",
+        "#22c55e",
+        (
+            AutoTestFlowParam("hp_resource", "HP VISA", "GPIB0::5::INSTR"),
+            AutoTestFlowParam("keithley_resource", "Keithley VISA", "GPIB0::18::INSTR"),
+            AutoTestFlowParam("output_terminal", "Keithley terminal", "front"),
+            AutoTestFlowParam("device_name", "Device name", "{point}"),
+            AutoTestFlowParam("sweep_start_v", "Vg start V", "0"),
+            AutoTestFlowParam("sweep_end_v", "Vg end V", "2"),
+            AutoTestFlowParam("sweep_points", "Vg points", "41"),
+            AutoTestFlowParam("scan_type", "Vg scan", "forward"),
+            AutoTestFlowParam("bias_values_v", "Vd list V", "-1:-1:-3"),
+            AutoTestFlowParam("drain_current_limit_a", "Id limit A", "1"),
+            AutoTestFlowParam("drain_measure_range", "Id range", "auto"),
+            AutoTestFlowParam("gate_current_limit_a", "Ig limit A", "1e-6"),
+            AutoTestFlowParam("drain_nplc", "Drain NPLC", "1"),
+            AutoTestFlowParam("sample_count", "Samples/Vg", "1"),
+            AutoTestFlowParam("gate_settle_s", "Gate settle s", "0.02"),
+            AutoTestFlowParam("step_delay_s", "Step delay s", "0.02"),
+            AutoTestFlowParam("pre_settle_s", "Pre-settle s", "0.2"),
+            AutoTestFlowParam("post_sweep_pause_s", "Post pause s", "0.2"),
+            AutoTestFlowParam("heatmap_metric", "Heatmap", "vth"),
+            AutoTestFlowParam("heatmap_values", "Heatmap values", "true"),
+        ),
+    ),
+    AutoTestFlowDefinition(
+        "hp6614c_output",
+        "6614C Output",
+        "Sweep Keithley drain voltage while HP 6614C applies each gate-bias value.",
+        "#16a34a",
+        (
+            AutoTestFlowParam("hp_resource", "HP VISA", "GPIB0::5::INSTR"),
+            AutoTestFlowParam("keithley_resource", "Keithley VISA", "GPIB0::18::INSTR"),
+            AutoTestFlowParam("output_terminal", "Keithley terminal", "front"),
+            AutoTestFlowParam("device_name", "Device name", "{point}"),
+            AutoTestFlowParam("sweep_start_v", "Vd start V", "0"),
+            AutoTestFlowParam("sweep_end_v", "Vd end V", "-2"),
+            AutoTestFlowParam("sweep_points", "Vd points", "41"),
+            AutoTestFlowParam("bias_values_v", "Vg list V", "0"),
+            AutoTestFlowParam("drain_current_limit_a", "Id limit A", "1"),
+            AutoTestFlowParam("drain_measure_range", "Id range", "auto"),
+            AutoTestFlowParam("gate_current_limit_a", "Ig limit A", "1e-6"),
+            AutoTestFlowParam("drain_nplc", "Drain NPLC", "1"),
+            AutoTestFlowParam("sample_count", "Samples/Vd", "1"),
+            AutoTestFlowParam("gate_settle_s", "Gate settle s", "0.02"),
+            AutoTestFlowParam("step_delay_s", "Step delay s", "0.02"),
+            AutoTestFlowParam("pre_settle_s", "Pre-settle s", "0.2"),
+            AutoTestFlowParam("post_sweep_pause_s", "Post pause s", "0.2"),
             AutoTestFlowParam("heatmap_values", "Heatmap values", "true"),
         ),
     ),
@@ -2396,6 +2451,8 @@ class AutoTestPanel:
             return int(height * self._flow_zoom)
         if card.type_id == "iv":
             return int(IV_FLOW_CARD_HEIGHT * self._flow_zoom)
+        if card.type_id in {"hp6614c_transfer", "hp6614c_output"}:
+            return int(HP6614C_FLOW_CARD_HEIGHT * self._flow_zoom)
         if card.type_id in {"b1500_transfer", "b1500_output"}:
             return int(585 * self._flow_zoom)
         definition = autotest_flow_definitions_by_type()[card.type_id]
@@ -2702,6 +2759,9 @@ class AutoTestPanel:
         if card.type_id == "wobb_test":
             self._build_wobb_test_flow_card_params(frame, card, definition)
             return
+        if card.type_id in {"hp6614c_transfer", "hp6614c_output"}:
+            self._build_hp6614c_flow_card_params(frame, card, definition)
+            return
         if card.type_id in {"b1500_transfer", "b1500_output"}:
             self._build_b1500_flow_card_params(frame, card, definition)
             return
@@ -2960,6 +3020,128 @@ class AutoTestPanel:
             else:
                 entry(electrical, key, row + 1, column, width=10, padx=(0, 6 if column < 2 else 0))
 
+    def _build_hp6614c_flow_card_params(self, frame: tk.Frame, card: AutoTestFlowCard, definition: AutoTestFlowDefinition) -> None:
+        defaults = {param.key: param.default for param in definition.parameters}
+        params = tk.Frame(frame, bg=self.colors["surface"], padx=10, pady=2)
+        params.grid(row=2, column=1, columnspan=4, sticky="nsew")
+        params.columnconfigure(0, weight=1)
+
+        def group(title: str, row: int) -> tk.LabelFrame:
+            section = tk.LabelFrame(
+                params,
+                text=title,
+                bg=self.colors["surface"],
+                fg=self.colors["muted"],
+                bd=0,
+                highlightthickness=1,
+                highlightbackground=self.colors["border"],
+                padx=8,
+                pady=5,
+                font=("Segoe UI Semibold", 8),
+            )
+            section.grid(row=row, column=0, sticky="ew", pady=(0, 7))
+            return section
+
+        def entry(parent: tk.Widget, key: str, row: int, column: int, *, width: int = 10, padx: tuple[int, int] = (0, 6)) -> tk.Entry:
+            var = self._flow_card_param_var(card, key, defaults.get(key, ""))
+            widget = tk.Entry(
+                parent,
+                textvariable=var,
+                bg=self.colors["input"],
+                fg=self.colors["text"],
+                insertbackground=self.colors["accent"],
+                relief="flat",
+                highlightthickness=1,
+                highlightbackground=self.colors["border"],
+                highlightcolor=self.colors["border_focus"],
+                font=("Cascadia Mono", 9),
+                width=width,
+            )
+            widget.grid(row=row, column=column, sticky="ew", padx=padx, pady=(2, 0))
+            return widget
+
+        def combo(parent: tk.Widget, key: str, values: tuple[str, ...], row: int, column: int, *, width: int = 10, padx: tuple[int, int] = (0, 6)) -> ttk.Combobox:
+            var = self._flow_card_param_var(card, key, defaults.get(key, ""))
+            widget = ttk.Combobox(parent, textvariable=var, values=values, state="readonly", width=width)
+            widget.grid(row=row, column=column, sticky="ew", padx=padx, pady=(2, 0))
+            return widget
+
+        identity = group("Instruments", 0)
+        identity.columnconfigure((0, 1, 2, 3), weight=1, uniform=f"hp6614c_identity_{card.card_id}")
+        for column, (key, label) in enumerate(
+            (
+                ("hp_resource", "HP VISA"),
+                ("keithley_resource", "Keithley VISA"),
+                ("output_terminal", "Terminal"),
+                ("device_name", "Device"),
+            )
+        ):
+            ttk.Label(identity, text=label, style="Muted.TLabel").grid(row=0, column=column, sticky="w", padx=(0, 6))
+            if key == "output_terminal":
+                combo(identity, key, ("rear", "front"), 1, column, width=10, padx=(0, 6 if column < 3 else 0))
+            else:
+                entry(identity, key, 1, column, width=14, padx=(0, 6 if column < 3 else 0))
+
+        sweep = group("Sweep", 1)
+        sweep.columnconfigure((0, 1, 2, 3, 4), weight=1, uniform=f"hp6614c_sweep_{card.card_id}")
+        axis_label = "Vg" if card.type_id == "hp6614c_transfer" else "Vd"
+        bias_label = "Vd list" if card.type_id == "hp6614c_transfer" else "Vg list"
+        sweep_fields = [
+            ("sweep_start_v", f"{axis_label} start V"),
+            ("sweep_end_v", f"{axis_label} end V"),
+            ("sweep_points", f"{axis_label} points"),
+        ]
+        if card.type_id == "hp6614c_transfer":
+            sweep_fields.append(("scan_type", "Vg scan"))
+        sweep_fields.append(("bias_values_v", f"{bias_label} V"))
+        for column, (key, label) in enumerate(sweep_fields):
+            ttk.Label(sweep, text=label, style="Muted.TLabel").grid(row=0, column=column, sticky="w", padx=(0, 6))
+            if key == "scan_type":
+                combo(sweep, key, ("forward", "backward", "double"), 1, column, width=10, padx=(0, 6 if column < len(sweep_fields) - 1 else 0))
+            else:
+                entry(sweep, key, 1, column, width=12, padx=(0, 6 if column < len(sweep_fields) - 1 else 0))
+
+        protection = group("Compliance and Acquisition", 2)
+        protection.columnconfigure((0, 1, 2, 3, 4), weight=1, uniform=f"hp6614c_protect_{card.card_id}")
+        sample_label = "Samples/Vg" if card.type_id == "hp6614c_transfer" else "Samples/Vd"
+        for column, (key, label) in enumerate(
+            (
+                ("drain_current_limit_a", "Id limit A"),
+                ("drain_measure_range", "Id range"),
+                ("gate_current_limit_a", "Ig limit A"),
+                ("drain_nplc", "Drain NPLC"),
+                ("sample_count", sample_label),
+            )
+        ):
+            ttk.Label(protection, text=label, style="Muted.TLabel").grid(row=0, column=column, sticky="w", padx=(0, 6))
+            if key == "drain_measure_range":
+                combo(protection, key, self._flow_param_choices("measure_range"), 1, column, width=10, padx=(0, 6 if column < 4 else 0))
+            else:
+                entry(protection, key, 1, column, width=10, padx=(0, 6 if column < 4 else 0))
+
+        timing = group("Timing and Output", 3)
+        timing.columnconfigure((0, 1, 2, 3), weight=1, uniform=f"hp6614c_timing_{card.card_id}")
+        for column, (key, label) in enumerate(
+            (
+                ("pre_settle_s", "Pre-settle s"),
+                ("gate_settle_s", "Gate settle s"),
+                ("step_delay_s", "Step delay s"),
+                ("post_sweep_pause_s", "Post pause s"),
+            )
+        ):
+            ttk.Label(timing, text=label, style="Muted.TLabel").grid(row=0, column=column, sticky="w", padx=(0, 6))
+            entry(timing, key, 1, column, width=10, padx=(0, 0 if column == 3 else 6))
+
+        display = group("Display", 4)
+        display_fields = [("heatmap_values", "Values")]
+        if card.type_id == "hp6614c_transfer":
+            display_fields.insert(0, ("heatmap_metric", "Heatmap metric"))
+        display.columnconfigure(tuple(range(len(display_fields))), weight=1, uniform=f"hp6614c_display_{card.card_id}")
+        for column, (key, label) in enumerate(display_fields):
+            ttk.Label(display, text=label, style="Muted.TLabel").grid(row=0, column=column, sticky="w", padx=(0, 6))
+            values = self._flow_param_choices(key)
+            combo(display, key, values, 1, column, width=16 if key == "heatmap_metric" else 10, padx=(0, 0 if column == len(display_fields) - 1 else 6))
+
     def _build_b1500_flow_card_params(self, frame: tk.Frame, card: AutoTestFlowCard, definition: AutoTestFlowDefinition) -> None:
         defaults = {param.key: param.default for param in definition.parameters}
         params = tk.Frame(frame, bg=self.colors["surface"], padx=10, pady=2)
@@ -3091,6 +3273,7 @@ class AutoTestPanel:
             "measure_range": ("auto", "1e-9", "1e-8", "1e-7", "1e-6", "1e-5", "1e-4", "1e-3", "1e-2", "0.1", "1", "2", "20", "200"),
             "plot_layout": ("horizontal", "vertical"),
             "heatmap_values": ("true", "false"),
+            "heatmap_metric": ("vth", "ss", "on_off_ratio"),
             "mode": ("Z", "Z-XY"),
             "z_step_um": ("0.5", "1", "2", "4", "8"),
             "xy_pattern": ("square", "corners", "spiral"),
@@ -3130,6 +3313,20 @@ class AutoTestPanel:
                 f"{card.params.get('sweep_mode', 'voltage')} {card.params.get('scan_type', card.params.get('bidirectional', 'single'))} | "
                 f"0..{card.params.get('stop', '1')} step {card.params.get('step', '0.05')} | "
                 f"{card.params.get('plot_layout', 'horizontal')} plot"
+            )
+        if card.type_id in {"hp6614c_transfer", "hp6614c_output"}:
+            axis = "Vg" if card.type_id == "hp6614c_transfer" else "Vd"
+            bias = "Vd" if card.type_id == "hp6614c_transfer" else "Vg"
+            scan = f" {card.params.get('scan_type', 'forward')}" if card.type_id == "hp6614c_transfer" else ""
+            return (
+                f"HP {card.params.get('hp_resource', 'GPIB0::5::INSTR')} + "
+                f"K2450 {card.params.get('keithley_resource', 'GPIB0::18::INSTR')} {card.params.get('output_terminal', 'rear')} | "
+                f"{axis}{scan} {card.params.get('sweep_start_v', '0')}..{card.params.get('sweep_end_v', '0')} V, "
+                f"{card.params.get('sweep_points', '41')} pts | "
+                f"{bias}: {card.params.get('bias_values_v', '')} | "
+                f"Id range {card.params.get('drain_measure_range', 'auto')} | "
+                f"NPLC {card.params.get('drain_nplc', '1')}"
+                + (f" | heatmap {card.params.get('heatmap_metric', 'vth')}" if card.type_id == "hp6614c_transfer" else "")
             )
         if card.type_id in {"b1500_transfer", "b1500_output"}:
             axis = "Vg" if card.type_id == "b1500_transfer" else "Vd"

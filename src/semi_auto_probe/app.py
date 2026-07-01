@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import queue
 import csv
 import hmac
@@ -12,6 +13,7 @@ import threading
 import time
 import tkinter as tk
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -108,7 +110,7 @@ from .edge_trace_panel import (
 )
 from .gds_edge_trace import EdgeTracePlan, EdgeTracePathPoint
 from .focusmap_3d import create_focusmap_3d_view
-from .gds_stage_mapper import GDSStageMapperPanel, stage_move_plan_from_um, stage_xyz_move_plan_from_um
+from .gds_stage_mapper import GDSStageMapperPanel, LAYOUTBOND_AUTOSAVE_FILENAME, stage_move_plan_from_um, stage_xyz_move_plan_from_um
 from .img_matrix import ImgMatrixPanel, ImgMatrixPoint, ImgMatrixSettings, generate_imgmatrix_points, session_manifest_path
 from .img_stitch import (
     StitchEdgeQuality,
@@ -127,6 +129,8 @@ from .img_stitch import (
     z_stack_positions,
 )
 from .keithley2450 import (
+    ConstantVoltageCurrentConfig,
+    IV_SWEEP_MODE_VOLTAGE,
     IVSweepConfig,
     IVSweepSample,
     IVSweepStatistics,
@@ -135,6 +139,18 @@ from .keithley2450 import (
     constant_voltage_current_config_from_params,
     iv_sweep_configs_from_params,
     parse_bool,
+)
+from .hp6614c import (
+    HP6614C_HEATMAP_ON_OFF_RATIO,
+    HP6614C_TEST_OUTPUT,
+    HP6614C_TEST_TRANSFER,
+    HP6614CSweepConfig,
+    HP6614CVoltageConfig,
+    HP6614CRunner,
+    HP6614CTransferAnalysis,
+    analyze_hp6614c_transfer_records,
+    hp6614c_transfer_heatmap_label,
+    hp6614c_sweep_config_from_params,
 )
 from .logging_utils import colorize_hex_frame, configure_logging, print_startup_banner
 from .protocol import COMM_TEST_COMMAND, FUNCTION_READ_POSITION, RESPONSE_HEAD, Axis, AxisPosition, IoStatus, hex_bytes, parse_axis_position_response
@@ -869,6 +885,415 @@ class B1500PlotWindow:
         self.canvas.draw_idle()
 
 
+class HP6614CPlotWindow:
+    def __init__(self, parent: tk.Tk, colors: dict[str, str]) -> None:
+        self.parent = parent
+        self.colors = colors
+        self.records_by_test: dict[str, list[dict[str, object]]] = {
+            HP6614C_TEST_TRANSFER: [],
+            HP6614C_TEST_OUTPUT: [],
+        }
+        self.records = self.records_by_test[HP6614C_TEST_TRANSFER]
+        self.test_type = HP6614C_TEST_TRANSFER
+        self.current_point_name: str | None = None
+        self.combined_plot: bool | None = None
+        self.curve_colors: dict[float, object] = {}
+        self.next_curve_color_index = 0
+        self.heatmap_values: dict[tuple[int, int], float] = {}
+        self.heatmap_values_by_key: dict[tuple[str, str], dict[tuple[int, int], float]] = {}
+        self.heatmap_rows = 1
+        self.heatmap_cols = 1
+        self.heatmap_label = "Vth (V)"
+        self.heatmap_metric = "vth"
+        self.heatmap_key = (HP6614C_TEST_TRANSFER, "vth")
+        self.show_heatmap_values = True
+        self.active_cell: tuple[int, int] | None = None
+        self.heatmap_colorbar = None
+        self.window = tk.Toplevel(parent)
+        self.window.title("AutoTest 6614C Curves")
+        self.window.geometry("900x620")
+        self.window.configure(bg=colors["bg"])
+        self.window.protocol("WM_DELETE_WINDOW", self.hide)
+
+        header = ttk.Frame(self.window, style="App.TFrame", padding=(14, 12, 14, 8))
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        self.title_var = tk.StringVar(value="6614C curves")
+        self.status_var = tk.StringVar(value="Waiting")
+        ttk.Label(header, textvariable=self.title_var, style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header, textvariable=self.status_var, style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(3, 0))
+
+        plot_frame = ttk.Frame(self.window, style="Panel.TFrame", padding=8)
+        plot_frame.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        plot_frame.columnconfigure(0, weight=1)
+        plot_frame.rowconfigure(0, weight=1)
+        self.window.columnconfigure(0, weight=1)
+        self.window.rowconfigure(1, weight=1)
+
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.figure import Figure
+
+        self.figure = Figure(figsize=(9.0, 5.2), dpi=100, facecolor=colors["surface"])
+        self._configure_plot_layout(False)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
+        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self._draw()
+
+    def _style_axes(self, axes) -> None:
+        axes.set_facecolor(self.colors["surface_2"])
+        axes.tick_params(colors=self.colors["muted"])
+        axes.grid(True, color=self.colors["border"], alpha=0.34)
+        for spine in axes.spines.values():
+            spine.set_color(self.colors["border"])
+
+    def hide(self) -> None:
+        self.window.withdraw()
+
+    def show(self) -> None:
+        self.window.deiconify()
+        self.window.lift()
+
+    def _configure_plot_layout(self, combined_plot: bool) -> None:
+        combined = bool(combined_plot)
+        if self.combined_plot == combined and hasattr(self, "heatmap_axes"):
+            return
+        if hasattr(self, "heatmap_colorbar"):
+            self._remove_heatmap_colorbar()
+        self.figure.clear()
+        self.combined_plot = combined
+        if combined:
+            self.transfer_axes = self.figure.add_subplot(131)
+            self.transfer_linear_axes = self.transfer_axes.twinx()
+            self.output_axes = self.figure.add_subplot(132)
+            self.heatmap_axes = self.figure.add_subplot(133)
+            self.axes = self.transfer_axes
+            self.linear_axes = self.transfer_linear_axes
+            if hasattr(self, "window"):
+                self.window.geometry("1320x620")
+        else:
+            self.axes = self.figure.add_subplot(121)
+            self.linear_axes = self.axes.twinx()
+            self.heatmap_axes = self.figure.add_subplot(122)
+            self.transfer_axes = None
+            self.transfer_linear_axes = None
+            self.output_axes = None
+            if hasattr(self, "window"):
+                self.window.geometry("900x620")
+
+    def start(
+        self,
+        point_name: str,
+        config: HP6614CSweepConfig,
+        *,
+        row: int | None = None,
+        col: int | None = None,
+        rows: int | None = None,
+        cols: int | None = None,
+        reset_heatmap: bool = False,
+        combined_plot: bool = False,
+    ) -> None:
+        layout_changed = self.combined_plot != bool(combined_plot)
+        new_point = self.current_point_name != point_name
+        self._configure_plot_layout(combined_plot)
+        if combined_plot:
+            if layout_changed or new_point:
+                for records in self.records_by_test.values():
+                    records.clear()
+                self.curve_colors.clear()
+                self.next_curve_color_index = 0
+            self.records = self.records_by_test[config.test_type]
+            self.records.clear()
+        else:
+            for records in self.records_by_test.values():
+                records.clear()
+            self.records = self.records_by_test[config.test_type]
+            self.curve_colors.clear()
+            self.next_curve_color_index = 0
+        self.current_point_name = point_name
+        self.test_type = config.test_type
+        self.heatmap_metric = config.heatmap_metric if config.test_type == HP6614C_TEST_TRANSFER else "max_abs_id"
+        self.heatmap_key = (config.test_type, self.heatmap_metric)
+        self.heatmap_values = self.heatmap_values_by_key.setdefault(self.heatmap_key, {})
+        self.show_heatmap_values = bool(config.heatmap_values)
+        self.active_cell = (row, col) if row is not None and col is not None else None
+        if rows is not None and cols is not None:
+            self.heatmap_rows = max(1, int(rows))
+            self.heatmap_cols = max(1, int(cols))
+        if reset_heatmap:
+            self.heatmap_values.clear()
+        self.heatmap_label = hp6614c_transfer_heatmap_label(self.heatmap_metric) if config.test_type == HP6614C_TEST_TRANSFER else "Max |Id| (A)"
+        label = "Transfer + Output" if combined_plot else ("Transfer" if config.test_type == HP6614C_TEST_TRANSFER else "Output")
+        self.title_var.set(f"6614C {label}: {point_name}")
+        self.status_var.set(config.summary())
+        self._draw()
+        self.show()
+
+    def add_sample(self, record: dict[str, object]) -> None:
+        self.records.append(record)
+        test_label = "Transfer" if self.test_type == HP6614C_TEST_TRANSFER else "Output"
+        self.status_var.set(
+            f"{test_label} curve {record.get('curve_index')}/{record.get('curve_total')} | "
+            f"Vg={float(record.get('gate_voltage_v', math.nan)):.6g} V | "
+            f"Vd={float(record.get('drain_voltage_v', math.nan)):.6g} V | "
+            f"Id={float(record.get('drain_current_a', math.nan)):.6g} A"
+        )
+        self._draw()
+        self.show()
+
+    def finish(self, message: str, analysis: dict[str, object] | None = None) -> None:
+        parameter_text = self._update_heatmap_from_completed_point(analysis)
+        self.status_var.set(f"{message} {parameter_text}".strip())
+        self._draw()
+        self.show()
+
+    @staticmethod
+    def _current_tick_label(value: float, *, include_zero: bool = True) -> str:
+        if not math.isfinite(float(value)):
+            return ""
+        value = float(value)
+        if value == 0:
+            return "0" if include_zero else ""
+        sign = "-" if value < 0 else ""
+        magnitude = abs(value)
+        prefixes = (
+            (-15, "f"),
+            (-12, "p"),
+            (-9, "n"),
+            (-6, "u"),
+            (-3, "m"),
+            (0, ""),
+            (3, "k"),
+        )
+        exponent = int(math.floor(math.log10(magnitude) / 3.0) * 3)
+        exponent = max(-15, min(3, exponent))
+        prefix = dict(prefixes)[exponent]
+        scaled = magnitude / (10**exponent)
+        if scaled >= 100:
+            text = f"{scaled:.0f}"
+        elif scaled >= 10:
+            text = f"{scaled:.1f}".rstrip("0").rstrip(".")
+        else:
+            text = f"{scaled:.2f}".rstrip("0").rstrip(".")
+        return f"{sign}{text}{(' ' + prefix) if prefix else ''}A"
+
+    def _format_current_axes_ticks(self, axes, linear_axes=None) -> None:
+        from matplotlib.ticker import FuncFormatter, NullFormatter
+
+        axes.yaxis.set_major_formatter(FuncFormatter(lambda value, _pos: self._current_tick_label(value)))
+        axes.yaxis.set_minor_formatter(NullFormatter())
+        axes.yaxis.get_offset_text().set_visible(False)
+        if linear_axes is not None:
+            linear_axes.yaxis.set_major_formatter(FuncFormatter(lambda value, _pos: self._current_tick_label(value)))
+            linear_axes.yaxis.get_offset_text().set_visible(False)
+
+    def _curve_color_for_bias(self, bias: float):
+        key = round(float(bias), 9)
+        color = self.curve_colors.get(key)
+        if color is not None:
+            return color
+        palette = (
+            "#38bdf8",
+            "#34d399",
+            "#facc15",
+            "#f472b6",
+            "#a78bfa",
+            "#fb7185",
+            "#22d3ee",
+            "#fb923c",
+            "#84cc16",
+            "#60a5fa",
+        )
+        color = palette[self.next_curve_color_index % len(palette)]
+        self.next_curve_color_index += 1
+        self.curve_colors[key] = color
+        return color
+
+    def _update_heatmap_from_completed_point(self, analysis: dict[str, object] | None = None) -> str:
+        if self.active_cell is None or not self.records:
+            return ""
+        if self.test_type == HP6614C_TEST_TRANSFER:
+            completed = analysis or analyze_hp6614c_transfer_records(self.records, self.heatmap_metric).to_dict()
+            value = completed.get("mean_value")
+            self.heatmap_label = hp6614c_transfer_heatmap_label(self.heatmap_metric)
+            curves = completed.get("curves")
+            curve_parts: list[str] = []
+            if isinstance(curves, list):
+                for curve in curves:
+                    if not isinstance(curve, dict) or not _finite_number(curve.get("drain_voltage_v")) or not _finite_number(curve.get("value")):
+                        continue
+                    curve_parts.append(f"Vd={float(curve['drain_voltage_v']):g} V: {float(curve['value']):.6g}")
+            parameter_text = f"{self.heatmap_label}: " + ", ".join(curve_parts)
+            if len(curve_parts) > 1 and _finite_number(value):
+                parameter_text += f", mean: {float(value):.6g}"
+        else:
+            currents = [abs(float(record.get("drain_current_a"))) for record in self.records if _finite_number(record.get("drain_current_a"))]
+            value = max(currents) if currents else None
+            self.heatmap_label = "Max |Id| (A)"
+            parameter_text = ""
+        if value is None or not math.isfinite(float(value)):
+            return parameter_text
+        self.heatmap_values[(int(self.active_cell[0]), int(self.active_cell[1]))] = float(value)
+        return parameter_text
+
+    def _draw_empty_heatmap(self) -> None:
+        self._remove_heatmap_colorbar()
+        self.heatmap_axes.clear()
+        self._style_axes(self.heatmap_axes)
+        self.heatmap_axes.set_title(self.heatmap_label, color=self.colors["text"])
+        self.heatmap_axes.text(0.5, 0.5, "No heatmap values", ha="center", va="center", color=self.colors["muted"], transform=self.heatmap_axes.transAxes)
+        self.heatmap_axes.set_xticks([])
+        self.heatmap_axes.set_yticks([])
+
+    def _draw_heatmap(self) -> None:
+        self._remove_heatmap_colorbar()
+        if not self.heatmap_values:
+            self._draw_empty_heatmap()
+            return
+        matrix = [[math.nan for _col in range(self.heatmap_cols)] for _row in range(self.heatmap_rows)]
+        finite_values: list[float] = []
+        positive_values: list[float] = []
+        for (row, col), value in self.heatmap_values.items():
+            if 0 <= row < self.heatmap_rows and 0 <= col < self.heatmap_cols and math.isfinite(float(value)):
+                matrix[row][col] = float(value)
+                finite_values.append(float(value))
+                if float(value) > 0:
+                    positive_values.append(float(value))
+        self.heatmap_axes.clear()
+        self._style_axes(self.heatmap_axes)
+        self.heatmap_axes.set_title(self.heatmap_label, color=self.colors["text"])
+        if not finite_values:
+            self._draw_empty_heatmap()
+            return
+        norm = None
+        use_log = self.heatmap_metric in {HP6614C_HEATMAP_ON_OFF_RATIO} or self.test_type == HP6614C_TEST_OUTPUT
+        if use_log and positive_values:
+            from matplotlib.colors import LogNorm
+
+            vmin = min(positive_values)
+            vmax = max(positive_values)
+            if vmin == vmax:
+                vmin = max(vmin / 10.0, 1e-30)
+                vmax *= 10.0
+            norm = LogNorm(vmin=vmin, vmax=vmax)
+        image = self.heatmap_axes.imshow(matrix, cmap="viridis", interpolation="nearest", origin="lower", norm=norm)
+        image.cmap.set_bad(color=self.colors["surface_3"])
+        self.heatmap_colorbar = self.figure.colorbar(image, ax=self.heatmap_axes, fraction=0.046, pad=0.04)
+        self.heatmap_colorbar.set_label(self.heatmap_label, color=self.colors["text"])
+        self.heatmap_colorbar.ax.tick_params(colors=self.colors["muted"])
+        self.heatmap_colorbar.outline.set_edgecolor(self.colors["border"])
+        self.heatmap_axes.set_xticks(range(self.heatmap_cols))
+        self.heatmap_axes.set_yticks(range(self.heatmap_rows))
+        self.heatmap_axes.set_xlabel("Column", color=self.colors["text"])
+        self.heatmap_axes.set_ylabel("Row", color=self.colors["text"])
+        if self.show_heatmap_values:
+            for (row, col), value in self.heatmap_values.items():
+                if 0 <= row < self.heatmap_rows and 0 <= col < self.heatmap_cols and math.isfinite(float(value)):
+                    self.heatmap_axes.text(col, row, f"{float(value):.3g}", ha="center", va="center", color="#f8fafc", fontsize=8)
+        if self.active_cell is not None:
+            row, col = self.active_cell
+            if 0 <= row < self.heatmap_rows and 0 <= col < self.heatmap_cols:
+                self.heatmap_axes.plot(col, row, marker="s", markersize=18, markerfacecolor="none", markeredgecolor="#facc15", markeredgewidth=1.5)
+
+    def _remove_heatmap_colorbar(self) -> None:
+        if self.heatmap_colorbar is None:
+            return
+        try:
+            self.heatmap_colorbar.remove()
+        except Exception:
+            pass
+        self.heatmap_colorbar = None
+
+    def _draw(self) -> None:
+        if self.combined_plot:
+            assert self.transfer_axes is not None
+            assert self.transfer_linear_axes is not None
+            assert self.output_axes is not None
+            self._draw_curve_panel(
+                self.transfer_axes,
+                self.transfer_linear_axes,
+                HP6614C_TEST_TRANSFER,
+                self.records_by_test[HP6614C_TEST_TRANSFER],
+            )
+            self._draw_curve_panel(
+                self.output_axes,
+                None,
+                HP6614C_TEST_OUTPUT,
+                self.records_by_test[HP6614C_TEST_OUTPUT],
+            )
+        else:
+            self._draw_curve_panel(self.axes, self.linear_axes, self.test_type, self.records)
+        self._draw_heatmap()
+        self.figure.tight_layout()
+        self.canvas.draw_idle()
+
+    def _draw_curve_panel(self, axes, linear_axes, test_type: str, records: list[dict[str, object]]) -> None:
+        axes.clear()
+        self._style_axes(axes)
+        if linear_axes is not None:
+            linear_axes.clear()
+            self._style_axes(linear_axes)
+        is_transfer = test_type == HP6614C_TEST_TRANSFER
+        axes.set_yscale("log" if is_transfer else "linear")
+        if is_transfer:
+            assert linear_axes is not None
+            self._format_current_axes_ticks(linear_axes)
+        else:
+            self._format_current_axes_ticks(axes)
+        axes.set_title("6614C Transfer: Id-Vg" if is_transfer else "6614C Output: Id-Vd", color=self.colors["text"])
+        axes.set_xlabel("Vg (V)" if is_transfer else "Vd (V)", color=self.colors["text"])
+        axes.set_ylabel("|Id| log (A)" if is_transfer else "Id (A)", color=self.colors["text"])
+        axes.yaxis.set_label_position("left")
+        axes.yaxis.tick_left()
+        if is_transfer:
+            assert linear_axes is not None
+            linear_axes.set_ylabel("|Id| linear (A)", color=self.colors["text"])
+            linear_axes.yaxis.set_label_position("right")
+            linear_axes.yaxis.tick_right()
+            linear_axes.tick_params(axis="y", colors=self.colors["muted"], labelright=True, labelleft=False)
+            linear_axes.spines["right"].set_visible(True)
+        elif linear_axes is not None:
+            linear_axes.set_ylabel("")
+            linear_axes.set_yticks([])
+            linear_axes.tick_params(axis="y", labelright=False, labelleft=False)
+            linear_axes.spines["right"].set_visible(False)
+
+        if not records:
+            label = "No transfer curves" if is_transfer else "No output curves"
+            axes.text(0.5, 0.5, label, ha="center", va="center", color=self.colors["muted"], transform=axes.transAxes)
+            return
+
+        groups: dict[float, list[dict[str, object]]] = {}
+        group_key = "drain_voltage_v" if is_transfer else "gate_voltage_v"
+        for record in records:
+            if _finite_number(record.get(group_key)):
+                groups.setdefault(round(float(record[group_key]), 9), []).append(record)
+
+        for bias, records in sorted(groups.items()):
+            color = self._curve_color_for_bias(bias)
+            if is_transfer:
+                records = sorted(records, key=lambda item: float(item["gate_voltage_v"]))
+                x_values = [float(item["gate_voltage_v"]) for item in records]
+                id_values = [max(abs(float(item["drain_current_a"])), 1e-15) for item in records]
+                axes.plot(x_values, id_values, color=color, marker="o", markersize=3, linewidth=1.4, label=f"Vd={bias:g} V log")
+                assert linear_axes is not None
+                linear_axes.plot(x_values, id_values, color=color, linestyle="--", linewidth=1.1, alpha=0.82, label=f"Vd={bias:g} V linear")
+            else:
+                records = sorted(records, key=lambda item: float(item["drain_voltage_v"]))
+                x_values = [float(item["drain_voltage_v"]) for item in records]
+                id_values = [float(item["drain_current_a"]) for item in records]
+                axes.plot(x_values, id_values, color=color, marker="o", markersize=3, linewidth=1.4, label=f"Vg={bias:g} V")
+
+        if is_transfer:
+            handles, labels = axes.get_legend_handles_labels()
+            assert linear_axes is not None
+            linear_handles, linear_labels = linear_axes.get_legend_handles_labels()
+            handles.extend(linear_handles)
+            labels.extend(linear_labels)
+            axes.legend(handles, labels, loc="best", frameon=False, fontsize=8, labelcolor=self.colors["text"])
+        else:
+            axes.legend(loc="best", frameon=False, fontsize=8, labelcolor=self.colors["text"])
+
+
 def _finite_number(value: object) -> bool:
     try:
         return math.isfinite(float(value))
@@ -876,8 +1301,16 @@ def _finite_number(value: object) -> bool:
         return False
 
 
+def _actual_gate_voltage_from_reading(programmed_v: float, readback_v: float | None) -> float:
+    try:
+        value = float(readback_v)
+    except (TypeError, ValueError):
+        return float(programmed_v)
+    return value if math.isfinite(value) else float(programmed_v)
+
+
 class ProbeApp(tk.Tk):
-    def __init__(self) -> None:
+    def __init__(self, *, restore_last: bool = False) -> None:
         super().__init__()
         self.title("Semi Auto Probe")
         self.window_icon: tk.PhotoImage | None = None
@@ -899,6 +1332,7 @@ class ProbeApp(tk.Tk):
         self.iv_plot_window: IVPlotWindow | None = None
         self.wobb_test_plot_window: WobbTestPlotWindow | None = None
         self.b1500_plot_window: B1500PlotWindow | None = None
+        self.hp6614c_plot_window: HP6614CPlotWindow | None = None
         self.edge_trace_panel: EdgeTracePanel | None = None
         self.agent_panel: AgentPanel | None = None
         self.agent_function_spec_path = Path.cwd() / "docs" / "agent-function-spec.md"
@@ -1203,6 +1637,8 @@ class ProbeApp(tk.Tk):
         self.start_camera()
         self.after(300, self.connect_and_test_serial)
         self.after(RESULT_POLL_INTERVAL_MS, self._poll_result_queue)
+        if restore_last:
+            self.after_idle(self.restore_last_focusmap_layoutmap)
 
     def _set_window_icon(self) -> None:
         icon_path = Path(__file__).parent / "assets" / "logo-system-diagram.png"
@@ -1882,6 +2318,43 @@ class ProbeApp(tk.Tk):
 
     def _autotest_layoutmap_ready(self) -> bool:
         return self.gds_stage_mapper_panel is not None and self.gds_stage_mapper_panel.mapper is not None
+
+    def restore_last_focusmap_layoutmap(self) -> None:
+        restored: list[str] = []
+        skipped: list[str] = []
+
+        focusmap_path = Path.cwd() / FOCUSMAP_AUTOSAVE_FILENAME
+        if focusmap_path.exists():
+            if self.load_af_plane_results_from_path(focusmap_path):
+                restored.append("FocusMap")
+        else:
+            skipped.append(focusmap_path.name)
+
+        layoutmap_path = Path.cwd() / LAYOUTBOND_AUTOSAVE_FILENAME
+        if layoutmap_path.exists() and self.gds_stage_mapper_panel is not None:
+            try:
+                self.gds_stage_mapper_panel.load_calibration_from_path(layoutmap_path, show_missing_gds_warning=False)
+            except Exception as exc:
+                logger.warning("LayoutMap calibration import failed from %s: %s", layoutmap_path, exc)
+                self.gds_stage_mapper_panel.motion_status_var.set(f"LayoutMap import failed: {exc}")
+            else:
+                restored.append("LayoutMap")
+        else:
+            skipped.append(layoutmap_path.name)
+
+        if get_sample_plane_model() is not None:
+            self.main_focusmap_plane_var.set(True)
+            self._update_main_focusmap_z_display()
+            if self.gds_stage_mapper_panel is not None:
+                self.gds_stage_mapper_panel.clear_coordinate_edits()
+
+        self._sync_layout_dependent_panels()
+        if restored:
+            self.status_var.set(f"Startup restored last {', '.join(restored)} context.")
+            logger.info("Startup restored last context: %s.", ", ".join(restored))
+            return
+        if skipped:
+            self.status_var.set(f"Startup restore skipped; missing {', '.join(skipped)}.")
 
     def _sync_layout_dependent_panels(self) -> None:
         self._sync_imgmatrix_from_layoutbond()
@@ -6669,6 +7142,12 @@ class ProbeApp(tk.Tk):
         )
         if not path:
             return
+        self.load_af_plane_results_from_path(Path(path))
+
+    def load_af_plane_results_from_path(self, path: Path) -> bool:
+        if self.af_plane_running:
+            self.af_plane_status_var.set("Stop mapping before loading results.")
+            return False
         try:
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
@@ -6676,7 +7155,8 @@ class ProbeApp(tk.Tk):
             mesh_points, records, model, mesh_settings = parse_focusmap_result_payload(payload)
         except Exception as exc:
             self.af_plane_status_var.set(f"Import failed: {exc}")
-            return
+            logger.warning("FocusMap import failed from %s: %s", path, exc)
+            return False
         self._apply_af_plane_mesh_settings(mesh_settings)
         self.af_plane_mesh_points = mesh_points
         self.af_plane_results = records or [self._new_af_plane_record(point) for point in mesh_points]
@@ -6696,6 +7176,7 @@ class ProbeApp(tk.Tk):
         self._refresh_af_plane_table()
         self._draw_focusmap_all()
         self.af_plane_status_var.set(f"Imported {Path(path).name}.")
+        return True
 
     def _apply_af_plane_mesh_settings(self, settings: dict[str, object]) -> None:
         self.af_plane_mesh_type_var.set(str(settings.get("mesh_type", self.af_plane_mesh_type_var.get())))
@@ -8121,7 +8602,7 @@ class ProbeApp(tk.Tk):
     @staticmethod
     def _autotest_requires_session_dir(settings: AutoTestSettings) -> bool:
         flow_types = {step.type_id for step in settings.measurement_flow}
-        return "photo" in settings.measurement_steps or bool({"photo", "iv", "wobb_test", "b1500_transfer", "b1500_output"} & flow_types)
+        return "photo" in settings.measurement_steps or bool({"photo", "iv", "wobb_test", "hp6614c_transfer", "hp6614c_output", "b1500_transfer", "b1500_output"} & flow_types)
 
     @staticmethod
     def _autotest_grid_shape(points: tuple[AutoTestPoint, ...], settings: AutoTestSettings) -> tuple[int, int]:
@@ -8150,6 +8631,7 @@ class ProbeApp(tk.Tk):
         (session_dir / "images").mkdir(parents=True, exist_ok=False)
         (session_dir / "iv").mkdir(parents=True, exist_ok=True)
         (session_dir / "wobb").mkdir(parents=True, exist_ok=True)
+        (session_dir / "hp6614c").mkdir(parents=True, exist_ok=True)
         (session_dir / "b1500").mkdir(parents=True, exist_ok=True)
         return session_dir
 
@@ -8303,6 +8785,8 @@ class ProbeApp(tk.Tk):
                 "photo": "Photo",
                 "iv": "IV",
                 "wobb_test": "WobbTest",
+                "hp6614c_transfer": "6614C Transfer",
+                "hp6614c_output": "6614C Output",
                 "b1500_transfer": "B1500 Transfer",
                 "b1500_output": "B1500 Output",
                 "it": "IT",
@@ -8325,6 +8809,11 @@ class ProbeApp(tk.Tk):
             return
         self._execute_autotest_measurement_steps(point, settings.measurement_steps, session_dir, cv2_module)
 
+    @staticmethod
+    def _autotest_uses_combined_hp6614c_plot(settings: AutoTestSettings) -> bool:
+        flow_types = {step.type_id for step in settings.measurement_flow}
+        return {"hp6614c_transfer", "hp6614c_output"}.issubset(flow_types)
+
     def _execute_autotest_flow_step(self, point: AutoTestPoint, settings: AutoTestSettings, step: AutoTestFlowStep, session_dir: Path | None, cv2_module) -> None:
         params = dict(step.params)
         if step.type_id == "wait":
@@ -8343,6 +8832,24 @@ class ProbeApp(tk.Tk):
             return
         if step.type_id == "wobb_test":
             self._run_autotest_wobb_test(point, settings, params, session_dir)
+            return
+        if step.type_id == "hp6614c_transfer":
+            config = hp6614c_sweep_config_from_params(params, test_type=HP6614C_TEST_TRANSFER)
+            self._run_autotest_hp6614c_sweep(
+                point,
+                config,
+                session_dir,
+                combined_plot=self._autotest_uses_combined_hp6614c_plot(settings),
+            )
+            return
+        if step.type_id == "hp6614c_output":
+            config = hp6614c_sweep_config_from_params(params, test_type=HP6614C_TEST_OUTPUT)
+            self._run_autotest_hp6614c_sweep(
+                point,
+                config,
+                session_dir,
+                combined_plot=self._autotest_uses_combined_hp6614c_plot(settings),
+            )
             return
         if step.type_id == "b1500_transfer":
             config = b1500_config_from_params(params, test_type=B1500_TEST_TRANSFER)
@@ -8721,6 +9228,307 @@ class ProbeApp(tk.Tk):
             output_payload = tuple(output_paths) if len(output_paths) > 1 else output_paths[0]
         statistics_payload = latest_statistics.to_dict() if latest_statistics is not None else None
         self.result_queue.put(("iv_done", point.name, total_samples, output_payload, statistics_payload, point.row, point.col, self.autotest_grid_rows, self.autotest_grid_cols))
+
+    def _run_autotest_hp6614c_sweep(
+        self,
+        point: AutoTestPoint,
+        config: HP6614CSweepConfig,
+        session_dir: Path | None,
+        *,
+        combined_plot: bool = False,
+    ) -> list[dict[str, object]]:
+        if session_dir is None:
+            raise RuntimeError("AutoTest 6614C session directory is unavailable.")
+        config = config.normalized()
+        device_name = config.device_name.replace("{point}", point.name).replace("{row}", str(point.row)).replace("{col}", str(point.col)).replace("{order}", str(point.order))
+        config = replace(config, device_name=device_name).normalized()
+        label = "6614C Transfer" if config.test_type == HP6614C_TEST_TRANSFER else "6614C Output"
+        self.result_queue.put(
+            (
+                "hp6614c_sweep_started",
+                point.name,
+                config,
+                point.row,
+                point.col,
+                self.autotest_grid_rows,
+                self.autotest_grid_cols,
+                point.order == 1,
+                bool(combined_plot),
+            )
+        )
+        self.result_queue.put(("autotest_status", f"{label} started at {point.name}: {config.summary()}"))
+        records: list[dict[str, object]] = []
+        hp_runner = HP6614CRunner()
+        drain_runner: Keithley2450IVRunner | None = None
+        try:
+            stopped = config.pre_settle_s > 0 and self.autotest_stop_event.wait(config.pre_settle_s)
+            if not stopped and config.test_type == HP6614C_TEST_OUTPUT:
+                iv_config = self._hp6614c_output_iv_config(config)
+                drain_runner = Keithley2450IVRunner()
+                drain_runner.begin_sweep(iv_config)
+                for curve_index, vg in enumerate(config.bias_values_v, start=1):
+                    if self.autotest_stop_event.is_set():
+                        break
+                    if curve_index > 1:
+                        drain_runner.set_sweep_source_value(iv_config.start)
+                    gate_reading = hp_runner.apply_voltage(self._hp6614c_voltage_config_for_sweep(config, vg))
+                    actual_vg = _actual_gate_voltage_from_reading(vg, gate_reading.voltage_v)
+
+                    def handle_sample(sample: IVSweepSample, programmed_vg: float = vg, measured_vg: float = actual_vg, index: int = curve_index) -> None:
+                        record = self._hp6614c_record(
+                            point,
+                            config,
+                            index,
+                            len(config.bias_values_v),
+                            measured_vg,
+                            sample.source_value,
+                            sample,
+                            gate_voltage_v=measured_vg,
+                            programmed_gate_voltage_v=programmed_vg,
+                        )
+                        records.append(record)
+                        self.result_queue.put(("hp6614c_sweep_sample", point.name, record))
+
+                    samples = drain_runner.sample_sweep(
+                        samples_per_point=config.sample_count,
+                        stop_requested=self.autotest_stop_event.is_set,
+                        on_sample=handle_sample,
+                    )
+                    self.result_queue.put(("autotest_status", f"{label} curve {curve_index}/{len(config.bias_values_v)} at {point.name}: Vg={vg:g} V, {len(samples)} sample(s)."))
+            elif not stopped:
+                gate_values = config.sweep_values()
+                drain_runner = Keithley2450IVRunner()
+                drain_runner.begin_constant_voltage_current(
+                    ConstantVoltageCurrentConfig(
+                        resource_name=config.keithley_resource_name,
+                        output_terminal=config.output_terminal,
+                        voltage_v=config.bias_values_v[0],
+                        current_limit_a=config.drain_current_limit_a,
+                        measure_range=config.drain_measure_range,
+                        sample_count=config.sample_count,
+                        nplc=config.drain_nplc,
+                        output_off_after=True,
+                    )
+                )
+                for curve_index, vd in enumerate(config.bias_values_v, start=1):
+                    if self.autotest_stop_event.is_set():
+                        break
+                    if curve_index > 1:
+                        drain_runner.set_constant_voltage(vd)
+                    if config.drain_settle_s > 0 and self.autotest_stop_event.wait(config.drain_settle_s):
+                        break
+                    for gate_index, vg in enumerate(gate_values, start=1):
+                        if self.autotest_stop_event.is_set():
+                            break
+                        gate_reading = hp_runner.apply_voltage(self._hp6614c_voltage_config_for_sweep(config, vg))
+                        actual_vg = _actual_gate_voltage_from_reading(vg, gate_reading.voltage_v)
+                        def handle_sample(
+                            sample: IVSweepSample,
+                            programmed_vg: float = vg,
+                            measured_vg: float = actual_vg,
+                            curve_idx: int = curve_index,
+                            gate_idx: int = gate_index,
+                        ) -> None:
+                            record = self._hp6614c_record(
+                                point,
+                                config,
+                                curve_idx,
+                                len(config.bias_values_v),
+                                vd,
+                                vd,
+                                sample,
+                                gate_voltage_v=measured_vg,
+                                programmed_gate_voltage_v=programmed_vg,
+                                gate_index=gate_idx,
+                                gate_total=len(gate_values),
+                            )
+                            records.append(record)
+                            self.result_queue.put(("hp6614c_sweep_sample", point.name, record))
+
+                        drain_runner.sample_constant_voltage_current(
+                            stop_requested=self.autotest_stop_event.is_set,
+                            on_sample=handle_sample,
+                        )
+                    self.result_queue.put(("autotest_status", f"{label} curve {curve_index}/{len(config.bias_values_v)} at {point.name}: Vd={vd:g} V, {len(gate_values)} gate point(s)."))
+            if config.post_sweep_pause_s > 0:
+                self.autotest_stop_event.wait(config.post_sweep_pause_s)
+        finally:
+            if drain_runner is not None:
+                drain_runner.end_sweep()
+                drain_runner.end_constant_voltage_current()
+            self._turn_hp6614c_output_off(hp_runner, config)
+        output_path = session_dir / "hp6614c" / f"{self._safe_autotest_name(point.name)}_6614c_{config.test_type}.csv"
+        transfer_analysis = analyze_hp6614c_transfer_records(records, config.heatmap_metric) if config.test_type == HP6614C_TEST_TRANSFER else None
+        self._write_hp6614c_sweep_csv(output_path, point, config, records, transfer_analysis=transfer_analysis)
+        message = f"{label} completed at {point.name}: {len(records)} sample(s); saved {output_path.name}."
+        self.result_queue.put(("hp6614c_done", point.name, message, transfer_analysis.to_dict() if transfer_analysis is not None else None))
+        self.result_queue.put(("autotest_status", message))
+        return records
+
+    @staticmethod
+    def _hp6614c_output_iv_config(config: HP6614CSweepConfig) -> IVSweepConfig:
+        if config.sweep_start_v == config.sweep_end_v:
+            step = 1.0
+        else:
+            step = (config.sweep_end_v - config.sweep_start_v) / max(config.sweep_points - 1, 1)
+        return IVSweepConfig(
+            resource_name=config.keithley_resource_name,
+            output_terminal=config.output_terminal,
+            sweep_mode=IV_SWEEP_MODE_VOLTAGE,
+            start=config.sweep_start_v,
+            stop=config.sweep_end_v,
+            step=step,
+            current_limit_a=config.drain_current_limit_a,
+            measure_range=config.drain_measure_range,
+            source_delay_s=config.drain_settle_s,
+            nplc=config.drain_nplc,
+            output_off_after=True,
+        ).normalized()
+
+    @staticmethod
+    def _hp6614c_voltage_config_for_sweep(config: HP6614CSweepConfig, voltage_v: float) -> HP6614CVoltageConfig:
+        return HP6614CVoltageConfig(
+            resource_name=config.hp_resource_name,
+            voltage_v=float(voltage_v),
+            current_limit_a=config.gate_current_limit_a,
+            settle_s=config.gate_settle_s,
+            output_on=True,
+            output_off_after=False,
+            verify_identity=config.verify_identity,
+            readback=config.readback,
+            skip_open_clear=config.skip_open_clear,
+        ).normalized()
+
+    def _turn_hp6614c_output_off(self, hp_runner: HP6614CRunner, config: HP6614CSweepConfig) -> None:
+        try:
+            hp_runner.apply_voltage(
+                HP6614CVoltageConfig(
+                    resource_name=config.hp_resource_name,
+                    voltage_v=0.0,
+                    current_limit_a=config.gate_current_limit_a,
+                    settle_s=0.0,
+                    output_on=False,
+                    output_off_after=True,
+                    verify_identity=config.verify_identity,
+                    readback=False,
+                    skip_open_clear=config.skip_open_clear,
+                ).normalized()
+            )
+        except Exception as exc:
+            self.result_queue.put(("autotest_status", f"Warning: failed to turn HP 6614C output off at 0 V: {exc}"))
+
+    @staticmethod
+    def _hp6614c_record(
+        point: AutoTestPoint,
+        config: HP6614CSweepConfig,
+        curve_index: int,
+        curve_total: int,
+        bias_v: float,
+        drain_voltage_v: float,
+        sample: IVSweepSample,
+        *,
+        gate_voltage_v: float,
+        programmed_gate_voltage_v: float | None = None,
+        gate_index: int | None = None,
+        gate_total: int | None = None,
+    ) -> dict[str, object]:
+        return {
+            "point_name": point.name,
+            "test_type": config.test_type,
+            "curve_index": int(curve_index),
+            "curve_total": int(curve_total),
+            "bias_v": float(bias_v),
+            "gate_index": int(gate_index or sample.index),
+            "gate_total": int(gate_total or sample.total),
+            "gate_voltage_v": float(gate_voltage_v),
+            "programmed_gate_voltage_v": float(programmed_gate_voltage_v if programmed_gate_voltage_v is not None else gate_voltage_v),
+            "drain_voltage_v": float(drain_voltage_v),
+            "drain_current_a": sample.current_a,
+            "sample_index": sample.index,
+            "sample_total": sample.total,
+            "elapsed_s": sample.elapsed_s,
+            "raw": sample.raw,
+        }
+
+    @staticmethod
+    def _write_hp6614c_sweep_csv(
+        output_path: Path,
+        point: AutoTestPoint,
+        config: HP6614CSweepConfig,
+        records: list[dict[str, object]],
+        *,
+        transfer_analysis: HP6614CTransferAnalysis | None = None,
+    ) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fields = [
+            "point_name",
+            "test_type",
+            "curve_index",
+            "curve_total",
+            "bias_v",
+            "gate_index",
+            "gate_total",
+            "gate_voltage_v",
+            "programmed_gate_voltage_v",
+            "drain_voltage_v",
+            "drain_current_a",
+            "sample_index",
+            "sample_total",
+            "elapsed_s",
+            "raw",
+        ]
+        with output_path.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            for record in records:
+                writer.writerow(record)
+        output_path.with_suffix(".json").write_text(
+            json.dumps(
+                {
+                    "format": "semi_auto_probe.autotest_result_metadata",
+                    "version": 1,
+                    "result_type": f"hp6614c_{config.test_type}",
+                    "csv_file": output_path.name,
+                    "json_file": output_path.with_suffix(".json").name,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "device": {"name": point.name, "order": point.order, "row": point.row, "col": point.col},
+                    "coordinates": {"gds": {"u": point.u, "v": point.v}, "stage_um": {"x": point.stage_x_um, "y": point.stage_y_um}},
+                    "measurement": {
+                        "test_type": config.test_type,
+                        "hp_resource": config.hp_resource_name,
+                        "keithley_resource": config.keithley_resource_name,
+                        "output_terminal": config.output_terminal,
+                        "device_name": config.device_name,
+                        "sweep_start_v": config.sweep_start_v,
+                        "sweep_end_v": config.sweep_end_v,
+                        "sweep_points": config.sweep_points,
+                        "scan_type": config.scan_type,
+                        "bias_values_v": list(config.bias_values_v),
+                        "drain_current_limit_a": config.drain_current_limit_a,
+                        "drain_measure_range": config.drain_measure_range,
+                        "gate_current_limit_a": config.gate_current_limit_a,
+                        "drain_nplc": config.drain_nplc,
+                        "sample_count": config.sample_count,
+                        "gate_settle_s": config.gate_settle_s,
+                        "step_delay_s": config.drain_settle_s,
+                        "pre_settle_s": config.pre_settle_s,
+                        "post_sweep_pause_s": config.post_sweep_pause_s,
+                        "verify_identity": config.verify_identity,
+                        "readback": config.readback,
+                        "skip_open_clear": config.skip_open_clear,
+                        "output_off_after": True,
+                        "heatmap_metric": config.heatmap_metric,
+                        "heatmap_values": config.heatmap_values,
+                    },
+                    "sample_count": len(records),
+                    "analysis": transfer_analysis.to_dict() if transfer_analysis is not None else None,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
     def _run_autotest_b1500_sweep(self, point: AutoTestPoint, settings: AutoTestSettings, config: B1500SweepConfig, session_dir: Path | None) -> None:
         if session_dir is None:
@@ -10592,6 +11400,17 @@ class ProbeApp(tk.Tk):
             self.b1500_plot_window = B1500PlotWindow(self, self.colors)
         return self.b1500_plot_window
 
+    def _ensure_hp6614c_plot_window(self) -> HP6614CPlotWindow:
+        if self.hp6614c_plot_window is None:
+            self.hp6614c_plot_window = HP6614CPlotWindow(self, self.colors)
+            return self.hp6614c_plot_window
+        try:
+            if not self.hp6614c_plot_window.window.winfo_exists():
+                self.hp6614c_plot_window = HP6614CPlotWindow(self, self.colors)
+        except tk.TclError:
+            self.hp6614c_plot_window = HP6614CPlotWindow(self, self.colors)
+        return self.hp6614c_plot_window
+
     def _poll_result_queue(self) -> None:
         started_at = time.monotonic()
         processed = 0
@@ -11337,6 +12156,55 @@ class ProbeApp(tk.Tk):
             logger.info("WobbTest completed at %s: %s", point_name, message)
             return
 
+        if event_type == "hp6614c_sweep_started":
+            _, point_name, config, *payload = event
+            if isinstance(config, HP6614CSweepConfig):
+                row = int(payload[0]) if len(payload) >= 1 and payload[0] is not None else None
+                col = int(payload[1]) if len(payload) >= 2 and payload[1] is not None else None
+                rows = int(payload[2]) if len(payload) >= 3 and payload[2] is not None else None
+                cols = int(payload[3]) if len(payload) >= 4 and payload[3] is not None else None
+                reset_heatmap = bool(payload[4]) if len(payload) >= 5 else False
+                combined_plot = bool(payload[5]) if len(payload) >= 6 else False
+                self._ensure_hp6614c_plot_window().start(
+                    str(point_name),
+                    config,
+                    row=row,
+                    col=col,
+                    rows=rows,
+                    cols=cols,
+                    reset_heatmap=reset_heatmap,
+                    combined_plot=combined_plot,
+                )
+                self.status_var.set(f"6614C {config.test_type} started at {point_name}.")
+            return
+
+        if event_type == "hp6614c_sweep_sample":
+            _, point_name, record = event
+            if isinstance(record, dict):
+                self._ensure_hp6614c_plot_window().add_sample(record)
+                self.status_var.set(
+                    f"6614C sample at {point_name}: Vg={float(record.get('gate_voltage_v', math.nan)):.6g} V, "
+                    f"Vd={float(record.get('drain_voltage_v', math.nan)):.6g} V, "
+                    f"Id={float(record.get('drain_current_a', math.nan)):.6g} A."
+                )
+            return
+
+        if event_type == "hp6614c_done":
+            _, point_name, message, *payload = event
+            message_text = str(message)
+            analysis = payload[0] if payload and isinstance(payload[0], dict) else None
+            if self.hp6614c_plot_window is not None:
+                try:
+                    if self.hp6614c_plot_window.window.winfo_exists():
+                        self.hp6614c_plot_window.finish(message_text, analysis)
+                except tk.TclError:
+                    pass
+            if self.autotest_panel is not None:
+                self.autotest_panel.set_status(message_text)
+            self.status_var.set(message_text)
+            logger.info("6614C completed at %s: %s", point_name, message_text)
+            return
+
         if event_type == "b1500_started":
             _, point_name, config = event
             if isinstance(config, B1500SweepConfig):
@@ -11652,10 +12520,24 @@ class ProbeApp(tk.Tk):
         super().destroy()
 
 
-def main() -> None:
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Launch the Semi Auto Probe desktop application.")
+    parser.add_argument(
+        "--restore-last",
+        "--load-last",
+        "--last",
+        action="store_true",
+        dest="restore_last",
+        help=f"restore {FOCUSMAP_AUTOSAVE_FILENAME} and {LAYOUTBOND_AUTOSAVE_FILENAME} at startup",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_arg_parser().parse_args(argv)
     print_startup_banner()
     logger.info("Application starting.")
-    app = ProbeApp()
+    app = ProbeApp(restore_last=args.restore_last)
     try:
         app.mainloop()
     finally:

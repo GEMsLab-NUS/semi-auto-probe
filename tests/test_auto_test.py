@@ -253,6 +253,23 @@ class AutoTestTests(unittest.TestCase):
         self.assertEqual(steps[3].params["measurement_adc"], "high_resolution")
         self.assertNotIn("avg_coefficient", steps[3].params)
 
+    def test_hp6614c_cards_include_id_range_and_transfer_heatmap_metric(self) -> None:
+        cards = [
+            create_autotest_flow_card("hp6614c_transfer", "card_6614c_transfer"),
+            create_autotest_flow_card("hp6614c_output", "card_6614c_output"),
+        ]
+
+        steps = measurement_flow_steps_from_cards(cards)
+
+        self.assertEqual(steps[0].params["drain_measure_range"], "auto")
+        self.assertEqual(steps[0].params["output_terminal"], "front")
+        self.assertEqual(steps[0].params["heatmap_metric"], "vth")
+        self.assertEqual(steps[0].params["heatmap_values"], "true")
+        self.assertEqual(steps[1].params["drain_measure_range"], "auto")
+        self.assertEqual(steps[1].params["output_terminal"], "front")
+        self.assertEqual(steps[1].params["heatmap_values"], "true")
+        self.assertNotIn("heatmap_metric", steps[1].params)
+
     def test_wobbtest_requires_session_dir_and_best_z_uses_median_current(self) -> None:
         settings = AutoTestSettings(
             0,

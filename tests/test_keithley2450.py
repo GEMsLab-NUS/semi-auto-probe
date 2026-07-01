@@ -90,7 +90,8 @@ class Keithley2450Tests(unittest.TestCase):
         self.assertEqual(len(samples), 3)
         self.assertIn(":SOUR:FUNC:MODE VOLT", instrument.commands)
         self.assertIn(":ROUT:TERM REAR", instrument.commands)
-        self.assertIn(":SENS:CURR:PROT:LEV 0.001", instrument.commands)
+        self.assertIn(":SOUR:VOLT:ILIM 0.001", instrument.commands)
+        self.assertNotIn(":SENS:CURR:PROT:LEV 0.001", instrument.commands)
         self.assertIn(":OUTP OFF", instrument.commands)
         self.assertAlmostEqual(result[-1].voltage_v, 0.3)
         self.assertAlmostEqual(result[-1].current_a, 3e-6)
@@ -103,8 +104,38 @@ class Keithley2450Tests(unittest.TestCase):
             IVSweepConfig(start=0, stop=0.2, step=0.1, measure_range=1e-4, source_delay_s=0),
         )
 
-        self.assertIn(":SENS:CURR:RANG:AUTO 0", instrument.commands)
         self.assertIn(":SENS:CURR:RANG 0.0001", instrument.commands)
+        self.assertFalse(any(command.startswith(":SENS:CURR:RANG:AUTO") for command in instrument.commands))
+
+    def test_sweep_session_reuses_configuration_and_honors_samples_per_point(self) -> None:
+        instrument = FakeInstrument()
+        runner = Keithley2450IVRunner(instrument)
+        config = IVSweepConfig(
+            output_terminal="front",
+            start=0,
+            stop=0.2,
+            step=0.1,
+            current_limit_a=1e-3,
+            measure_range=1e-8,
+            source_delay_s=0,
+        )
+
+        runner.begin_sweep(config)
+        first = runner.sample_sweep(samples_per_point=2)
+        runner.set_sweep_source_value(config.start)
+        second = runner.sample_sweep(samples_per_point=2)
+        runner.end_sweep()
+
+        self.assertEqual(len(first), 6)
+        self.assertEqual(len(second), 6)
+        self.assertEqual([sample.source_value for sample in first], [0.0, 0.0, 0.1, 0.1, 0.2, 0.2])
+        self.assertEqual(instrument.commands.count("*RST"), 1)
+        self.assertEqual(instrument.commands.count(":ROUT:TERM FRON"), 1)
+        self.assertEqual(instrument.commands.count(":SOUR:VOLT:ILIM 0.001"), 1)
+        self.assertEqual(instrument.commands.count(":SENS:CURR:RANG 1e-08"), 1)
+        self.assertEqual(instrument.commands.count(":OUTP ON"), 1)
+        self.assertEqual(instrument.commands.count(":OUTP OFF"), 1)
+        self.assertEqual(instrument.commands.count(":READ?"), 12)
 
     def test_runner_configures_constant_voltage_current_sampling(self) -> None:
         instrument = FakeInstrument()
@@ -116,10 +147,45 @@ class Keithley2450Tests(unittest.TestCase):
 
         self.assertEqual(len(result), 2)
         self.assertIn(":SOUR:VOLT:LEV 0.1", instrument.commands)
-        self.assertIn(":SENS:CURR:PROT:LEV 1e-05", instrument.commands)
+        self.assertIn(":SOUR:VOLT:ILIM 1e-05", instrument.commands)
         self.assertIn(":OUTP ON", instrument.commands)
         self.assertAlmostEqual(result[0].voltage_v, 0.1)
         self.assertAlmostEqual(result[0].current_a, 1e-6)
+
+    def test_runner_configures_constant_voltage_current_fixed_range(self) -> None:
+        instrument = FakeInstrument()
+        runner = Keithley2450IVRunner(instrument)
+
+        runner.run_constant_voltage_current(
+            ConstantVoltageCurrentConfig(voltage_v=0.1, current_limit_a=1e-5, measure_range=1e-7, sample_count=1),
+        )
+
+        self.assertIn(":SENS:CURR:RANG 1e-07", instrument.commands)
+        self.assertFalse(any(command.startswith(":SENS:CURR:RANG:AUTO") for command in instrument.commands))
+
+    def test_constant_voltage_session_configures_range_and_limit_once(self) -> None:
+        instrument = FakeInstrument()
+        runner = Keithley2450IVRunner(instrument)
+        config = ConstantVoltageCurrentConfig(
+            output_terminal="front",
+            voltage_v=-1,
+            current_limit_a=1e-3,
+            measure_range=1e-8,
+            sample_count=1,
+        )
+
+        runner.begin_constant_voltage_current(config)
+        runner.sample_constant_voltage_current()
+        runner.set_constant_voltage(-2)
+        runner.sample_constant_voltage_current()
+        runner.end_constant_voltage_current()
+
+        self.assertEqual(instrument.commands.count("*RST"), 1)
+        self.assertEqual(instrument.commands.count(":ROUT:TERM FRON"), 1)
+        self.assertEqual(instrument.commands.count(":SOUR:VOLT:ILIM 0.001"), 1)
+        self.assertEqual(instrument.commands.count(":SENS:CURR:RANG 1e-08"), 1)
+        self.assertEqual(instrument.commands.count(":OUTP ON"), 1)
+        self.assertEqual(instrument.commands.count(":OUTP OFF"), 1)
 
     def test_constant_voltage_params_default_to_100mv_and_10ua(self) -> None:
         config = constant_voltage_current_config_from_params({})
@@ -127,6 +193,11 @@ class Keithley2450Tests(unittest.TestCase):
         self.assertAlmostEqual(config.voltage_v, 0.1)
         self.assertAlmostEqual(config.current_limit_a, 1e-5)
         self.assertAlmostEqual(config.nplc, 10.0)
+
+    def test_constant_voltage_params_parse_measure_range(self) -> None:
+        config = constant_voltage_current_config_from_params({"measure_range": "1e-8"})
+
+        self.assertAlmostEqual(config.measure_range or 0.0, 1e-8)
 
     def test_statistics_use_linear_iv_slope_for_resistance_only(self) -> None:
         samples = [

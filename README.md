@@ -227,6 +227,12 @@ Run the GUI:
 uv run python -m semi_auto_probe
 ```
 
+Restore the latest FocusMap plane and LayoutMap calibration on startup:
+
+```powershell
+uv run python -m semi_auto_probe --restore-last
+```
+
 or:
 
 ```powershell
