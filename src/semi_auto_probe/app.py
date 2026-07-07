@@ -154,7 +154,7 @@ from .hp6614c import (
 )
 from .logging_utils import colorize_hex_frame, configure_logging, print_startup_banner
 from .protocol import COMM_TEST_COMMAND, FUNCTION_READ_POSITION, RESPONSE_HEAD, Axis, AxisPosition, IoStatus, hex_bytes, parse_axis_position_response
-from .protocol import payload_contains_clear_position_command
+from .protocol import payload_contains_clear_position_command, payload_contains_go_home_command
 from .serial_client import ControllerSerialClient, CommunicationTestResult, list_serial_ports
 from .ssh_tunnel import RemoteBridgeStatus, SshSerialTunnel, probe_remote_bridge_status
 from .ui.calibration_dialog import PixelCalibrationDialog
@@ -1608,7 +1608,6 @@ class ProbeApp(tk.Tk):
             for axis in JOG_STEP_AXES
         }
         self.controller_motion_status_var = tk.StringVar(value="D5 controller parameters not read.")
-        self.controller_motion_startup_read_done = False
         self.camera_exposure_mode_var = tk.StringVar(value=self._camera_control_mode_label(self.probe_config.camera_exposure_mode))
         self.camera_exposure_var = tk.StringVar(value=f"{self.probe_config.camera_exposure:g}")
         self.camera_gain_mode_var = tk.StringVar(value=self._camera_control_mode_label(self.probe_config.camera_gain_mode))
@@ -1650,6 +1649,7 @@ class ProbeApp(tk.Tk):
         self.agent_timeout_var = tk.StringVar(value=f"{self.probe_config.agent_timeout_seconds:g}")
         self.set_xyz_zero_button: ttk.Button | None = None
         self.set_autofocus_z_zero_button: ttk.Button | None = None
+        self.go_home_button: ttk.Button | None = None
 
         self._configure_theme()
         self._build_ui()
@@ -3296,7 +3296,8 @@ class ProbeApp(tk.Tk):
         zero_bar = ttk.Frame(axes, style="Panel.TFrame")
         zero_bar.grid(row=4, column=0, sticky="ew", padx=8, pady=(10, 8))
         zero_bar.columnconfigure((0, 1, 2), weight=1, uniform="zero_bar")
-        ttk.Button(zero_bar, textvariable=self.home_signal_button_var, command=self.toggle_home_signal_polling).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.go_home_button = ttk.Button(zero_bar, text="Go Home", command=self.go_home)
+        self.go_home_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         self.set_xyz_zero_button = ttk.Button(zero_bar, text="Set New Zero", style="Accent.TButton", command=self.set_xyz_zero)
         self.set_xyz_zero_button.grid(row=0, column=1, sticky="ew", padx=(4, 4))
         ttk.Button(zero_bar, text="Go Zero", command=self.go_xyz_zero).grid(row=0, column=2, sticky="ew", padx=(4, 0))
@@ -4318,7 +4319,7 @@ class ProbeApp(tk.Tk):
         d5_panel.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(22, 0))
         d5_panel.columnconfigure(0, minsize=40)
         d5_panel.columnconfigure((1, 2, 3), weight=1, uniform="d5_params", minsize=72)
-        ttk.Label(d5_panel, text="D5 CONTROLLER READBACK", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        ttk.Label(d5_panel, text="CONTROLLER SPEED (D5 / 10-13)", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
         ttk.Label(d5_panel, text="Axis", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
         for column, label in enumerate(("Min", "Work", "Accel"), start=1):
             ttk.Label(d5_panel, text=label, style="Muted.TLabel").grid(row=1, column=column, sticky="w", padx=(8 if column > 1 else 0, 0), pady=2)
@@ -4332,10 +4333,20 @@ class ProbeApp(tk.Tk):
                     maximum=65535,
                     width=7,
                 )
-                entry.configure(state="readonly")
                 entry.grid(row=row_index, column=column, sticky="ew", padx=(8 if column > 1 else 0, 0), pady=2, ipady=5)
         ttk.Button(d5_panel, text="Read D5 X/Y/Z", command=self.read_controller_motion_parameters).grid(row=5, column=0, columnspan=4, sticky="ew", pady=(10, 0))
-        ttk.Label(d5_panel, textvariable=self.controller_motion_status_var, style="Status.TLabel", wraplength=440, padding=8).grid(row=6, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        ttk.Button(
+            d5_panel,
+            text="Apply 10/11 (temporary)",
+            command=lambda: self.write_controller_motion_parameters(persist=False),
+        ).grid(row=6, column=0, columnspan=2, sticky="ew", padx=(0, 4), pady=(8, 0))
+        ttk.Button(
+            d5_panel,
+            text="Save 12/13 (power-off)",
+            style="Accent.TButton",
+            command=lambda: self.write_controller_motion_parameters(persist=True),
+        ).grid(row=6, column=2, columnspan=2, sticky="ew", padx=(4, 0), pady=(8, 0))
+        ttk.Label(d5_panel, textvariable=self.controller_motion_status_var, style="Status.TLabel", wraplength=440, padding=8).grid(row=7, column=0, columnspan=4, sticky="ew", pady=(8, 0))
 
         ttk.Label(motion_panel, text="CONVERSION", style="Section.TLabel").grid(row=10, column=0, columnspan=2, sticky="w", pady=(24, 6))
         ttk.Label(motion_panel, textvariable=self.motor_conversion_var, style="Value.TLabel", wraplength=360, padding=10).grid(row=11, column=0, columnspan=2, sticky="ew")
@@ -4455,6 +4466,8 @@ class ProbeApp(tk.Tk):
             self.status_var.set("Read bytes must be zero or positive.")
             return "break"
         if payload_contains_clear_position_command(payload) and not self._require_admin_mode("Manual clear-position command"):
+            return "break"
+        if payload_contains_go_home_command(payload) and not self._require_admin_mode("Manual Go Home command"):
             return "break"
 
         self.status_var.set("Sending manual command...")
@@ -4614,20 +4627,20 @@ class ProbeApp(tk.Tk):
 
         self.admin_mode_enabled = True
         self.admin_token_var.set("")
-        self.admin_mode_status_var.set("Admin mode enabled for this session. Set-zero commands are unlocked.")
+        self.admin_mode_status_var.set("Admin mode enabled for this session. Set-zero and Go Home commands are unlocked.")
         self.status_var.set("Admin mode enabled.")
         self._update_admin_mode_controls()
 
     def _update_admin_mode_controls(self) -> None:
         state = "normal" if self.admin_mode_enabled else "disabled"
-        for button_name in ("set_xyz_zero_button", "set_autofocus_z_zero_button"):
-            button = getattr(self, button_name, None)
+        for button_name in ("set_xyz_zero_button", "set_autofocus_z_zero_button", "go_home_button"):
+            button = self.__dict__.get(button_name)
             if button is not None:
                 button.configure(state=state)
         if self.serial_client is not None:
             self.serial_client.set_admin_mode_enabled(self.admin_mode_enabled)
         if not self.admin_mode_enabled and self.admin_mode_status_var.get() == "Admin mode locked":
-            self.admin_mode_status_var.set("Admin mode locked. Set-zero commands are disabled.")
+            self.admin_mode_status_var.set("Admin mode locked. Set-zero and Go Home commands are disabled.")
 
     def _require_admin_mode(self, action: str) -> bool:
         if self.admin_mode_enabled:
@@ -4753,6 +4766,9 @@ class ProbeApp(tk.Tk):
         self.config_status_var.set(f"Saved {self.config_path.name}")
 
     def read_controller_motion_parameters(self) -> None:
+        if self.current_page != "Config":
+            self.controller_motion_status_var.set("D5 read is only available in Settings.")
+            return
         self._start_controller_motion_parameters_read("manual")
 
     def _start_controller_motion_parameters_read(self, source: str) -> None:
@@ -4772,6 +4788,61 @@ class ProbeApp(tk.Tk):
             self.result_queue.put(("controller_motion_parameters", entries, source))
         except Exception as exc:
             self.result_queue.put(("controller_motion_parameters_error", exc, source))
+
+    def _controller_motion_parameters_from_ui(self) -> dict[str, dict[str, int]]:
+        parameters: dict[str, dict[str, int]] = {}
+        for axis in JOG_STEP_AXES:
+            values = {
+                field_name: int(self.controller_motion_parameter_vars[axis][field_name].get())
+                for field_name in ("minimum_speed", "work_speed", "acceleration")
+            }
+            for field_name, value in values.items():
+                if value < 0 or value > 0xFFFF:
+                    raise ValueError(f"{axis} {field_name.replace('_', ' ')} must be in range 0..65535.")
+            parameters[axis] = values
+        return parameters
+
+    def write_controller_motion_parameters(self, *, persist: bool) -> None:
+        if self.current_page != "Config":
+            self.controller_motion_status_var.set("Controller speed writes are only available in Settings.")
+            return
+        try:
+            parameters = self._controller_motion_parameters_from_ui()
+        except ValueError as exc:
+            self.controller_motion_status_var.set(f"Invalid controller speed: {exc}")
+            self.status_var.set(f"Controller speed write rejected: {exc}")
+            return
+        if not self.serial_client:
+            self.connect_serial()
+        if not self.serial_client:
+            self.controller_motion_status_var.set("Controller speed write skipped: serial is not connected.")
+            return
+
+        action = "Saving 12/13" if persist else "Applying 10/11"
+        self.controller_motion_status_var.set(f"{action} controller speed parameters...")
+        threading.Thread(
+            target=self._write_controller_motion_parameters_worker,
+            args=(parameters, persist),
+            daemon=True,
+        ).start()
+
+    def _write_controller_motion_parameters_worker(self, parameters: dict[str, dict[str, int]], persist: bool) -> None:
+        assert self.serial_client is not None
+        try:
+            commands: list[bytes] = []
+            for axis_name in JOG_STEP_AXES:
+                values = parameters[axis_name]
+                minimum_command, work_command = self.serial_client.write_motion_parameters(
+                    Axis[axis_name],
+                    values["minimum_speed"],
+                    values["work_speed"],
+                    values["acceleration"],
+                    persist=persist,
+                )
+                commands.extend((minimum_command, work_command))
+            self.result_queue.put(("controller_motion_parameters_written", commands, parameters, persist))
+        except Exception as exc:
+            self.result_queue.put(("controller_motion_parameters_write_error", exc, persist))
 
     def _keyboard_event_key(self, event: tk.Event) -> str:
         keysym = str(getattr(event, "keysym", ""))
@@ -5811,6 +5882,37 @@ class ProbeApp(tk.Tk):
             logger.info("Set XYZ=0 command sent: %s", colorize_hex_frame(hex_bytes(command), "TX"))
         except Exception as exc:
             self.result_queue.put(("motor_error", "ZERO_XYZ", exc))
+        finally:
+            self.result_queue.put(("motor_done",))
+
+    def go_home(self) -> None:
+        if not self._require_admin_mode("Go Home"):
+            return
+        if self.motion_busy:
+            self.status_var.set("Motion is busy; Go Home skipped.")
+            logger.warning("Go Home skipped because motion is busy.")
+            return
+        if not self.serial_client:
+            self.connect_serial()
+        if not self.serial_client:
+            return
+
+        self.motion_busy = True
+        self.clear_position_edits()
+        self.status_var.set("Homing X/Y/Z axes...")
+        threading.Thread(target=self._go_home_worker, daemon=True).start()
+
+    def _go_home_worker(self) -> None:
+        assert self.serial_client is not None
+        try:
+            if not self.admin_mode_enabled:
+                raise PermissionError("Go Home requires Config admin mode.")
+            command, completed = self.serial_client.go_home_and_wait(Axis.ALL)
+            self.result_queue.put(("go_home_completed", command, completed))
+            entries = self.serial_client.read_xyz_positions()
+            self.result_queue.put(("read_positions", entries, "go_home", {axis: 0 for axis in JOG_STEP_AXES}))
+        except Exception as exc:
+            self.result_queue.put(("motor_error", "GO_HOME", exc))
         finally:
             self.result_queue.put(("motor_done",))
 
@@ -11630,9 +11732,6 @@ class ProbeApp(tk.Tk):
                     logger.info("Communication test passed. %s %s", colorize_hex_frame(result.request_hex, "TX"), colorize_hex_frame(result.response_hex, "RX"))
                     self.clear_position_edits()
                     self.status_var.set("Communication test passed. Reading current X/Y/Z positions...")
-                    if not self.controller_motion_startup_read_done:
-                        self.controller_motion_startup_read_done = True
-                        self._start_controller_motion_parameters_read("startup")
                     threading.Thread(target=self._read_current_position_worker, args=("comm_test", False), daemon=True).start()
                 else:
                     logger.warning("Communication test did not pass. %s %s Detail=%s", colorize_hex_frame(result.request_hex, "TX"), colorize_hex_frame(result.response_hex or "-", "RX"), result.message)
@@ -11720,6 +11819,8 @@ class ProbeApp(tk.Tk):
                 self.status_var.set("X/Y/Z positions set to 0.")
             elif source == "go_zero":
                 self.status_var.set("Go Zero completed.")
+            elif source == "go_home":
+                self.status_var.set("Go Home completed; X/Y/Z are at controller home zero.")
             if self.current_page == "Main" and self.vision_panel is not None:
                 self.vision_panel.draw_overlay()
             logger.info(
@@ -11864,6 +11965,62 @@ class ProbeApp(tk.Tk):
             if source != "startup":
                 self.status_var.set(message)
             logger.error("Controller D5 parameter read failed: %s", exc)
+            return
+
+        if event_type == "controller_motion_parameters_written":
+            _, commands, parameters, persist = event
+            for command in commands:
+                command_hex = hex_bytes(command)
+                self.tx_var.set(command_hex)
+                self._append_hex_history("TX", command_hex)
+            instruction_pair = "12/13" if persist else "10/11"
+            if persist:
+                self.probe_config.controller_motion_parameters = {
+                    axis: dict(values)
+                    for axis, values in parameters.items()
+                }
+                try:
+                    save_probe_config(self.probe_config, self.config_path)
+                except Exception as exc:
+                    message = f"Controller 12/13 sent, but local config save failed: {exc}"
+                    self.controller_motion_status_var.set(message)
+                    self.status_var.set(message)
+                    logger.error(message)
+                    return
+                self.config_status_var.set(f"Saved {self.config_path.name}")
+            summary = "; ".join(
+                f"{axis} min {values['minimum_speed']}, work {values['work_speed']}, accel {values['acceleration']}"
+                for axis, values in parameters.items()
+            )
+            message = f"Controller {instruction_pair} sent: {summary}."
+            self.controller_motion_status_var.set(message)
+            self.status_var.set(message)
+            logger.info(message)
+            return
+
+        if event_type == "controller_motion_parameters_write_error":
+            _, exc, persist = event
+            instruction_pair = "12/13" if persist else "10/11"
+            message = f"Controller {instruction_pair} write failed: {exc}"
+            self.controller_motion_status_var.set(message)
+            self.status_var.set(message)
+            logger.error(message)
+            return
+
+        if event_type == "go_home_completed":
+            _, command, response = event
+            command_hex = hex_bytes(command)
+            response_hex = hex_bytes(response)
+            self.tx_var.set(command_hex)
+            self.rx_var.set(response_hex)
+            self._append_hex_history("TX", command_hex)
+            self._append_hex_history("RX", response_hex)
+            self.status_var.set("Go Home completion received; reading X/Y/Z positions...")
+            logger.info(
+                "Go Home completed. %s %s",
+                colorize_hex_frame(command_hex, "TX"),
+                colorize_hex_frame(response_hex, "RX"),
+            )
             return
 
         if event_type == "moving":

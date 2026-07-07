@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import threading
 import unittest
 from unittest.mock import patch
@@ -20,6 +21,7 @@ from semi_auto_probe.config import (
     ProbeConfig,
 )
 from semi_auto_probe.protocol import Axis, ControllerMotionParameters
+from semi_auto_probe.serial_client import CommunicationTestResult
 
 
 class DummyVar:
@@ -158,17 +160,56 @@ class ExclusiveSerialWorkflowTests(unittest.TestCase):
         app.serial_client = None
         app.set_xyz_zero_button = None
         app.set_autofocus_z_zero_button = None
+        app.go_home_button = DummyEntry()
         app.cc_accel_time_entry = DummyEntry()
 
         ProbeApp._update_admin_mode_controls(app)
 
         self.assertEqual(app.cc_accel_time_entry.state, "normal")
+        self.assertEqual(app.go_home_button.state, "disabled")
         self.assertNotIn("CC accel/decel", app.admin_mode_status_var.get())
 
         app.admin_mode_enabled = True
         ProbeApp._update_admin_mode_controls(app)
 
         self.assertEqual(app.cc_accel_time_entry.state, "normal")
+        self.assertEqual(app.go_home_button.state, "normal")
+
+    def test_communication_success_does_not_auto_read_controller_speed(self) -> None:
+        app = ProbeApp.__new__(ProbeApp)
+        app.result_queue = queue.Queue()
+        app.result_queue.put(CommunicationTestResult(True, "3A 55", "A3 AA", "ok"))
+        app.autotest_running = False
+        app.serial_client = None
+        app.tx_var = DummyVar()
+        app.rx_var = DummyVar()
+        app.status_var = DummyVar()
+        app._append_hex_history = MethodType(lambda self, direction, payload: None, app)
+        app.clear_position_edits = MethodType(lambda self: None, app)
+        app._read_current_position_worker = MethodType(lambda self, source, stable=True: None, app)
+        app._start_controller_motion_parameters_read = MethodType(
+            lambda self, source: self.fail(f"unexpected D5 read from {source}"),
+            app,
+        )
+        app.after = lambda delay, callback: None
+
+        with patch("semi_auto_probe.app.threading.Thread") as thread:
+            ProbeApp._poll_result_queue(app)
+
+        thread.assert_called_once()
+        self.assertNotIn("controller_motion_startup_read_done", app.__dict__)
+
+    def test_controller_speed_read_is_restricted_to_settings_page(self) -> None:
+        app = ProbeApp.__new__(ProbeApp)
+        app.current_page = "Main"
+        app.controller_motion_status_var = DummyVar()
+        reads: list[str] = []
+        app._start_controller_motion_parameters_read = MethodType(lambda self, source: reads.append(source), app)
+
+        ProbeApp.read_controller_motion_parameters(app)
+
+        self.assertEqual(reads, [])
+        self.assertIn("only available in Settings", app.controller_motion_status_var.get())
 
     def test_apply_config_writes_cc_accel_without_admin(self) -> None:
         app = ProbeApp.__new__(ProbeApp)

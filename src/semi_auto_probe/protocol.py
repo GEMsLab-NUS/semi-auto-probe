@@ -20,7 +20,15 @@ FUNCTION_ENABLE_REALTIME_POSITION = 0xD1
 FUNCTION_DISABLE_REALTIME_POSITION = 0xD4
 FUNCTION_CLEAR_POSITION = 0xD3
 FUNCTION_READ_MOTION_PARAMETERS = 0xD5
+FUNCTION_WRITE_MINIMUM_SPEED = 0xDA
+FUNCTION_WRITE_WORK_SPEED = 0xDB
+FUNCTION_SAVE_MINIMUM_SPEED = 0xDC
+FUNCTION_SAVE_WORK_SPEED = 0xDD
+FUNCTION_GO_HOME = 0xD0
+FUNCTION_MINIMUM_SPEED_RESPONSE = 0xB2
+FUNCTION_WORK_SPEED_RESPONSE = 0xB3
 FUNCTION_MOTION_PARAMETERS_RESPONSE = 0xB4
+FUNCTION_GO_HOME_COMPLETED = 0xB7
 FUNCTION_REACHED_POSITION = 0xB5
 FUNCTION_MULTI_AXIS_COMPLETED = 0xBE
 FUNCTION_READ_IO_STATUS = 0xD7
@@ -165,12 +173,46 @@ def payload_contains_clear_position_command(payload: bytes) -> bool:
     return False
 
 
+def build_go_home_command(axis: Axis = Axis.ALL) -> bytes:
+    return build_frame(FUNCTION_GO_HOME, axis)
+
+
+def payload_contains_go_home_command(payload: bytes) -> bool:
+    for index in range(max(0, len(payload) - 1)):
+        if payload[index] == FRAME_HEAD and payload[index + 1] == FUNCTION_GO_HOME:
+            return True
+    return False
+
+
 def build_read_io_status_command() -> bytes:
     return build_frame(FUNCTION_READ_IO_STATUS)
 
 
 def build_read_motion_parameters_command(axis: Axis) -> bytes:
     return build_frame(FUNCTION_READ_MOTION_PARAMETERS, axis)
+
+
+def build_write_minimum_speed_command(axis: Axis, minimum_speed: int, *, persist: bool = False) -> bytes:
+    if minimum_speed < 0 or minimum_speed > 0xFFFFFFFF:
+        raise ValueError("Minimum speed must be in range 0..4294967295.")
+    function_code = FUNCTION_SAVE_MINIMUM_SPEED if persist else FUNCTION_WRITE_MINIMUM_SPEED
+    return build_frame(function_code, axis, minimum_speed.to_bytes(4, byteorder="big") + bytes(2))
+
+
+def build_write_work_speed_and_acceleration_command(
+    axis: Axis,
+    work_speed: int,
+    acceleration: int,
+    *,
+    persist: bool = False,
+) -> bytes:
+    if work_speed < 0 or work_speed > 0xFFFFFFFF:
+        raise ValueError("Work speed must be in range 0..4294967295.")
+    if acceleration < 0 or acceleration > 0xFFFF:
+        raise ValueError("Acceleration must be in range 0..65535.")
+    function_code = FUNCTION_SAVE_WORK_SPEED if persist else FUNCTION_WRITE_WORK_SPEED
+    data = work_speed.to_bytes(4, byteorder="big") + acceleration.to_bytes(2, byteorder="big")
+    return build_frame(function_code, axis, data)
 
 
 def build_relative_move_command(axis: Axis, reverse: bool, pulses: int, speed_percent: int = 100) -> bytes:
@@ -259,17 +301,39 @@ def parse_io_status_response(raw: bytes) -> IoStatus:
 
 
 def parse_motion_parameters_response(raw: bytes) -> ControllerMotionParameters:
-    frame = parse_frame(raw, expected_head=RESPONSE_HEAD)
-    if frame.function_code != FUNCTION_MOTION_PARAMETERS_RESPONSE:
-        raise ValueError(f"Expected motion-parameter response B4, got {frame.function_code:02X}.")
+    expected_length = FRAME_LENGTH * 3
+    if len(raw) != expected_length:
+        raise ValueError(f"Expected three D5 response frames ({expected_length} bytes), got {len(raw)}.")
+
+    frames = [
+        parse_frame(raw[offset : offset + FRAME_LENGTH], expected_head=RESPONSE_HEAD)
+        for offset in range(0, expected_length, FRAME_LENGTH)
+    ]
+    expected_functions = {
+        FUNCTION_MINIMUM_SPEED_RESPONSE,
+        FUNCTION_WORK_SPEED_RESPONSE,
+        FUNCTION_MOTION_PARAMETERS_RESPONSE,
+    }
+    frames_by_function = {frame.function_code: frame for frame in frames}
+    if set(frames_by_function) != expected_functions:
+        actual = ", ".join(f"{frame.function_code:02X}" for frame in frames)
+        raise ValueError(f"Expected D5 response frames B2, B3, B4; got {actual}.")
+    axes = {frame.axis for frame in frames}
+    if len(axes) != 1:
+        raise ValueError("D5 response frames do not belong to the same axis.")
+    axis_value = axes.pop()
     try:
-        axis = Axis(frame.axis)
+        axis = Axis(axis_value)
     except ValueError as exc:
-        raise ValueError(f"Unexpected axis in D5 motion-parameter response: {frame.axis:02X}.") from exc
+        raise ValueError(f"Unexpected axis in D5 motion-parameter response: {axis_value:02X}.") from exc
+
+    minimum_frame = frames_by_function[FUNCTION_MINIMUM_SPEED_RESPONSE]
+    work_frame = frames_by_function[FUNCTION_WORK_SPEED_RESPONSE]
+    acceleration_frame = frames_by_function[FUNCTION_MOTION_PARAMETERS_RESPONSE]
     return ControllerMotionParameters(
         axis=axis,
-        minimum_speed=int.from_bytes(frame.data[0:2], byteorder="big", signed=False),
-        work_speed=int.from_bytes(frame.data[2:4], byteorder="big", signed=False),
-        acceleration=int.from_bytes(frame.data[4:6], byteorder="big", signed=False),
+        minimum_speed=int.from_bytes(minimum_frame.data[0:4], byteorder="big", signed=False),
+        work_speed=int.from_bytes(work_frame.data[0:4], byteorder="big", signed=False),
+        acceleration=int.from_bytes(acceleration_frame.data[0:4], byteorder="big", signed=False),
         raw=raw,
     )

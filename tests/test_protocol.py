@@ -8,6 +8,7 @@ from semi_auto_probe.protocol import (
     build_clear_position_command,
     build_disable_realtime_position_command,
     build_enable_realtime_position_command,
+    build_go_home_command,
     build_multi_axis_relative_move_command,
     build_read_io_status_command,
     build_read_motion_parameters_command,
@@ -15,8 +16,11 @@ from semi_auto_probe.protocol import (
     build_frame,
     build_read_position_command,
     build_stop_command,
+    build_write_minimum_speed_command,
+    build_write_work_speed_and_acceleration_command,
     checksum,
     payload_contains_clear_position_command,
+    payload_contains_go_home_command,
     parse_axis_position_response,
     parse_frame,
     parse_io_status_response,
@@ -51,11 +55,35 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(build_read_motion_parameters_command(Axis.Z), bytes.fromhex("3A D5 04 00 00 00 00 00 00 13 0D 0A"))
         self.assertEqual(build_clear_position_command(Axis.Z), bytes.fromhex("3A D3 04 00 00 00 00 00 00 11 0D 0A"))
         self.assertEqual(build_clear_position_command(Axis.ALL), bytes.fromhex("3A D3 FF 00 00 00 00 00 00 0C 0D 0A"))
+        self.assertEqual(build_go_home_command(Axis.ALL), bytes.fromhex("3A D0 FF 00 00 00 00 00 00 09 0D 0A"))
 
     def test_detects_clear_position_payloads(self) -> None:
         self.assertTrue(payload_contains_clear_position_command(build_clear_position_command(Axis.Z)))
         self.assertTrue(payload_contains_clear_position_command(b"\x00\xff" + build_clear_position_command(Axis.ALL)))
         self.assertFalse(payload_contains_clear_position_command(build_read_position_command(Axis.Z)))
+
+    def test_detects_go_home_payloads(self) -> None:
+        self.assertTrue(payload_contains_go_home_command(build_go_home_command(Axis.ALL)))
+        self.assertTrue(payload_contains_go_home_command(b"\x00\xff" + build_go_home_command(Axis.X)))
+        self.assertFalse(payload_contains_go_home_command(build_read_position_command(Axis.X)))
+
+    def test_build_motion_parameter_write_commands(self) -> None:
+        self.assertEqual(
+            build_write_minimum_speed_command(Axis.Z, 0x0A),
+            bytes.fromhex("3A DA 04 00 00 00 0A 00 00 22 0D 0A"),
+        )
+        self.assertEqual(
+            build_write_work_speed_and_acceleration_command(Axis.AXIS_4, 0x0FA0, 0x0010),
+            bytes.fromhex("3A DB 08 00 00 0F A0 00 10 DC 0D 0A"),
+        )
+        self.assertEqual(
+            build_write_minimum_speed_command(Axis.Z, 0x0A, persist=True),
+            bytes.fromhex("3A DC 04 00 00 00 0A 00 00 24 0D 0A"),
+        )
+        self.assertEqual(
+            build_write_work_speed_and_acceleration_command(Axis.AXIS_4, 0x0FA0, 0x0010, persist=True),
+            bytes.fromhex("3A DD 08 00 00 0F A0 00 10 DE 0D 0A"),
+        )
 
     def test_build_motor_commands(self) -> None:
         self.assertEqual(build_relative_move_command(Axis.Z, reverse=True, pulses=0x00002710, speed_percent=0x20), bytes.fromhex("3A FA 04 01 00 00 27 10 20 90 0D 0A"))
@@ -95,12 +123,18 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(status.output_mask, 0x04)
 
     def test_parse_motion_parameters_response(self) -> None:
-        parameters = parse_motion_parameters_response(bytes.fromhex("A3 B4 01 00 00 00 0A 00 00 62 0D 0A"))
+        parameters = parse_motion_parameters_response(
+            bytes.fromhex(
+                "A3 B2 01 00 00 00 05 00 00 5B 0D 0A "
+                "A3 B3 01 00 00 00 0A 00 00 61 0D 0A "
+                "A3 B4 01 00 00 00 1E 00 00 76 0D 0A"
+            )
+        )
 
         self.assertEqual(parameters.axis, Axis.X)
-        self.assertEqual(parameters.minimum_speed, 0)
+        self.assertEqual(parameters.minimum_speed, 5)
         self.assertEqual(parameters.work_speed, 10)
-        self.assertEqual(parameters.acceleration, 0)
+        self.assertEqual(parameters.acceleration, 30)
 
 
 if __name__ == "__main__":

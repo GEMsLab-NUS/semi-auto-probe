@@ -9,6 +9,9 @@ from .protocol import (
     COMM_TEST_COMMAND,
     FRAME_LENGTH,
     FUNCTION_MOTION_PARAMETERS_RESPONSE,
+    FUNCTION_MINIMUM_SPEED_RESPONSE,
+    FUNCTION_WORK_SPEED_RESPONSE,
+    FUNCTION_GO_HOME_COMPLETED,
     FUNCTION_READ_MOTION_PARAMETERS,
     FUNCTION_READ_POSITION,
     FUNCTION_REACHED_POSITION,
@@ -23,14 +26,18 @@ from .protocol import (
     build_clear_position_command,
     build_disable_realtime_position_command,
     build_enable_realtime_position_command,
+    build_go_home_command,
     build_read_io_status_command,
     build_read_motion_parameters_command,
     build_multi_axis_relative_move_command,
     build_relative_move_command,
     build_read_position_command,
     build_stop_command,
+    build_write_minimum_speed_command,
+    build_write_work_speed_and_acceleration_command,
     hex_bytes,
     payload_contains_clear_position_command,
+    payload_contains_go_home_command,
     parse_frame,
     parse_axis_position_response,
     parse_io_status_response,
@@ -94,9 +101,18 @@ class ControllerSerialClient:
         if not self.admin_mode_enabled:
             raise PermissionError("Clear-position commands require Config admin mode.")
 
-    def send_and_read_frame(self, command: bytes) -> bytes:
+    def _require_admin_mode_for_go_home(self) -> None:
+        if not self.admin_mode_enabled:
+            raise PermissionError("Go Home requires Config admin mode.")
+
+    def _authorize_command(self, command: bytes) -> None:
         if payload_contains_clear_position_command(command):
             self._require_admin_mode_for_clear_position()
+        if payload_contains_go_home_command(command):
+            self._require_admin_mode_for_go_home()
+
+    def send_and_read_frame(self, command: bytes) -> bytes:
+        self._authorize_command(command)
         with self._lock:
             if not self.is_open:
                 self.open()
@@ -108,8 +124,7 @@ class ControllerSerialClient:
             return self._serial.read(FRAME_LENGTH)
 
     def write_command(self, command: bytes, reset_input: bool = False) -> None:
-        if payload_contains_clear_position_command(command):
-            self._require_admin_mode_for_clear_position()
+        self._authorize_command(command)
         with self._lock:
             if not self.is_open:
                 self.open()
@@ -128,8 +143,7 @@ class ControllerSerialClient:
             return self._serial.read(FRAME_LENGTH)
 
     def send_raw(self, payload: bytes, read_length: int = FRAME_LENGTH, reset_input: bool = True) -> bytes:
-        if payload_contains_clear_position_command(payload):
-            self._require_admin_mode_for_clear_position()
+        self._authorize_command(payload)
         with self._lock:
             if not self.is_open:
                 self.open()
@@ -305,6 +319,33 @@ class ControllerSerialClient:
     def read_xyz_motion_parameters(self) -> list[tuple[bytes, bytes, ControllerMotionParameters]]:
         return [self.read_motion_parameters(axis) for axis in (Axis.X, Axis.Y, Axis.Z)]
 
+    def write_motion_parameters(
+        self,
+        axis: Axis,
+        minimum_speed: int,
+        work_speed: int,
+        acceleration: int,
+        *,
+        persist: bool = False,
+    ) -> tuple[bytes, bytes]:
+        minimum_command = build_write_minimum_speed_command(axis, minimum_speed, persist=persist)
+        work_command = build_write_work_speed_and_acceleration_command(
+            axis,
+            work_speed,
+            acceleration,
+            persist=persist,
+        )
+        with self._lock:
+            if not self.is_open:
+                self.open()
+            assert self._serial is not None
+            self._serial.reset_input_buffer()
+            self._serial.write(minimum_command)
+            self._serial.flush()
+            self._serial.write(work_command)
+            self._serial.flush()
+        return minimum_command, work_command
+
     def _read_io_status_response(self) -> bytes:
         assert self._serial is not None
         deadline = time.monotonic() + self.timeout
@@ -345,6 +386,12 @@ class ControllerSerialClient:
         deadline = time.monotonic() + self.timeout
         last_seen = b""
         buffer = bytearray()
+        frames_by_function: dict[int, bytes] = {}
+        expected_functions = (
+            FUNCTION_MINIMUM_SPEED_RESPONSE,
+            FUNCTION_WORK_SPEED_RESPONSE,
+            FUNCTION_MOTION_PARAMETERS_RESPONSE,
+        )
 
         while time.monotonic() < deadline:
             chunk = self._serial.read(1)
@@ -369,11 +416,14 @@ class ControllerSerialClient:
                     break
                 del buffer[:FRAME_LENGTH]
                 last_seen = frame
-                if parsed.function_code == FUNCTION_MOTION_PARAMETERS_RESPONSE and parsed.axis == axis:
-                    return frame
+                if parsed.function_code in expected_functions and parsed.axis == axis:
+                    frames_by_function[parsed.function_code] = frame
+                    if len(frames_by_function) == len(expected_functions):
+                        return b"".join(frames_by_function[function_code] for function_code in expected_functions)
 
         detail = f"last bytes {hex_bytes(last_seen)}" if last_seen else "no frame"
-        raise TimeoutError(f"Timeout waiting for {axis.name} D5 motion-parameter response ({detail}).")
+        received = ",".join(f"{function_code:02X}" for function_code in frames_by_function) or "none"
+        raise TimeoutError(f"Timeout waiting for {axis.name} D5 B2/B3/B4 responses; received {received} ({detail}).")
 
     def read_stable_xyz_positions(
         self,
@@ -499,6 +549,64 @@ class ControllerSerialClient:
         command = build_stop_command(axis=Axis.ALL, emergency=True)
         self.write_command(command)
         return command
+
+    def go_home_and_wait(self, axis: Axis = Axis.ALL, timeout: float = 120.0) -> tuple[bytes, bytes]:
+        self._require_admin_mode_for_go_home()
+        command = build_go_home_command(axis)
+        expected_axes = {Axis.X, Axis.Y, Axis.Z} if axis == Axis.ALL else {axis}
+        with self._lock:
+            if not self.is_open:
+                self.open()
+            assert self._serial is not None
+            self._serial.reset_input_buffer()
+            self._serial.write(command)
+            self._serial.flush()
+            response = self._read_go_home_completed_response(expected_axes, timeout)
+        return command, response
+
+    def _read_go_home_completed_response(self, expected_axes: set[Axis], timeout: float) -> bytes:
+        assert self._serial is not None
+        deadline = time.monotonic() + timeout
+        last_seen = b""
+        buffer = bytearray()
+        completed_axes: set[Axis] = set()
+        completed_frames: list[bytes] = []
+
+        while time.monotonic() < deadline:
+            chunk = self._serial.read(1)
+            if not chunk:
+                continue
+            buffer.extend(chunk)
+            last_seen = bytes(buffer[-FRAME_LENGTH:])
+
+            head_index = buffer.find(bytes((RESPONSE_HEAD,)))
+            if head_index < 0:
+                del buffer[:-1]
+                continue
+            if head_index > 0:
+                del buffer[:head_index]
+
+            while len(buffer) >= FRAME_LENGTH:
+                frame = bytes(buffer[:FRAME_LENGTH])
+                try:
+                    parsed = parse_frame(frame, expected_head=RESPONSE_HEAD)
+                except ValueError:
+                    del buffer[0]
+                    break
+                del buffer[:FRAME_LENGTH]
+                last_seen = frame
+                if parsed.function_code != FUNCTION_GO_HOME_COMPLETED:
+                    continue
+                completed_frames.append(frame)
+                if parsed.axis == int(Axis.ALL):
+                    return b"".join(completed_frames)
+                completed_axes.update(axis for axis in expected_axes if parsed.axis & int(axis))
+                if expected_axes.issubset(completed_axes):
+                    return b"".join(completed_frames)
+
+        detail = f"last bytes {hex_bytes(last_seen)}" if last_seen else "no response"
+        expected = ",".join(axis.name for axis in sorted(expected_axes, key=int))
+        raise TimeoutError(f"Timeout waiting for Go Home completion for {expected} ({detail}).")
 
     def clear_position(self, axis: Axis) -> bytes:
         self._require_admin_mode_for_clear_position()

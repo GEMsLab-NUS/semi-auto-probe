@@ -141,7 +141,7 @@ The software is a Python desktop application for operating the semi-automatic st
 
 | Page | Purpose |
 | --- | --- |
-| `Main` | Live vision, visual measurement, image-point centering, keyboard/jog motion, probe-down guard, GDS/FOV overlays, position readout, home-signal polling, zeroing |
+| `Main` | Live vision, visual measurement, image-point centering, keyboard/jog motion, probe-down guard, GDS/FOV overlays, position readout, administrator-gated three-axis homing, zeroing |
 | `Communication` | Raw command entry, communication-test frame loading, last TX/RX display, hex history |
 | `AutoFocus` | Z autofocus, focus metric selection, score plots, manual Z jog, Z zeroing |
 | `FocusMap` | AF-plane mesh setup, autofocus sampling, plane fitting, 3D visualization, mapping save/load, mapped-Z lock |
@@ -151,7 +151,7 @@ The software is a Python desktop application for operating the semi-automatic st
 | `AutoTest` | Grid/device automation with FocusMap-aware Z approach, probe-assist overlays, photos, Keithley IV, WobbTest, and Keysight B1500 flows |
 | `EdgeTrace` | GDS edge/path selection, work-bound filtering, safe/start/contact steps, segment run, and auto edge tracing |
 | `AI Agent` | Natural-language workflow planning, live microscope/context view, guarded execution of existing high-level workflows |
-| `Config` | Objective/eyepiece selection, pixel calibration, motor mapping, conversion display |
+| `Config` | Objective/eyepiece selection, pixel calibration, motor mapping, controller speed read/write, conversion display |
 
 ### Supported protocol capabilities
 
@@ -159,6 +159,8 @@ The software is a Python desktop application for operating the semi-automatic st
 - Realtime position enable/disable
 - Single-axis position reads
 - I/O status reads for home inputs
+- Three-axis Go Home with completion feedback
+- Controller speed readback (`D5` / `B2`-`B4`) and temporary or power-off-persistent writes (items 10-13)
 - Clear-position commands
 - Single-axis relative and absolute moves
 - 4-axis coordinated relative move command generation
@@ -281,7 +283,8 @@ See [`docs/web-deploy.md`](docs/web-deploy.md) and [`src/semi_auto_probe/web/REA
 - Position cells show `X`, `Y`, and `Z`
 - Single-click a coordinate cell to enter a relative move
 - Double-click a coordinate cell to enter an absolute target
-- `Move`, `Read`, `Continue`, jog controls, home-signal polling, zeroing, and emergency stop are all available from the main motion panel
+- `Move`, `Read`, `Continue`, jog controls, `Go Home`, zeroing, and emergency stop are available from the main motion panel
+- `Go Home` sends protocol item 18 for all axes and remains disabled until Config admin mode is enabled
 - Vision tools include `Center +`, `Point-Point`, `Point-Line`, `Polygon Area`, and `Move Center`
 
 ### LayoutBond
@@ -364,7 +367,7 @@ Local settings are stored in:
 probe_config.local.json
 ```
 
-The configuration page controls optical calibration, active objective/eyepiece selection, camera source/resolution/exposure/gain, motor microstep settings, axis polarity, speed profiles, controller motion parameters, keyboard jog levels, focus thresholds, Agent API settings, and derived `um/pulse` conversions.
+The configuration page controls optical calibration, active objective/eyepiece selection, camera source/resolution/exposure/gain, motor microstep settings, axis polarity, speed profiles, controller motion parameters, keyboard jog levels, focus thresholds, Agent API settings, and derived `um/pulse` conversions. Controller speed values are read only on demand from this page; item 10/11 applies temporary values and item 12/13 saves power-off-persistent values.
 
 Core-field example:
 

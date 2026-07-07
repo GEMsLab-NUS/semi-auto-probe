@@ -1,7 +1,17 @@
 import unittest
 from unittest.mock import patch
 
-from semi_auto_probe.protocol import FRAME_TAIL, RESPONSE_HEAD, Axis, build_clear_position_command, build_read_motion_parameters_command, checksum
+from semi_auto_probe.protocol import (
+    FRAME_TAIL,
+    RESPONSE_HEAD,
+    Axis,
+    build_clear_position_command,
+    build_go_home_command,
+    build_read_motion_parameters_command,
+    build_write_minimum_speed_command,
+    build_write_work_speed_and_acceleration_command,
+    checksum,
+)
 from semi_auto_probe.serial_client import ControllerSerialClient
 
 
@@ -48,12 +58,15 @@ def multi_axis_completed_response() -> bytes:
 
 
 def motion_parameters_response(axis: Axis, minimum_speed: int, work_speed: int, acceleration: int) -> bytes:
-    data = (
-        minimum_speed.to_bytes(2, "big")
-        + work_speed.to_bytes(2, "big")
-        + acceleration.to_bytes(2, "big")
-    )
-    first_nine = bytes((RESPONSE_HEAD, 0xB4, axis)) + data
+    frames = []
+    for function_code, value in ((0xB2, minimum_speed), (0xB3, work_speed), (0xB4, acceleration)):
+        first_nine = bytes((RESPONSE_HEAD, function_code, axis)) + value.to_bytes(4, "big") + bytes(2)
+        frames.append(first_nine + bytes((checksum(first_nine),)) + FRAME_TAIL)
+    return b"".join(frames)
+
+
+def home_completed_response(axis: Axis) -> bytes:
+    first_nine = bytes((RESPONSE_HEAD, 0xB7, axis)) + bytes(6)
     return first_nine + bytes((checksum(first_nine),)) + FRAME_TAIL
 
 
@@ -215,6 +228,49 @@ class SerialClientTest(unittest.TestCase):
 
         self.assertEqual(command, build_clear_position_command(Axis.Z))
         self.assertEqual(bytes(fake.written), command)
+
+    def test_go_home_is_blocked_without_admin_mode(self) -> None:
+        client = ControllerSerialClient("COM_TEST", timeout=0.05)
+        client._serial = FakeSerial(b"")
+
+        with self.assertRaises(PermissionError):
+            client.go_home_and_wait(Axis.ALL, timeout=0.05)
+        with self.assertRaises(PermissionError):
+            client.send_raw(build_go_home_command(Axis.ALL), read_length=0)
+
+    def test_go_home_all_waits_for_xyz_completion(self) -> None:
+        client = ControllerSerialClient("COM_TEST", timeout=0.05)
+        fake = FakeSerial(
+            home_completed_response(Axis.X)
+            + home_completed_response(Axis.Y)
+            + home_completed_response(Axis.Z)
+        )
+        client._serial = fake
+        client.set_admin_mode_enabled(True)
+
+        command, response = client.go_home_and_wait(Axis.ALL, timeout=0.05)
+
+        self.assertEqual(command, build_go_home_command(Axis.ALL))
+        self.assertEqual(bytes(fake.written), command)
+        self.assertEqual(len(response), 3 * 12)
+
+    def test_write_motion_parameters_uses_temporary_or_persistent_commands(self) -> None:
+        client = ControllerSerialClient("COM_TEST", timeout=0.05)
+        fake = FakeSerial(b"")
+        client._serial = fake
+
+        temporary = client.write_motion_parameters(Axis.X, 5, 100, 10, persist=False)
+        persistent = client.write_motion_parameters(Axis.Y, 6, 90, 11, persist=True)
+
+        expected = (
+            build_write_minimum_speed_command(Axis.X, 5)
+            + build_write_work_speed_and_acceleration_command(Axis.X, 100, 10)
+            + build_write_minimum_speed_command(Axis.Y, 6, persist=True)
+            + build_write_work_speed_and_acceleration_command(Axis.Y, 90, 11, persist=True)
+        )
+        self.assertEqual(bytes(fake.written), expected)
+        self.assertEqual(temporary, (expected[:12], expected[12:24]))
+        self.assertEqual(persistent, (expected[24:36], expected[36:48]))
 
 
 if __name__ == "__main__":
