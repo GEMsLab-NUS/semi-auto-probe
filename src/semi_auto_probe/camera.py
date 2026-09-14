@@ -341,6 +341,14 @@ def _miicam_library_candidates() -> list[Path | str]:
 
     arch_dir = "x64" if struct.calcsize("P") * 8 == 64 else "x86"
     candidates.append(Path.cwd() / "miicam.dll")
+    # ImageView ships the same native SDK. Prefer this persistent installation
+    # over a downloaded SDK folder, which may have been moved or cleaned up.
+    program_roots = dict.fromkeys(
+        root for key in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)")
+        if (root := os.environ.get(key))
+    )
+    for root in program_roots:
+        candidates.append(Path(root) / "MII" / "ImageView" / arch_dir / "miicam.dll")
     candidates.append(Path.home() / "Downloads" / "mmgr.20250415" / "win" / arch_dir / "miicam.dll")
     downloads = Path.home() / "Downloads"
     if downloads.exists():

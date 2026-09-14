@@ -1,0 +1,39 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="generator" content="Semi Auto Probe Help"><title>FocusMap</title><link rel="stylesheet" type="text/css" href="../assets/help.css"></head>
+<body><div class="topic-header"><div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div><h1>FocusMap</h1><p class="summary">在矩形或六角网格上测量最佳 Z，拟合样品平面，并供运动、拼接和测量复用。</p></div>
+
+<img class="screenshot" src="../assets/focusmap.png" alt="FocusMap 页面">
+<h2>前置条件</h2>
+<ul>
+<li>完成单点 AutoFocus 验证；Serial、camera frame、Probe Separate 和安全 Z 均已确认。</li>
+<li>运行前清除与目标样品无关的旧结果。移动样品、改变夹具或重定义坐标后应重建映射。</li>
+</ul>
+<h2>定义 Mesh</h2>
+<ol>
+<li>选择 <strong>Rectangular</strong> 或 <strong>Hexagonal</strong>。</li>
+<li>Region mode 使用 Center / Range 时，可输入 Center X/Y 或单击 <strong>Use Current XY</strong>，再给出 X/Y Range、Columns 与 Rows。角点模式下先在载台位置记录 P1/P2。</li>
+<li>单击 <strong>Generate Mesh</strong>，在预览中检查点数、边界和顺序。生成 mesh 只计算路径，不移动硬件。</li>
+</ol>
+<h2>执行选项</h2>
+<ul>
+<li><strong>AUTOFOCUS PARAMETERS：</strong>为网格采样指定 AF metric、步长、范围、重试和拟合参数。</li>
+<li><strong>Return to start position：</strong>任务完成后尝试回到起始坐标。</li>
+<li><strong>Dry run without hardware：</strong>验证网格和状态流，不发送真实运动/相机命令。</li>
+<li><strong>Start FocusMap：</strong>从待测点开始完整采集。</li>
+<li><strong>Re-Auto Focus：</strong>对当前/选中点重新自动对焦。</li>
+<li><strong>Inject Current Z：</strong>把当前 Z 作为选中点结果，适合人工确认，但应记录来源。</li>
+<li><strong>Pause / Stop / Cancel：</strong>暂停后可继续；Stop/Cancel 设置 cooperative stop，需等待当前阻塞动作返回，并在结束后核对实际 XYZ。</li>
+</ul>
+<h2>结果与平面拟合</h2>
+<p>Point Table 列出 X、Y、Z、拟合 Z′、残差 Δ、状态、重试和拟合信息；3D Surface 显示有效点和平面。至少 3 个有效且非共线点才可建立平面。Fit Evaluation 中检查有效/失败点数、最大残差、tilt 与异常点，不应只看“fit completed”。</p>
+<p>拟合平面可在 MainView 的 <strong>FocusMap Z</strong>、ImgStitch、ImgMatrix 或 AutoTest 中提供随 XY 变化的 Z。任何超出已采样区域的外推都应谨慎验证。</p>
+<h2>保存、恢复与导入</h2>
+<ul>
+<li>运行结果自动保存为 <code>last_focusmap_mapping.json</code>，<code>--restore-last</code> 会读取该文件。</li>
+<li><strong>Save Results</strong> 的默认手动文件名是 <code>last_af_plane_mapping.json</code>；这是与自动恢复文件不同的名称。</li>
+<li><strong>Import FM JSON</strong> 读取兼容的 mesh、measured points 和 sample plane model。导入后先核对坐标与样品是否仍匹配。</li>
+</ul>
+<div class="callout warning"><strong>有效期。</strong>FocusMap 不是永久校准。更换 objective、样品、夹具、相机姿态、载台零点或热状态后，应重新验证或重建。</div>
+<p class="related"><strong>相关主题：</strong><a href="autofocus.htm">AutoFocus</a> · <a href="imgstitch.htm">ImgStitch</a> · <a href="data-files.htm">JSON 字段</a></p>
+
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div></body></html>

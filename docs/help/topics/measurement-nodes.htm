@@ -1,0 +1,56 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="generator" content="Semi Auto Probe Help"><title>测量节点与仪器</title><link rel="stylesheet" type="text/css" href="../assets/help.css"></head><body><div class="topic-header"><div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div><h1>测量节点与仪器</h1><p class="summary">当前 Workflow v2 的 37 个节点、主要参数与输出责任。</p></div>
+<div class="callout danger"><strong>默认值不是样品限值。</strong>每次实验都要按接线、仪器端子、样品额定值和实验室 SOP 复核 voltage/current/compliance/range/OVP/OCP。运行前先 Validate，再用最小范围和单点试运行。</div>
+<h2>流程、等待与图像</h2>
+<table class="feature-table">
+<tr><th>节点</th><th>用途</th></tr>
+<tr><td>START / END</td><td>工作流入口与完成点；控制路径必须可达。</td></tr>
+<tr><td>Entity Pause</td><td>按 Duration (s) 等待，并记录 Reason。</td></tr>
+<tr><td>Capture Photo</td><td>保存当前 microscope frame，label 可引用 <code>{point}</code>。</td></tr>
+<tr><td>IT Test</td><td>占位节点；当前 Workflow v2 预检拒绝执行。</td></tr>
+<tr><td>Light Control / Light Pulse / Switch Wavelength</td><td>占位节点；当前 Workflow v2 预检拒绝执行，不代表已有光源适配器。</td></tr>
+</table>
+<h2>Keithley 2450 与 HP 6614C</h2>
+<table class="feature-table">
+<tr><th>节点</th><th>关键配置与结果</th></tr>
+<tr><td>Keithley IV</td><td>voltage/current sweep、single/往返 scan、start/stop/step、voltage/current limit、range、NPLC、terminal、output-off、statistics 与 resistance。</td></tr>
+<tr><td>2450 Fixed-bias Current</td><td>固定 Bias，按 sample count 采样；可在 Mapping 点间 hold。可选择 TEMT6000 optical model、wavelength、power correction 与 dark offset。</td></tr>
+<tr><td>WobbTest</td><td>在 Keithley bias 下扫描 Z，并可继续 XY 优化接触。固定 Z Wire-bond Mapping 中禁止。当前实际结果含 best_current_a；声明的 contact_resistance_ohm 尚未计算。</td></tr>
+<tr><td>6614C Transfer</td><td>HP 6614C 扫 Vg，Keithley 保持 Vd 并测 Id；设置 HP/Keithley resource、bias list、compliance、NPLC 与 settle。</td></tr>
+<tr><td>6614C Output</td><td>Keithley 扫 Vd，HP 6614C 应用每个 Vg；输出 curve、JSON/CSV 与特征。</td></tr>
+</table>
+<h2>Keysight B1500</h2>
+<table class="feature-table">
+<tr><th>节点</th><th>关键配置</th></tr>
+<tr><td>B1500 Transfer</td><td>Vg sweep 与 Vd list；Drain/Gate SMU、Id/Ig compliance、gate leak、abort-on-compliance、ADC、NPLC、autozero、save mode。</td></tr>
+<tr><td>B1500 Output</td><td>Vd sweep 与 Vg list；其余安全与保存参数同类。结果可按 curve 或 ALL long/wide CSV 保存。</td></tr>
+</table>
+<h2>DP100 与光响应</h2>
+<table class="feature-table">
+<tr><th>节点</th><th>用途</th></tr>
+<tr><td>DP100 Laser I-V Calibration</td><td>在 voltage ceiling、current min/max/step、settle、readback timeout、OVP/OCP 与 preset 下建立电流到电压表，只执行一次并输出 calibration data。</td></tr>
+<tr><td>DP100 Laser Output</td><td>设置 voltage/current limit/OVP/OCP、output state、preset、settle；Mapping 可选择 set once。</td></tr>
+<tr><td>DP100 Waveform</td><td>执行 software-timed 点列或 Pulse/Ramp/Staircase 程序；必须设置 final output state。</td></tr>
+<tr><td>Power-gradient Pulse Response</td><td>Keithley 固定 detector bias，同步 DP100 功率逐级升降，输出 I-t 与提取特征。</td></tr>
+<tr><td>Pulse-width Gradient Response</td><td>固定校准功率，递增 pulse width，记录响应。</td></tr>
+<tr><td>Photo IV</td><td>当前执行分支复用通用 IV sweep；dark_reference/light_settle/metric/bias 参数尚未被专用逻辑消费，声明的 photocurrent、dark ratio、responsivity 输出会成为 invalid/missing。不要把它用于自动暗亮扣除结论。</td></tr>
+<tr><td>Photo Transient</td><td>同步光脉冲列的 current-time；支持 bias hold、readback verify 与 rise/fall 提取。</td></tr>
+<tr><td>Virtual Mask Illumination</td><td>将灰度 image 的黑/白电功率按散点绑定映射到 XY 或 UV 坐标。</td></tr>
+<tr><td>Mapping Heatmap</td><td>把已连接数值特征发布成可选空间热图，本身不采集仪器数据。</td></tr>
+</table>
+<h2>计算、条件与显示</h2>
+<table class="feature-table">
+<tr><th>节点</th><th>用途</th></tr>
+<tr><td>Math Formula</td><td>对标量/curve 执行受限表达式，定义变量、常量、输出类型/单位与 invalid 策略。</td></tr>
+<tr><td>Add / Subtract / Multiply / Divide</td><td>连接两个数值或使用 fallback constant；除法要处理零与 invalid。</td></tr>
+<tr><td>Number Compare / Compare A/B</td><td>数值与阈值或两个输入比较，输出 Boolean。</td></tr>
+<tr><td>Boolean Logic</td><td>AND/OR/XOR/NOT，支持缺输入 fallback。</td></tr>
+<tr><td>Boolean Branch</td><td>根据连接的 Boolean 选择控制路径。</td></tr>
+<tr><td>Metric Condition</td><td>读取上游 result metric path，与阈值比较。</td></tr>
+<tr><td>Device State</td><td>按粗 IV 的 resistance/current 阈值分类 open/short 等状态。</td></tr>
+<tr><td>Compliance Check</td><td>判断上游 sweep 是否触及 current/voltage compliance。</td></tr>
+<tr><td>Plot Panel</td><td>1×2 等布局，最多六个 slot；同源 curve family 可叠加，支持 linear/log scale 与手动轴/色标范围。</td></tr>
+</table>
+<h2>终止与证据</h2>
+<p>节点成功不仅依赖函数返回，还应产生预期 completion evidence：曲线终止、输出文件、readback 或 plot history。Stop、blocked 或 failed 后，运行器不会继续后续步骤。外部仪器输出状态必须在节点清理和现场仪器上双重确认。</p>
+<p class="related"><strong>相关主题：</strong><a href="workflow-editor.htm">连接与校验</a> · <a href="data-files.htm">节点输出</a> · <a href="troubleshooting.htm">仪器故障</a></p>
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div></body></html>

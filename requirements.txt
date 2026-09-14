@@ -7,3 +7,5 @@ qcodes>=0.45
 gdstk>=0.9
 fastapi>=0.111
 uvicorn[standard]>=0.30
+PySide6>=6.7
+pyqtgraph>=0.13.7

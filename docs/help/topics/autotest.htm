@@ -1,0 +1,28 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="generator" content="Semi Auto Probe Help"><title>AutoTest：Probe Test</title><link rel="stylesheet" type="text/css" href="../assets/help.css"></head><body><div class="topic-header"><div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div><h1>AutoTest：Probe Test</h1><p class="summary">按版图测试点执行安全接近、探针动作与 Measurement Workflow v2。</p></div>
+<img class="screenshot" src="../assets/autotest.png" alt="AutoTest Probe Test 页面">
+<div class="callout note"><strong>两种互斥页面。</strong>Settings 中由 Admin 启用 Wire-bond Test 后，AutoTest 页显示 Mapping 工作区；关闭时显示本主题的 Probe Test。两种模式共享 Measurement Workflow。</div>
+<h2>前置条件</h2>
+<ul>
+<li><strong>FocusMap：</strong>提供测试点的表面 Z；状态卡必须 Ready。</li>
+<li><strong>LayoutMap：</strong>把 GDS 设备坐标转换为载台坐标；mapping 与当前样品一致。</li>
+<li>Serial、相机与所需 VISA/DP100 仪器已准备，Probe 初始为 Separate。</li>
+<li>先在 <strong>Config Measure Flow</strong> 中完成 Workflow v2 校验；检查所有电气限值和输出关闭路径。</li>
+</ul>
+<h2>Test Point</h2>
+<p>点位可从 Previous、Import 或 Generate 获取。Generate AutoTest Point List 支持内/外 basis、行列计数、name pattern、预览、保存 JSON/List 和 Direct Import。导入后核对设备名、U/V、顺序与 GDS overlay。</p>
+<h2>Device Separate and Approach</h2>
+<p>接近参数包括 down margin、fast/slow 步长、settle、wobble/cycle/offset 与 Z-up split 等。它们控制从安全位置接近和离开样品的运动。第一次样品应使用少量点和保守步长，现场观察完整的 separate→approach→measurement→retract 周期。</p>
+<h2>Measurement Workflow</h2>
+<p><strong>Config Measure Flow</strong> 打开当前正式的图工作流编辑器。节点通过控制线确定执行顺序，通过数据线传递标量或曲线。运行前执行 Validate，确认 start、必需参数、类型和终止路径；节点清单见 <a href="measurement-nodes.htm">测量节点与仪器</a>。</p>
+<h2>执行</h2>
+<ol>
+<li>核对 prerequisites、点数、预测运行时间、workflow 摘要和所有仪器连接。</li>
+<li>保持输出关闭，先用单点/最小参数完成 dry commissioning。</li>
+<li>单击 <strong>Run</strong>。观察 Microscope、Coordinates、GDS、progress 和独立 plot windows。</li>
+<li>错误或风险时按 <strong>Stop</strong>；它在当前阻塞调用返回后退出，不自动抬到 safe Z。紧急情况使用顶栏急停并另行关闭外部仪器输出。</li>
+<li>完成后检查 completed point 数、失败节点、输出 JSON/CSV/图像与 workflow plot 证据。正常完成也不会统一回原点或 safe Z，载台通常停在最后一点的接触/offset 位置。</li>
+</ol>
+<h2>会话输出</h2>
+<p>每次运行创建 <code>autotest_session/YYYYMMDD_HHMMSS[_NN]/</code>，可含 <code>images/</code>、<code>iv/</code>、<code>wobb/</code>、<code>hp6614c/</code>、<code>b1500/</code>、节点 execution JSON 和 <code>workflow_plots/</code>。不同节点的详细文件名见 <a href="data-files.htm">文件、会话与导出</a>。</p>
+<p class="related"><strong>相关主题：</strong><a href="workflow-editor.htm">Workflow v2</a> · <a href="wirebond-mapping.htm">Wire-bond Mapping</a> · <a href="ai-agent.htm">用 Agent 检查/运行</a></p>
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div></body></html>

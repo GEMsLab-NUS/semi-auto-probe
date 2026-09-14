@@ -1,0 +1,26 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="generator" content="Semi Auto Probe Help"><title>Wire-bond Mapping</title><link rel="stylesheet" type="text/css" href="../assets/help.css"></head><body><div class="topic-header"><div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div><h1>Wire-bond Mapping</h1><p class="summary">在固定 Z 的区域网格中运行共享测量工作流，并生成空间热图与可追溯点数据。</p></div>
+<img class="screenshot" src="../assets/wirebond-mapping.png" alt="Wire-bond Mapping 页面">
+<h2>启用方式与边界</h2>
+<p>由授权人员在 Settings 的 Admin 区启用 <strong>Enable Wire-bond Test in AutoTest</strong>，AutoTest 会切换为本页面。它与 Probe Test 互斥，但共享同一 Measurement Workflow。模式写入 <code>probe_config.local.json</code>，普通操作员可继续使用已启用的模式。</p>
+<div class="callout warning"><strong>固定 Z。</strong>Mapping 按当前固定 Z 扫描，不要求 FocusMap、LayoutMap 或 camera 才能运行；这些上下文可用于坐标与预览。会移动探针 Z/XY 的 WobbTest 不允许在固定 Z Mapping 中执行。</div>
+<h2>定义 Scan Region</h2>
+<ul>
+<li><strong>Rectangle：</strong>可用两个角，或中心与角定义。</li>
+<li><strong>Circle：</strong>可用中心与 rim，或三个点定义。</li>
+<li><strong>Polygon：</strong>逐点绘制边界，以 Finish 完成；Backspace 可撤销。</li>
+</ul>
+<p>设置 ΔX、ΔY、serpentine/raster、settle 和 snap。每轴最多 500 点；范围不能整除步长时不会自动追加终点，pulse 取整产生重复坐标时会拒绝。<strong>Preview</strong> 只生成并显示路径；先检查边界、点数、扫描方向和首末点。需要时可 Load 既有计划。</p>
+<h2>Measurement Workflow</h2>
+<p><strong>Config Measure Flow</strong> 打开共享 Workflow v2。Mapping 适合 Capture Photo、2450 Fixed-bias Current、DP100/光响应、公式和 Mapping Heatmap 等每点工作流。设置 <em>hold during mapping</em> 时，仪器偏置可跨点保持，但扫描退出、Stop 或错误时必须有输出关闭清理。</p>
+<h2>运行</h2>
+<ol>
+<li>把探针置于已验证的固定接触/测量高度，核对区域不会越过夹具或器件边界。</li>
+<li>Validate workflow，确认 serial、VISA/DP100、compliance 与点数。</li>
+<li>单击 <strong>Start mapping</strong>。观察路径颜色、Scan Status、点状态和测量 plot。</li>
+<li><strong>Stop</strong> 等待当前运动/读数返回后终止，保留部分结果；没有 resume，载台停在最后位置。现场确认探针高度与所有仪器输出；Mapping 不会自动改用 FocusMap Z。</li>
+</ol>
+<h2>输出与恢复</h2>
+<p>输出位于一个 AutoTest 时间戳 session 中：<code>mapping.json</code>、<code>samples.csv</code>、<code>mapping.csv</code>、<code>mapping.png</code>，以及可选 <code>mapping_artifacts.sqlite3</code>。成功点的节点文件可压入 SQLite 后删除临时 <code>points/</code> 树；失败或中断会保留 loose artifacts 便于诊断。</p>
+<p>Mapping data plots 可选择工作流产生的数值特征作为空间热图。Load 时以 JSON、CSV/SQLite 中的 completed 数据为准，不能仅从 PNG 判断任务完整。</p>
+<p class="related"><strong>相关主题：</strong><a href="workflow-editor.htm">Workflow v2</a> · <a href="measurement-nodes.htm">Fixed-bias / Heatmap</a> · <a href="data-files.htm">Mapping 文件</a></p>
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div></body></html>

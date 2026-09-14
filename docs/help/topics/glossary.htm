@@ -1,0 +1,31 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="generator" content="Semi Auto Probe Help"><title>术语表</title><link rel="stylesheet" type="text/css" href="../assets/help.css"></head><body><div class="topic-header"><div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div><h1>术语表</h1><p class="summary">界面、坐标、扫描和测量中使用的名称。</p></div>
+<table class="feature-table">
+<tr><th>术语</th><th>含义</th></tr>
+<tr><td>Stage X/Y/Z</td><td>载台/探针机构的逻辑三轴坐标，桌面运动命令主要使用 controller pulse。</td></tr>
+<tr><td>Layout U/V</td><td>GDS 版图坐标，经 LayoutMap affine transform 与 Stage X/Y 互换。</td></tr>
+<tr><td>pulse</td><td>控制器离散位置单位；通过 microstep、丝杆导程等转换为物理距离。</td></tr>
+<tr><td>Relative / Absolute</td><td>相对于当前位置的增量 / 控制器坐标中的目标值。</td></tr>
+<tr><td>zero / Go Zero</td><td>控制器坐标 0；Go Zero 是移动到 0，不是寻限位。</td></tr>
+<tr><td>Home / Go Home</td><td>控制器 homing 流程，具体物理含义依现场机构与协议。</td></tr>
+<tr><td>Separate / Contact</td><td>探针被视作离开样品 / 接触样品的状态。</td></tr>
+<tr><td>Safe Z</td><td>用于横向移动或恢复的抬起高度/余量；不能自动保证越过所有夹具。</td></tr>
+<tr><td>FOV</td><td>Field of View，相机在样品/版图上的视场宽高与旋转。</td></tr>
+<tr><td>Focus score</td><td>Laplacian、Tenengrad 或 Brenner 计算的图像清晰度指标。</td></tr>
+<tr><td>FocusMap</td><td>多个 XY 点的最佳 Z 与拟合 sample plane model。</td></tr>
+<tr><td>LayoutMap / LayoutBond</td><td>当前可见名 / 内部历史名；将 GDS U/V 映射到 Stage X/Y。</td></tr>
+<tr><td>tile</td><td>ImgStitch 网格中的单个视场图像。</td></tr>
+<tr><td>T-stack / Z-stack</td><td>同位置的时间序列 / 沿 Z 的图像序列。</td></tr>
+<tr><td>serpentine / raster</td><td>交替行方向扫描 / 每行同方向并回绕。</td></tr>
+<tr><td>Workflow v2</td><td>由类型化 control/data edge 连接的 Measurement Workflow JSON format version 2。</td></tr>
+<tr><td>control edge / data edge</td><td>规定执行顺序的连线 / 传递 scalar、Boolean、curve 或 calibration 的连线。</td></tr>
+<tr><td>compliance</td><td>仪器为保护器件而施加的电压或电流限制。</td></tr>
+<tr><td>NPLC</td><td>按电网周期计的积分时间；通常越大越慢、噪声越低。</td></tr>
+<tr><td>VISA resource</td><td>如 <code>GPIB0::18::INSTR</code> 的仪器连接标识。</td></tr>
+<tr><td>Mapping</td><td>Wire-bond 模式下，在区域网格按固定 Z 执行每点 workflow 并汇总空间结果。</td></tr>
+<tr><td>manifest / execution evidence</td><td>记录任务设置、点/节点状态、文件与完成事实的结构化数据。</td></tr>
+<tr><td>fingerprint</td><td>Agent 计划生成时对 workflow 与扫描 geometry 的签名；配置变化会使旧计划失效。</td></tr>
+<tr><td>blocker</td><td>因状态、前置条件或参数不满足而阻止 Agent/工作流执行的原因。</td></tr>
+<tr><td>CHM / context ID</td><td>Windows Compiled HTML Help 文件 / F1 用于定位具体主题的稳定数字标识。</td></tr>
+</table>
+<p class="related"><strong>相关主题：</strong><a href="interface.htm">界面</a> · <a href="measurement-nodes.htm">节点</a> · <a href="data-files.htm">文件</a></p>
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div></body></html>

@@ -1,0 +1,41 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="generator" content="Semi Auto Probe Help"><title>AutoFocus</title><link rel="stylesheet" type="text/css" href="../assets/help.css"></head>
+<body><div class="topic-header"><div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div><h1>AutoFocus</h1><p class="summary">在当前 XY 位置沿 Z 搜索焦点评分峰值，并保存可审计的运行历史。</p></div>
+
+<img class="screenshot" src="../assets/autofocus.png" alt="AutoFocus 页面">
+<h2>前置条件</h2>
+<ul>
+<li>Serial 已连接、相机已有有效 frame，Probe 为 Separate，且没有其他运动工作流占用。</li>
+<li>先用小步长确认 Z 正负方向与安全搜索范围；Settings 中 green threshold 必须不低于 yellow threshold。</li>
+</ul>
+<h2>页面区域</h2>
+<ul>
+<li><strong>AUTOFOCUS VISION：</strong>运行期间显示采样帧。</li>
+<li><strong>AF Z vs score：</strong>显示 Z 与评分曲线、精细搜索区和拟合结果。</li>
+<li><strong>FOCUS SCORE HISTORY：</strong>显示最新相机帧的 Laplacian、Tenengrad 与 Brenner 历史及阈值状态。</li>
+<li><strong>AUTOFOCUS：</strong>当前 Z、Metric、Initial Step、Min Step、Search Range、Z-/Z+、Start Auto、Set Z=0 与 Stop。</li>
+</ul>
+<h2>参数</h2>
+<table class="feature-table">
+<tr><th>参数</th><th>作用</th></tr>
+<tr><td>Metric</td><td>Laplacian 对边缘二阶变化敏感；Tenengrad 使用梯度能量；Brenner 使用像素差。不同样品应通过重复性选择。</td></tr>
+<tr><td>Initial Step</td><td>粗搜索 Z 步长，单位为 pulse。</td></tr>
+<tr><td>Min Step</td><td>精细阶段允许的最小步长。</td></tr>
+<tr><td>Search Range (+/-)</td><td>以起始 Z 为中心的允许范围；不是机械行程保护。</td></tr>
+</table>
+<p>采样 settle 时间、每点 frame sample count、峰值模型和黄/绿阈值在 Settings 中配置。峰值模型可用于从离散评分估算最佳 Z；最终仍受有效样本与搜索边界约束。</p>
+<h2>运行步骤</h2>
+<ol>
+<li>保持样品静止，确认预览清晰且曝光没有饱和。</li>
+<li>选择 Metric，设置保守的 Initial Step、Min Step 与 Search Range。</li>
+<li>单击 <strong>Start Auto</strong>。状态依次显示运行、采样、拟合和终止。</li>
+<li>检查 Z-score 曲线：峰值应在搜索范围内部且有足够邻近点。核对最终位置读回与评分颜色。</li>
+<li>若方向、对比度或峰形异常，单击 <strong>Stop</strong>。主动 Stop 会跳过最终目标/初始 Z 返回，载台可能停在最后采样 Z；先核对位置，再调整照明/曝光或参数。</li>
+</ol>
+<h2>手动 Z 与零点</h2>
+<p><strong>Z-</strong>/<strong>Z+</strong> 使用 Initial Step 做手动调整。<strong>Set Z=0</strong> 改变当前 Z 坐标参考，受 Admin 保护，不等于机械 homing。</p>
+<h2>输出</h2>
+<p>最近一次完整采样历史写入启动工作目录的 <code>last_autofocus_history.csv</code>，包含时间、stage/Z 目标与读回、运动方向、三种评分、等待与采样信息，以及控制器终止帧。FocusMap 会为每个网格点保存对应的自动对焦结果。</p>
+<p class="related"><strong>相关主题：</strong><a href="focusmap.htm">FocusMap</a> · <a href="config.htm">AutoFocus Settings</a> · <a href="troubleshooting.htm">评分异常</a></p>
+
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div></body></html>

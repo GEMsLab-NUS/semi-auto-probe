@@ -335,6 +335,7 @@ class KeysightB1500Runner:
         *,
         stop_requested: Callable[[], bool] | None = None,
         on_curve: Callable[[dict[str, object]], None] | None = None,
+        strict_cleanup: bool = False,
     ) -> B1500SweepResult:
         normalized = config.normalized()
         stop_requested = stop_requested or (lambda: False)
@@ -350,12 +351,19 @@ class KeysightB1500Runner:
             sample_count = sum(len(curve["x"]) for curve in curves)
             return B1500SweepResult(normalized.test_type, len(curves), sample_count, tuple(output_paths))
         finally:
-            with contextlib.suppress(Exception):
+            errors = []
+            try:
                 b1500.disable_channels()
+            except Exception as exc:
+                errors.append(f"B1500 output OFF failed: {exc}")
             if self._owns_instrument:
-                with contextlib.suppress(Exception):
+                try:
                     b1500.close()
+                except Exception as exc:
+                    errors.append(f"B1500 close failed: {exc}")
                 self.instrument = None
+            if strict_cleanup and errors:
+                raise RuntimeError("; ".join(errors))
 
     def _open_resource(self, resource_name: str):
         try:

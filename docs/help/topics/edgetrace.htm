@@ -1,0 +1,24 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="generator" content="Semi Auto Probe Help"><title>EdgeTrace</title><link rel="stylesheet" type="text/css" href="../assets/help.css"></head><body><div class="topic-header"><div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div><h1>EdgeTrace</h1><p class="summary">以 LayoutMap 路径与 FocusMap 高度为基准，按 scratch/contact 序列追踪器件边缘。</p></div>
+<img class="screenshot" src="../assets/edgetrace.png" alt="EdgeTrace 页面">
+<div class="callout danger"><strong>可能接触样品。</strong>EdgeTrace 包含明确的 Contact 与 scratch Z 动作。先用非关键样品、低速和保守 offset 验证方向、接触高度与停止恢复。</div>
+<h2>前置条件</h2>
+<ul>
+<li>从 LayoutMap 同步或载入 GDS，选择正确 layer；stage↔GDS mapping 有效。</li>
+<li>FocusMap 已建立，目标区域 Z 可用；serial 已连接且位置读回可信。</li>
+<li>核对 microscope、Stage XYZ/Layout UV、FOV 和 GDS pick。</li>
+</ul>
+<h2>规划</h2>
+<p>在 GDS Layout 选择 edge/peak range，设置 grid/range；在 Trace Parameter 设置 offset、scratch、safe、step 和 minimum segment，然后单击 <strong>Plan</strong>。Plan Summary 应显示段数、起点与预计范围。</p>
+<h2>强制准备顺序</h2>
+<ol>
+<li><strong>Move Safe Z：</strong>先抬到安全高度。</li>
+<li><strong>Move Start：</strong>在安全 Z 移到 trace 起点。</li>
+<li><strong>Contact：</strong>降到经 FocusMap 与参数计算的接触/划痕高度。</li>
+</ol>
+<p>只有完成以上状态，<strong>Run Segment</strong> 或 <strong>Auto Run</strong> 才应开始。Run Segment 便于逐段观察；Auto Run 连续执行全部计划段。</p>
+<h2>停止和恢复</h2>
+<p><strong>Stop</strong> 在当前阻塞动作返回后停止新增 trace 点，但不会自动回到 safe Z，可能把针留在 scratch/contact Z。顶栏急停会发送控制器全轴停止，却不会设置 EdgeTrace 的循环停止标志；因此还要按本页 Stop 并现场确认。当前应用关闭流程也不会等待 EdgeTrace worker，EdgeTrace 运行时不要直接关闭窗口。</p>
+<h2>结果判断</h2>
+<p>观察 microscope、当前坐标、计划颜色、segment 进度与页面状态。只有未被 Stop 的正常 Auto Run 完成路径才会执行最终 safe-Z lift；Stop/异常后的 safe Z 必须人工确认。如果 GDS layer/mapping/FocusMap 不匹配，应用会阻止开始并给出 prerequisite 提示。</p>
+<p class="related"><strong>相关主题：</strong><a href="layoutbond.htm">LayoutMap</a> · <a href="focusmap.htm">FocusMap</a> · <a href="safety.htm">停止与恢复</a></p>
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div></body></html>

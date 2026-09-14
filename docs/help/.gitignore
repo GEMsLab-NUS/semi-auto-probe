@@ -1,0 +1,12 @@
+# Local compiler diagnosis matrix; keep the official source and final CHM visible.
+/diagnostic-*
+/matrix-*
+/isolate-*
+/cncombo-*
+/featurecombo-*
+/realcn-feature-*
+/smoke/
+/SemiAutoProbeHelp.compile-*
+!/build/
+/build/*
+!/build/SemiAutoProbeHelp.chm

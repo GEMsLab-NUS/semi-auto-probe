@@ -1,0 +1,25 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="generator" content="Semi Auto Probe Help"><title>ImgStitch</title><link rel="stylesheet" type="text/css" href="../assets/help.css"></head><body><div class="topic-header"><div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div><h1>ImgStitch</h1><p class="summary">按当前区域采集 XY tile、T-stack 或 Z-stack，并重组成完整显微图像。</p></div>
+<img class="screenshot" src="../assets/imgstitch.png" alt="ImgStitch 页面">
+<h2>模式与区域</h2>
+<ul>
+<li><strong>XY Stitch：</strong>按 rows/columns、spacing 或两个角点定义 tile 网格。</li>
+<li><strong>T-Stack：</strong>在同一位置按时间间隔连续采集。</li>
+<li><strong>Z-Stack：</strong>在指定 Z 数量、步长和方向上采集焦深序列。</li>
+</ul>
+<p>XY 区域可使用 Array/Space 参数或 Two Points。先用当前 XY 记录角点，核对行列、step、overlap、扫描顺序和预估 tile 数，再开始运动。</p>
+<h2>Tile acquisition</h2>
+<p>每个 tile 可为 Single、T 或 Z 采集。T/Z 参数控制帧数、间隔、步长及合成方式。使用四角 AutoFocus 或 FocusMap plane 时，先保证对应数据有效；FocusMap 外推区域应单独验证。</p>
+<h2>Recompose</h2>
+<p>重组设置可控制 background correction、tile balance、crop、grid/质量叠加、估计位移和 Focus plane 使用。单击 <strong>Apply and Recalculate</strong> 只重新处理已有 tile，不重新采集；质量与位移视图用于检查接缝、重复纹理与失败 tile。</p>
+<h2>推荐操作</h2>
+<ol>
+<li>相机曝光、白平衡与照明稳定后，选择小区域并核对 overlap。</li>
+<li>如果需要 Z 跟随，先加载或建立 FocusMap；若使用四角 AF，确保区域四角都能安全对焦。</li>
+<li>启动采集并观察进度、Live Camera 和 mosaic。运动或图像异常时先按页面 <strong>Stop</strong>；顶栏急停当前不会设置 ImgStitch 循环的 stop event。</li>
+<li>完成后检查接缝、亮度一致性、边界裁剪和实际覆盖范围，再 <strong>Save Full Image</strong> 导出 PNG/JPEG。</li>
+</ol>
+<h2>停止后的坐标</h2><p>XY Stitch Stop 保留已采 tile/session，通常尝试回原 XYZ；Z-stack Stop 不执行原 Z 返回。任何停止后都应核对位置读回和探针间隙。</p><h2>会话与文件覆盖</h2>
+<div class="callout warning"><strong>固定工作目录。</strong>每次建立新的 ImgStitch session 会重建启动目录下的 <code>imgstitch_session/</code>。需要保留的旧 tile、stack 或 session metadata 应在下一次新会话前复制或用 Save Full Image 导出。</div>
+<p>常见文件包括 <code>tiles/tile_rNNN_cNNN.png</code>、<code>session.json</code>、<code>recomposed_imgstitch.png</code>、<code>stack_result.png</code>、<code>raw_stack/</code> 和 <code>last_imgstitch.png</code>。AI Agent 的 single capture 使用独立、带时间戳的文件名，不再清空现有拼接会话。</p>
+<p class="related"><strong>相关主题：</strong><a href="focusmap.htm">焦平面</a> · <a href="data-files.htm">会话文件</a> · <a href="troubleshooting.htm">拼接质量</a></p>
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div></body></html>

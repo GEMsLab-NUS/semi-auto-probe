@@ -1,0 +1,86 @@
+[OPTIONS]
+Binary Index=Yes
+Binary TOC=Yes
+Compatibility=1.1 or later
+Compiled file=build\SemiAutoProbeHelp.chm
+Contents file=SemiAutoProbeHelp.hhc
+Default Window=main
+Default topic=topics\welcome.htm
+Display compile progress=Yes
+Full-text search=No
+Index file=SemiAutoProbeHelp.hhk
+Language=0x804 Chinese (Simplified, PRC)
+Title=Semi Auto Probe 帮助
+
+[WINDOWS]
+main="Semi Auto Probe 帮助","SemiAutoProbeHelp.hhc","SemiAutoProbeHelp.hhk","topics\welcome.htm","topics\welcome.htm",,,,,0x63520,,0x387e,[20,20,1100,760],0x0,,,,,,0
+
+[FILES]
+assets\help.css
+assets\ai-agent.png
+assets\autofocus.png
+assets\autotest.png
+assets\communication.png
+assets\config.png
+assets\edgetrace.png
+assets\focusmap.png
+assets\imgmatrix.png
+assets\imgstitch.png
+assets\layoutbond.png
+assets\main.png
+assets\wirebond-mapping.png
+topics\welcome.htm
+topics\quick-start.htm
+topics\interface.htm
+topics\safety.htm
+topics\main.htm
+topics\communication.htm
+topics\autofocus.htm
+topics\focusmap.htm
+topics\layoutbond.htm
+topics\imgstitch.htm
+topics\imgmatrix.htm
+topics\autotest.htm
+topics\wirebond-mapping.htm
+topics\workflow-editor.htm
+topics\measurement-nodes.htm
+topics\edgetrace.htm
+topics\ai-agent.htm
+topics\agent-templates.htm
+topics\config.htm
+topics\web-dashboard.htm
+topics\data-files.htm
+topics\shortcuts.htm
+topics\troubleshooting.htm
+topics\glossary.htm
+topics\release-notes.htm
+
+[ALIAS]
+IDH_WELCOME=topics\welcome.htm
+IDH_QUICK_START=topics\quick-start.htm
+IDH_INTERFACE=topics\interface.htm
+IDH_SAFETY=topics\safety.htm
+IDH_PAGE_MAIN=topics\main.htm
+IDH_PAGE_COMMUNICATION=topics\communication.htm
+IDH_PAGE_AUTOFOCUS=topics\autofocus.htm
+IDH_PAGE_FOCUSMAP=topics\focusmap.htm
+IDH_PAGE_LAYOUTBOND=topics\layoutbond.htm
+IDH_PAGE_IMGSTITCH=topics\imgstitch.htm
+IDH_PAGE_IMGMATRIX=topics\imgmatrix.htm
+IDH_PAGE_AUTOTEST=topics\autotest.htm
+IDH_WIREBOND_MAPPING=topics\wirebond-mapping.htm
+IDH_WORKFLOW_EDITOR=topics\workflow-editor.htm
+IDH_MEASUREMENT_NODES=topics\measurement-nodes.htm
+IDH_PAGE_EDGETRACE=topics\edgetrace.htm
+IDH_PAGE_AI_AGENT=topics\ai-agent.htm
+IDH_AGENT_TEMPLATES=topics\agent-templates.htm
+IDH_PAGE_CONFIG=topics\config.htm
+IDH_WEB_DASHBOARD=topics\web-dashboard.htm
+IDH_DATA_FILES=topics\data-files.htm
+IDH_SHORTCUTS=topics\shortcuts.htm
+IDH_TROUBLESHOOTING=topics\troubleshooting.htm
+IDH_GLOSSARY=topics\glossary.htm
+IDH_RELEASE_NOTES=topics\release-notes.htm
+
+[MAP]
+#include context_ids.h

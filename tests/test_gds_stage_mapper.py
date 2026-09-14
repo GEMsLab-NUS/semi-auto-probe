@@ -655,7 +655,7 @@ class GDSMapperMotionBridgeTests(unittest.TestCase):
             events.append(app.result_queue.get_nowait())
         self.assertEqual(events[0][:4], ("motor_command", "XY", "cc LayoutBond", b"command"))
         self.assertEqual(events[1], ("cc_done", b"done", "gds_mapper"))
-        self.assertEqual(events[-1], ("motor_done",))
+        self.assertEqual(events[-1], ("motor_done", "gds_mapper"))
 
     def test_worker_applies_x_axis_polarity_to_controller_direction(self) -> None:
         try:

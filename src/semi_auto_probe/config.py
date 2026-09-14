@@ -302,6 +302,7 @@ def pulses_from_um(distance_um: float, config: "ProbeConfig", axis: str) -> int:
 
 @dataclass
 class ProbeConfig:
+    wire_bond_enabled: bool = False
     objective: int = 10
     eyepiece: float = 2.0
     microstep: int = 2
@@ -545,6 +546,7 @@ class ProbeConfig:
             "camera_color_contrast": self.camera_color_contrast,
             "camera_color_gamma": self.camera_color_gamma,
             "camera_source": self.camera_source,
+            "wire_bond_enabled": self.wire_bond_enabled,
             "camera_resolution_width": self.camera_resolution_width,
             "camera_target_fps": self.camera_target_fps,
             "cc_accel_time_s": self.cc_accel_time_s,
@@ -609,6 +611,7 @@ class ProbeConfig:
             camera_color_contrast=float(data.get("camera_color_contrast", cls.camera_color_contrast)),
             camera_color_gamma=float(data.get("camera_color_gamma", cls.camera_color_gamma)),
             camera_source=str(data.get("camera_source", cls.camera_source)),
+            wire_bond_enabled=data.get("wire_bond_enabled", False) is True,
             camera_resolution_width=normalize_camera_resolution_width(data.get("camera_resolution_width", cls.camera_resolution_width)),
             camera_target_fps=normalize_camera_target_fps(data.get("camera_target_fps", cls.camera_target_fps)),
             cc_accel_time_s=float(data.get("cc_accel_time_s", cls.cc_accel_time_s)),

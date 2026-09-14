@@ -1,5 +1,10 @@
 import unittest
+import os
+import struct
+import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import cv2
 import numpy as np
@@ -12,6 +17,7 @@ from semi_auto_probe.camera import (
     _ToupCamBackend,
     _camera_source_candidates,
     _miicam_paths_from_root,
+    _miicam_library_candidates,
     camera_source_choices,
     normalize_camera_source,
 )
@@ -223,6 +229,40 @@ class CameraSourceTest(unittest.TestCase):
         backend.apply_settings(CameraSettings(white_balance_mode="auto"))
 
         self.assertEqual(dll.calls, [(backend._handle, None, None)])
+
+
+class MiiCamInstalledSdkTests(unittest.TestCase):
+    def test_loads_imageview_sdk_when_downloaded_sdk_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            arch = "x64" if struct.calcsize("P") == 8 else "x86"
+            installed = root / "Program Files" / "MII" / "ImageView" / arch / "miicam.dll"
+            installed.parent.mkdir(parents=True)
+            installed.touch()
+            expected_dll = object()
+
+            def load(path):
+                if Path(path) == installed:
+                    return expected_dll
+                raise OSError("not found")
+
+            loader = SimpleNamespace(WinDLL=Mock(side_effect=load), CDLL=Mock(side_effect=load))
+            backend = _MiiCamBackend()
+            with patch.dict(os.environ, {"SEMI_AUTO_PROBE_MIICAM_SDK": "", "ProgramFiles": str(root / "Program Files"),
+                                         "ProgramW6432": str(root / "Program Files"), "ProgramFiles(x86)": str(root / "Program Files (x86)")}), \
+                 patch("semi_auto_probe.camera.Path.home", return_value=root / "home"), \
+                 patch("semi_auto_probe.camera.Path.cwd", return_value=root / "workspace"):
+                try:
+                    self.assertIs(backend._load_dll(loader), expected_dll)
+                finally:
+                    backend.close()
+
+    def test_explicit_sdk_override_remains_first(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dll = Path(directory) / "miicam.dll"
+            dll.touch()
+            with patch.dict(os.environ, {"SEMI_AUTO_PROBE_MIICAM_SDK": str(dll)}):
+                self.assertEqual(_miicam_library_candidates()[0], dll)
 
 
 class WebCameraSourceTest(unittest.TestCase):

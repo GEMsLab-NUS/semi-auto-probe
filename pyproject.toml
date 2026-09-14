@@ -17,12 +17,18 @@ dependencies = [
   "gdstk>=0.9",
   "fastapi>=0.111",
   "uvicorn[standard]>=0.30",
+  "pyside6>=6.7",
+  "pyqtgraph>=0.13.7",
 ]
+
+[project.optional-dependencies]
+dp100 = ["pythonnet>=3.0"]
 
 [project.scripts]
 semi-auto-probe = "semi_auto_probe.app:main"
 semi-auto-probe-test = "semi_auto_probe.cli:main"
 semi-auto-probe-web = "semi_auto_probe.web_app:main"
+semi-auto-probe-measure = "semi_auto_probe.measure_debug:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,0 +1,36 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="generator" content="Semi Auto Probe Help"><title>AI Agent</title><link rel="stylesheet" type="text/css" href="../assets/help.css"></head><body><div class="topic-header"><div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div><h1>AI Agent</h1><p class="summary">用当前软件状态回答问题、生成受约束计划，并通过本地安全检查逐步执行。</p></div>
+<img class="screenshot" src="../assets/ai-agent.png" alt="AI Agent 页面">
+<h2>三栏工作区</h2>
+<ul>
+<li><strong>左栏：</strong>Microscope、Stage XYZ / Layout UV 与 Agent Status（Phase、Mode、Serial、Camera、Motion、API、token）。</li>
+<li><strong>中栏：</strong>Conversation、权限模式、Run Next Step / Cancel Plan、输入框、Send、Reset Context、Stop 与 Keep。</li>
+<li><strong>右栏：</strong>Steps、Help、Templates、Preview。Templates 的 <strong>Load into input</strong> 只填入输入框，不发送或运行。</li>
+</ul>
+<h2>权限模式</h2>
+<table class="feature-table">
+<tr><th>模式</th><th>行为</th></tr>
+<tr><td>Conversation Only</td><td>回答、解释和预览计划；不会执行步骤。</td></tr>
+<tr><td>Authorized Step</td><td>默认模式。计划生成后，操作员逐次单击 <strong>Run Next Step</strong>。</td></tr>
+<tr><td>Auto Step</td><td>自动调度后续可执行步骤；每一步仍重新读取实时状态并运行本地 blocker/参数检查。</td></tr>
+</table>
+<h2>不需要 API key 的命令</h2>
+<p>本地确定性路由优先处理 <code>/help [topic]</code>、<code>/status</code>、<code>/check</code>、<code>/open &lt;page&gt;</code> 和 <code>/run measurement</code>。中文“如何运行 autofocus？”等帮助意图只解释操作，不会变成硬件动作。</p>
+<p><code>/open</code> 接受界面可见名 MainView、LayoutMap、SerialIO、Settings，也兼容内部名 Main、LayoutBond、Communication、Config。</p>
+<h2>支持的高层动作</h2>
+<p>Agent 可读取帮助与状态、检查当前 measurement workflow、打开页面、按 pulse 移动载台、移动到已选 GDS 目标、运行当前点 AutoFocus、保存单帧、执行当前 ImgStitch/FocusMap 设置、关联最近图像到 LayoutMap，以及运行当前 AutoTest/Mapping measurement。</p>
+<p>ImgMatrix、EdgeTrace、相机连接与手动仪器配置目前由 Agent 提供帮助/导航，不直接修改。Agent 不发送任意 raw controller 命令，不执行 Python，不自由写文件，也不替操作员设置未确认的电压、电流或 compliance。</p>
+<h2>执行门与完成证据</h2>
+<ul>
+<li>Contact 状态下的横向/独立运动、AutoFocus 和扫描会被阻止，需先 Separate。</li>
+<li>运动、位置读取或另一个 workflow 占用时不会开始新动作。</li>
+<li>成像需要 camera frame；FocusMap 需要 mesh；GDS move 需要选中目标和有效 mapping；measurement 需要通过本地图/几何检查。</li>
+<li><code>/run measurement</code> 记录 workflow 与扫描 geometry fingerprint；确认前配置改变会使计划 blocked，必须重新生成。</li>
+<li>下一步只在前一步产生明确 terminal evidence 后开放。普通状态文本不会被当作成功。</li>
+</ul>
+<h2>Cancel 与 Stop</h2>
+<p><strong>Cancel Plan</strong> 丢弃剩余步骤，但当前硬件动作继续。<strong>Stop</strong> 请求停止 Agent 启动的 AutoFocus、FocusMap、ImgStitch、AutoTest/Mapping 或 EdgeTrace，并取消剩余步骤；Agent stage/GDS move 会触发急停。</p>
+<h2>在线模型配置</h2>
+<p>Settings 的 agent_api_key/model/base_url/timeout 非空时优先使用；否则读取 <code>SEMI_AUTO_PROBE_AGENT_API_KEY</code>、<code>..._BASE_URL</code>、<code>..._MODEL</code>、<code>..._TIMEOUT_SECONDS</code>。接口为 OpenAI-compatible <code>/chat/completions</code>。在线失败会显示原因并退到本地规则。</p>
+<div class="callout warning"><strong>密钥保存。</strong>在 Settings 输入的 API key 会以明文写入本地 JSON。共享或备份机器优先使用环境变量，并限制文件访问权限。</div>
+<p class="related"><strong>立即试用：</strong><a href="agent-templates.htm">复制 12 个测试模板</a> · <a href="workflow-editor.htm">Workflow v2</a> · <a href="safety.htm">停止语义</a></p>
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div></body></html>

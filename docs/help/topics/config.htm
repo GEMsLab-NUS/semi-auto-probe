@@ -1,0 +1,32 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="generator" content="Semi Auto Probe Help"><title>Settings：配置与校准</title><link rel="stylesheet" type="text/css" href="../assets/help.css"></head><body><div class="topic-header"><div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div><h1>Settings：配置与校准</h1><p class="summary">管理光学、相机、电机、AutoFocus、AI Agent 与受保护维护功能。</p></div>
+<img class="screenshot" src="../assets/config.png" alt="Settings 页面">
+<h2>配置文件与生效范围</h2>
+<p>桌面应用从<strong>启动工作目录</strong>读取 <code>probe_config.local.json</code>。文件不存在时使用默认值；JSON 无效时应用回退默认并写日志。大多数 Save 操作更新此 UTF-8 JSON；相机参数需要 <strong>Apply Camera</strong> 重启采集才完全生效。</p>
+<div class="callout warning"><strong>工作目录很重要。</strong>从不同目录启动会得到不同配置和输出根。排查“设置丢失”时先确认进程的当前目录和实际 <code>probe_config.local.json</code>。</div>
+<h2>左栏：光学、主控制与相机</h2>
+<ul>
+<li><strong>OPTICAL CALIBRATION：</strong>objective、eyepiece、Calibrate Pixels、Save Config。像素标定按倍率和分辨率保存；更换组合后重新检查。</li>
+<li><strong>MAIN CONTROL：</strong>Motion keys、camera FOV、rotation 等主界面行为。</li>
+<li><strong>CAMERA CONTROL / ADVANCED VIDEO：</strong>source、resolution、target FPS、exposure/gain/white balance 的 Auto/Manual，以及 temperature、saturation、brightness、contrast、gamma。</li>
+</ul>
+<p>Pixel Calibration 使用三点/已知距离对话框；FOV Rotation 可用按钮、slider 或直接输入角度。两者会影响图像↔stage 与 GDS overlay。</p>
+<h2>中栏：电机</h2>
+<ul>
+<li><strong>MOTOR MAPPING：</strong>把逻辑 X/Y/Z 绑定到控制器轴。</li>
+<li><strong>GLOBAL AXIS DIRECTION：</strong>逐轴反向；修改后必须以小步长现场验证。</li>
+<li><strong>MOTOR SPEED：</strong>Fast、Fine、Safe profile 与 active profile。</li>
+<li><strong>CONTROLLER SPEED (D5 / 10-13)：</strong>Read D5 X/Y/Z；Apply 10/11 临时写入；Save 12/13 掉电保存。保存会改变控制器长期状态。</li>
+<li><strong>CONVERSION：</strong>microstep、XY/Z lead、base angle、safe Z margin、CC acceleration；Apply Mapping 更新 pulse↔距离换算。</li>
+</ul>
+<h2>右栏：AutoFocus、Agent 与 Admin</h2>
+<ul>
+<li><strong>AUTOFOCUS CONFIG：</strong>settle ms、sample count、peak model、ImgStitch settle 与 Laplacian/Tenengrad/Brenner yellow/green thresholds。</li>
+<li><strong>AI AGENT API：</strong>provider base URL、API key、model、timeout；Save Agent API 写入 local JSON。</li>
+<li><strong>ADMIN MODE：</strong>读取 <code>SEMI_AUTO_PROBE_ADMIN_TOKEN</code>；未设置时也可使用 <code>SEMI_AUTO_PROBE_WEB_TOKEN</code>。Admin 只对当前应用 session 生效，解锁 set-zero、Go Home 与 Wire-bond mode。</li>
+</ul>
+<h2>相机环境变量</h2>
+<p><code>SEMI_AUTO_PROBE_CAMERA_SOURCE</code> 可覆盖 config；可用 auto、miicam:0、opencv:0、opencv-msmf:0、opencv-dshow:0、toupcam:0。其他变量包括 <code>..._COLOR_ORDER</code>、<code>..._FLIP_VERTICAL</code>、<code>..._FOURCC</code> 和 <code>..._MIICAM_SDK</code>。</p>
+<h2>敏感信息</h2>
+<p><code>agent_api_key</code> 以明文保存。共享电脑优先使用 Agent 环境变量；不要把 <code>probe_config.local.json</code>、token、仪器凭据提交到版本库或放入公开支持包。</p>
+<p class="related"><strong>相关主题：</strong><a href="quick-start.htm">首次配置</a> · <a href="main.htm">运动验证</a> · <a href="troubleshooting.htm">配置排障</a></p>
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div></body></html>

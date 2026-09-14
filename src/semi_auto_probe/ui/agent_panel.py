@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import math
 import threading
+import queue
 import tkinter as tk
 from collections.abc import Callable
 from tkinter import ttk
@@ -15,7 +16,10 @@ from ..agent import (
     VISUALIZATION_FOCUSMAP,
     VISUALIZATION_IMGSTITCH,
     VISUALIZATION_LAYOUT,
+    merge_context_blockers,
 )
+from ..agent_knowledge import AGENT_TEMPLATES, knowledge_markdown
+from ..agent_runtime import AgentExecutionResult
 
 
 class AgentPanel:
@@ -30,15 +34,17 @@ class AgentPanel:
         *,
         get_context: Callable[[], AgentContext],
         get_microscope_preview: Callable[[], bytes | None],
-        plan_instruction: Callable[[str], AgentPlan],
-        execute_plan: Callable[[AgentPlan], str],
+        plan_instruction: Callable[[str, AgentContext], AgentPlan],
+        execute_plan: Callable[[AgentPlan], AgentExecutionResult],
         cancel_plan: Callable[[], str],
         stop_task: Callable[[], str],
         draw_autofocus_plot: Callable[[tk.Canvas], None] | None = None,
+        get_live_context: Callable[[], AgentContext] | None = None,
     ) -> None:
         self.parent = parent
         self.colors = colors
         self.get_context = get_context
+        self.get_live_context = get_live_context or get_context
         self.get_microscope_preview = get_microscope_preview
         self.draw_autofocus_plot = draw_autofocus_plot
         self.plan_instruction = plan_instruction
@@ -46,6 +52,9 @@ class AgentPanel:
         self.cancel_plan = cancel_plan
         self.stop_task = stop_task
         self.pending_plan: AgentPlan | None = None
+        self.planning_results = queue.Queue()
+        self.request_generation = 0
+        self.active_run_id = ""
         self.planning_thread: threading.Thread | None = None
         self.microscope_image: tk.PhotoImage | None = None
         self.phase_var = tk.StringVar(value="Idle")
@@ -62,9 +71,9 @@ class AgentPanel:
 
         shell = ttk.Frame(parent, style="App.TFrame", padding=10)
         shell.grid(row=0, column=0, sticky="nsew")
-        shell.columnconfigure(0, weight=0, minsize=350)
-        shell.columnconfigure(1, weight=1, minsize=560)
-        shell.columnconfigure(2, weight=0, minsize=300)
+        shell.columnconfigure(0, weight=0, minsize=240)
+        shell.columnconfigure(1, weight=1, minsize=360)
+        shell.columnconfigure(2, weight=0, minsize=290)
         shell.rowconfigure(1, weight=1)
 
         header = ttk.Frame(shell, style="App.TFrame")
@@ -83,9 +92,10 @@ class AgentPanel:
         )
         self.refresh_context()
         self._update_microscope_preview()
+        self.parent.after(50, self._poll_planning_results)
 
     def _build_left_column(self, shell: ttk.Frame) -> None:
-        left = ttk.Frame(shell, style="App.TFrame", width=350)
+        left = ttk.Frame(shell, style="App.TFrame", width=280)
         left.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
         left.grid_propagate(False)
         left.columnconfigure(0, weight=1)
@@ -146,6 +156,7 @@ class AgentPanel:
         chat_card.rowconfigure(2, weight=0)
         self.chat_text = tk.Text(
             chat_card,
+            width=1,
             wrap="word",
             bg=self.colors["bg"],
             fg=self.colors["text"],
@@ -174,11 +185,11 @@ class AgentPanel:
             state="readonly",
             width=18,
         )
-        self.permission_mode_combo.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.permission_mode_combo.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 6))
         self.permission_mode_combo.bind("<<ComboboxSelected>>", lambda _event: self._on_permission_mode_changed())
         self.confirm_button = ttk.Button(self.chat_action_frame, text="Run Next Step", style="Accent.TButton", command=self.confirm_next_step, state="disabled")
-        self.confirm_button.grid(row=0, column=1, sticky="e", padx=(0, 6))
-        ttk.Button(self.chat_action_frame, text="Cancel Plan", command=self.cancel_pending_plan).grid(row=0, column=2, sticky="e")
+        self.confirm_button.grid(row=1, column=1, sticky="e", padx=(0, 6))
+        ttk.Button(self.chat_action_frame, text="Cancel Plan", command=self.cancel_pending_plan).grid(row=1, column=2, sticky="e")
 
         composer = ttk.Frame(center, style="Panel.TFrame", padding=10)
         composer.grid(row=1, column=0, sticky="ew", pady=(10, 0))
@@ -186,6 +197,7 @@ class AgentPanel:
         composer.columnconfigure(1, weight=0)
         self.input_text = tk.Text(
             composer,
+            width=1,
             height=3,
             wrap="word",
             bg=self.colors.get("input", self.colors["surface_2"]),
@@ -202,7 +214,7 @@ class AgentPanel:
             pady=9,
         )
         self.input_text.grid(row=0, column=0, columnspan=6, sticky="ew")
-        self.input_text.insert("1.0", "Run autofocus, then capture and save one image")
+        self.input_text.insert("1.0", "/help")
         self.input_text.bind("<Control-Return>", lambda _event: self.generate_plan())
 
         self.generate_button = ttk.Button(composer, text="Send", style="Accent.TButton", command=self.generate_plan)
@@ -218,22 +230,61 @@ class AgentPanel:
         right = ttk.Frame(shell, style="App.TFrame")
         right.grid(row=1, column=2, sticky="nsew")
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(0, weight=3)
-        right.rowconfigure(1, weight=2)
+        right.rowconfigure(0, weight=1)
 
-        task_card = self._section(right, "Task View")
+        style = ttk.Style(right)
+        style.configure("Agent.TNotebook.Tab", width=0, padding=(7, 7), font=("Segoe UI", 9))
+        notebook = ttk.Notebook(right, style="Agent.TNotebook")
+        notebook.grid(row=0, column=0, sticky="nsew")
+        steps_tab, help_tab, templates_tab, preview_tab = (ttk.Frame(notebook, padding=6) for _ in range(4))
+        for tab, title in ((steps_tab, "Steps"), (help_tab, "Help"), (templates_tab, "Templates"), (preview_tab, "Preview")):
+            notebook.add(tab, text=title)
+            tab.columnconfigure(0, weight=1)
+            tab.rowconfigure(0, weight=1)
+
+        task_card = self._section(preview_tab, "Task View")
         task_card.grid(row=0, column=0, sticky="nsew")
         task_card.rowconfigure(1, weight=1)
-        self.task_canvas = tk.Canvas(task_card, bg="#05070a", highlightthickness=1, highlightbackground=self.colors["border"])
+        self.task_canvas = tk.Canvas(task_card, width=1, height=1, bg="#05070a", highlightthickness=1, highlightbackground=self.colors["border"])
         self.task_canvas.grid(row=1, column=0, sticky="nsew")
         self.task_canvas.bind("<Configure>", lambda _event: self._draw_task_view())
 
-        plan_card = self._section(right, "Plan / Results")
-        plan_card.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        plan_card = self._section(steps_tab, "Plan / Results")
+        plan_card.grid(row=0, column=0, sticky="nsew")
         plan_card.rowconfigure(1, weight=1)
         self.plan_text = self._readonly_text(plan_card, height=12, font_size=10)
         self.plan_text.grid(row=1, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(plan_card, command=self.plan_text.yview)
+        scroll.grid(row=1, column=1, sticky="ns")
+        self.plan_text.configure(yscrollcommand=scroll.set)
         ttk.Label(plan_card, textvariable=self.status_var, style="Status.TLabel", wraplength=260, padding=(8, 6)).grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        help_text = self._readonly_text(help_tab, height=20, font_size=10)
+        help_text.grid(row=0, column=0, sticky="nsew")
+        self._replace_text(help_text, knowledge_markdown())
+        help_scroll = ttk.Scrollbar(help_tab, command=help_text.yview)
+        help_scroll.grid(row=0, column=1, sticky="ns")
+        help_text.configure(yscrollcommand=help_scroll.set)
+        self.template_list = tk.Listbox(templates_tab, exportselection=False, width=30,
+                                       bg=self.colors["bg"], fg=self.colors["text"], font=("Segoe UI", 10))
+        self.template_list.grid(row=0, column=0, sticky="nsew")
+        for _, title, _, _ in AGENT_TEMPLATES:
+            self.template_list.insert("end", title)
+        self.template_description = tk.StringVar(value="Select a template. Load only fills the input; it does not send or run.")
+        ttk.Label(templates_tab, textvariable=self.template_description, wraplength=270).grid(row=1, column=0, sticky="ew", pady=8)
+        self.template_list.bind("<<ListboxSelect>>", self._select_template)
+        ttk.Button(templates_tab, text="Load into input", command=self._load_template).grid(row=2, column=0, sticky="ew")
+
+    def _select_template(self, _event=None):
+        selection = self.template_list.curselection()
+        if selection:
+            self.template_description.set(AGENT_TEMPLATES[selection[0]][3])
+
+    def _load_template(self):
+        selection = self.template_list.curselection()
+        if selection:
+            self.input_text.delete("1.0", "end")
+            self.input_text.insert("1.0", AGENT_TEMPLATES[selection[0]][2])
+            self.input_text.focus_set()
 
     def _section(self, parent: tk.Widget, title: str) -> ttk.Frame:
         frame = ttk.Frame(parent, style="Panel.TFrame", padding=10)
@@ -357,6 +408,7 @@ class AgentPanel:
     def _readonly_text(self, parent: tk.Widget, *, height: int, font_size: int, mono: bool = False) -> tk.Text:
         widget = tk.Text(
             parent,
+            width=1,
             height=height,
             wrap="word",
             bg=self.colors.get("input", self.colors["surface_2"]),
@@ -466,7 +518,11 @@ class AgentPanel:
             return 12
 
     def refresh_context(self) -> None:
-        context = self.get_context()
+        context = self.get_live_context()
+        if self.pending_plan is not None:
+            self.pending_plan = merge_context_blockers(self.pending_plan, context)
+            self.confirm_button.configure(state="normal" if self._can_confirm_next_step(self.pending_plan) else "disabled")
+            self._replace_text(self.plan_text, self._format_plan(self.pending_plan))
         self._update_coordinate_metrics(context)
         self._update_agent_state_metrics(context)
         if self.pending_plan is None:
@@ -519,6 +575,9 @@ class AgentPanel:
         self.parent.after(120, self._update_microscope_preview)
 
     def generate_plan(self) -> str:
+        if self.active_run_id:
+            self.status_var.set("Wait for the running step to finish, or Stop it first.")
+            return "break"
         if self.planning_thread is not None and self.planning_thread.is_alive():
             self.status_var.set("Agent planning is already running.")
             return "break"
@@ -534,13 +593,16 @@ class AgentPanel:
         self.status_var.set("Collecting state and calling planner...")
         self._replace_text(self.plan_text, "Preparing capability brief and current software state.")
         planning_instruction = self._planning_instruction_with_history(instruction)
-        self.planning_thread = threading.Thread(target=self._generate_plan_worker, args=(planning_instruction,), daemon=True)
+        # Snapshot Tk variables on the UI thread. Workers only see plain data.
+        context = self.get_context()
+        self.request_generation += 1
+        self.planning_thread = threading.Thread(target=self._generate_plan_worker, args=(planning_instruction, context, self.request_generation), daemon=True)
         self.planning_thread.start()
         return "break"
 
     def _planning_instruction_with_history(self, instruction: str) -> str:
         keep = self._history_keep_count()
-        retained = [(role, text) for role, text, archived in self.chat_messages if not archived and role in {"User", "Agent"}]
+        retained = [(role, text) for role, text, archived in self.chat_messages if not archived and role in {"User", "Agent", "Tool"}]
         retained = retained[-keep:] if keep else []
         if not retained:
             return instruction
@@ -552,13 +614,27 @@ class AgentPanel:
         lines.extend(["", "## Current request", instruction])
         return "\n".join(lines)
 
-    def _generate_plan_worker(self, instruction: str) -> None:
+    def _generate_plan_worker(self, instruction: str, context: AgentContext, generation: int) -> None:
         try:
-            plan = self.plan_instruction(instruction)
+            plan = self.plan_instruction(instruction, context)
         except Exception as exc:
-            self.parent.after(0, lambda: self._handle_plan_error(exc))
+            self.planning_results.put((generation, None, exc))
             return
-        self.parent.after(0, lambda: self._apply_generated_plan(plan))
+        self.planning_results.put((generation, plan, None))
+
+    def _poll_planning_results(self):
+        try:
+            while True:
+                generation, plan, error = self.planning_results.get_nowait()
+                if generation == self.request_generation:
+                    if error is not None:
+                        self._handle_plan_error(error)
+                    else:
+                        self._apply_generated_plan(plan)
+        except queue.Empty:
+            pass
+        if self.parent.winfo_exists():
+            self.parent.after(50, self._poll_planning_results)
 
     def _handle_plan_error(self, exc: Exception) -> None:
         self.pending_plan = None
@@ -572,7 +648,7 @@ class AgentPanel:
         self.refresh_context()
 
     def _apply_generated_plan(self, plan: AgentPlan) -> None:
-        self.pending_plan = plan if plan.executable else None
+        self.pending_plan = plan
         self.task_hint = plan.visualization_hint
         self.total_token_usage += int(plan.token_usage.get("total_tokens", 0))
         self._replace_text(self.plan_text, self._format_plan(plan))
@@ -586,10 +662,14 @@ class AgentPanel:
             self.phase_var.set("Auto stepping")
             self.status_var.set(self._status_for_plan(plan))
         else:
-            self.phase_var.set("Waiting for confirmation" if self._can_confirm_next_step(plan) else ("Blocked" if plan.blockers or plan.needs_clarification else "Idle"))
+            self.phase_var.set("Waiting for confirmation" if self._can_confirm_next_step(plan) else ("Blocked" if plan.blockers or plan.needs_clarification or any(step.blockers for step in plan.steps) else "Idle"))
             self.status_var.set(self._status_for_plan(plan))
         self._append_chat("Agent", plan.reply_markdown or self._format_chat_plan(plan))
         self.refresh_context()
+        if not plan.steps and not plan.needs_clarification:
+            self.phase_var.set("Answered")
+            self.status_var.set("Answer ready. No execution steps.")
+            self._update_agent_state_metrics(self.get_live_context())
         self._schedule_auto_advance()
 
     def _can_confirm_next_step(self, plan: AgentPlan | None) -> bool:
@@ -601,7 +681,7 @@ class AgentPanel:
         if index is None:
             return False
         step = plan.steps[index]
-        return step.requires_confirmation and not step.blockers
+        return plan.executable and not step.blockers
 
     def confirm_next_step(self) -> None:
         if self.permission_mode_var.get() == self.MODE_CHAT:
@@ -627,18 +707,12 @@ class AgentPanel:
             self.confirm_button.configure(state="disabled")
             return
         step = self.pending_plan.steps[step_index]
-        message = self.execute_plan(self.pending_plan)
-        failed = "blocked" in message.lower() or "failed" in message.lower() or "not executable" in message.lower()
-        immediate_done = any(token in message.lower() for token in ("captured", "associated", "summary refreshed", "skipped", "already at"))
-        if failed:
-            self.pending_plan = self.pending_plan.with_step_status(step_index, "blocked", message)
-            self.phase_var.set("Blocked")
-        elif immediate_done:
-            self.pending_plan = self.pending_plan.with_step_status(step_index, "done", message)
-            self.phase_var.set("Waiting for confirmation" if self.pending_plan.next_pending_step_index() is not None else "Done")
-        else:
-            self.pending_plan = self.pending_plan.with_step_status(step_index, "running", message)
-            self.phase_var.set("Executing")
+        result = self.execute_plan(self.pending_plan)
+        message = result.message
+        self.active_run_id = result.run_id if result.status == "running" else ""
+        self.pending_plan = self.pending_plan.with_step_status(step_index, result.status, message)
+        self.phase_var.set("Executing" if result.status == "running" else result.status.title())
+        self.generate_button.configure(state="disabled" if self.active_run_id else "normal")
         self.task_hint = step.visualization_hint
         self.confirm_button.configure(state="normal" if self._can_confirm_next_step(self.pending_plan) else "disabled")
         self.status_var.set(message)
@@ -655,7 +729,8 @@ class AgentPanel:
         if running or self.pending_plan.next_pending_step_index() is None:
             return
         self.confirm_button.configure(state="disabled")
-        self.parent.after(150, lambda: self._run_next_step(auto=True))
+        generation = self.request_generation
+        self.parent.after(150, lambda: self._run_next_step(auto=True) if generation == self.request_generation else None)
 
     def _on_permission_mode_changed(self) -> None:
         mode = self.permission_mode_var.get()
@@ -675,6 +750,15 @@ class AgentPanel:
         self.refresh_context()
 
     def cancel_pending_plan(self) -> None:
+        self.request_generation += 1
+        self.generate_button.configure(state="disabled" if self.active_run_id else "normal")
+        if self.active_run_id and self.pending_plan is not None:
+            for index, step in enumerate(self.pending_plan.steps):
+                if step.status == "pending":
+                    self.pending_plan = self.pending_plan.with_step_status(index, "cancelled")
+            self.status_var.set("Remaining steps cancelled; the current workflow continues. Use Stop to stop it.")
+            self._replace_text(self.plan_text, self._format_plan(self.pending_plan))
+            return
         self.pending_plan = None
         self.confirm_button.configure(state="disabled")
         message = self.cancel_plan()
@@ -685,11 +769,13 @@ class AgentPanel:
         self.refresh_context()
 
     def stop_current_task(self) -> None:
+        self.request_generation += 1
         message = self.stop_task()
         if self.pending_plan is not None:
-            running_index = next((index for index, step in enumerate(self.pending_plan.steps) if step.status == "running"), None)
-            if running_index is not None:
-                self.pending_plan = self.pending_plan.with_step_status(running_index, "blocked", message)
+            for index, step in enumerate(self.pending_plan.steps):
+                if step.status == "pending":
+                    self.pending_plan = self.pending_plan.with_step_status(index, "cancelled", message)
+        self.generate_button.configure(state="disabled" if self.active_run_id else "normal")
         self.confirm_button.configure(state="disabled")
         self.phase_var.set("Blocked")
         self.status_var.set(message)
@@ -699,16 +785,20 @@ class AgentPanel:
 
     def set_status(self, message: str) -> None:
         self.status_var.set(message)
-        lower = message.lower()
+        self.refresh_context()
+
+    def apply_execution_result(self, result: AgentExecutionResult) -> None:
+        if result.run_id != self.active_run_id or not self.active_run_id:
+            return
+        self.active_run_id = ""
+        self.generate_button.configure(state="normal")
+        self.status_var.set(result.message)
         if self.pending_plan is not None:
             running_index = next((index for index, step in enumerate(self.pending_plan.steps) if step.status == "running"), None)
             if running_index is not None:
-                if any(token in lower for token in ("failed", "blocked", "stopped", "unavailable")):
-                    self.pending_plan = self.pending_plan.with_step_status(running_index, "blocked", message)
-                    self.phase_var.set("Blocked")
-                elif any(token in lower for token in ("completed", "saved", "done", "arrived")):
-                    self.pending_plan = self.pending_plan.with_step_status(running_index, "done", message)
-                    self.phase_var.set("Waiting for confirmation" if self.pending_plan.next_pending_step_index() is not None else "Done")
+                self.pending_plan = self.pending_plan.with_step_status(running_index, result.status, result.message)
+                self.phase_var.set(result.status.title())
+                self._append_chat("Tool", result.message)
                 self.confirm_button.configure(state="normal" if self._can_confirm_next_step(self.pending_plan) else "disabled")
                 self._replace_text(self.plan_text, self._format_plan(self.pending_plan))
                 self._schedule_auto_advance()
@@ -782,6 +872,9 @@ class AgentPanel:
 
     @staticmethod
     def _format_plan(plan: AgentPlan) -> str:
+        if not plan.steps:
+            return (f"{plan.title}\n\n" + ("Clarification needed. See the conversation." if plan.needs_clarification else "No execution steps. See the answer in the conversation.")
+                    + "\n\nHelp: current feature guide\nTemplates: load a test prompt\nPreview: workflow visualization")
         next_index = plan.next_pending_step_index()
         next_step = plan.steps[next_index] if next_index is not None else None
         lines = [
@@ -808,9 +901,10 @@ class AgentPanel:
             flag_text = f" [{', '.join(flags)}]" if flags else ""
             lines.append(f"{index}. {step.status.upper()} | {step.title}{flag_text}")
             lines.append(f"   module: {step.module}")
-            lines.append(f"   action: {step.action_id}")
             lines.append(f"   confirm: {'yes' if step.requires_confirmation else 'no'}")
             lines.append(f"   detail: {step.detail}")
+            if step.parameters:
+                lines.append(f"   parameters: {step.parameters}")
             if step.blockers:
                 lines.append("   blockers: " + "; ".join(step.blockers))
         if plan.blockers:
@@ -840,6 +934,9 @@ class AgentPanel:
             return f"Waiting to confirm: {step.title}"
         if plan.blockers:
             return "Blocked: " + "; ".join(plan.blockers)
+        step_blockers = [blocker for step in plan.steps if step.status == "pending" for blocker in step.blockers]
+        if step_blockers:
+            return "Blocked: " + "; ".join(dict.fromkeys(step_blockers))
         if plan.needs_clarification:
             return "Clarification needed."
         return "No executable step."
@@ -847,7 +944,7 @@ class AgentPanel:
     def _draw_task_view(self) -> None:
         if not hasattr(self, "task_canvas"):
             return
-        context = self.get_context()
+        context = self.get_live_context()
         hint = self.task_hint
         if self.pending_plan is not None:
             running = next((step for step in self.pending_plan.steps if step.status == "running"), None)

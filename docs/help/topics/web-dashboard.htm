@@ -1,0 +1,32 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="generator" content="Semi Auto Probe Help"><title>Web Dashboard</title><link rel="stylesheet" type="text/css" href="../assets/help.css"></head><body><div class="topic-header"><div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div><h1>Web Dashboard</h1><p class="summary">以只读方式浏览 AutoTest/Mapping 会话、文件树、JSON 摘要和文本结果。</p></div>
+<h2>启动</h2>
+<pre>$env:SEMI_AUTO_PROBE_WEB_TOKEN = "use-a-strong-token"
+$env:SEMI_AUTO_PROBE_AUTOTEST_SESSION_DIR = "D:\data\autotest_session"
+uv run semi-auto-probe-web</pre>
+<p>默认地址为 <code>http://127.0.0.1:8000</code>。可用 <code>SEMI_AUTO_PROBE_WEB_HOST</code> 和 <code>SEMI_AUTO_PROBE_WEB_PORT</code> 修改监听地址/端口。</p>
+<div class="callout danger"><strong>认证不是默认强制。</strong>只有设置 <code>SEMI_AUTO_PROBE_WEB_TOKEN</code> 后，API 才检查 token。向 LAN 或公网监听前必须设置强 token、限制网络访问，并确认 session 中没有敏感数据。</div>
+<h2>认证与浏览器</h2>
+<p>API 接受 <code>X-Access-Token</code> header 或 <code>?token=</code> query。网页收到 URL token 后会保存到 browser localStorage 并从地址栏移除。401 时核对服务进程实际环境、浏览器保存值与 header。</p>
+<h2>当前功能</h2>
+<ul>
+<li>系统 status 与 connections 摘要。</li>
+<li>列出 session、聚合 latest、选择单个 session。</li>
+<li>显示安全限制在 session root 内的文件树。</li>
+<li>预览 JSON 摘要、CSV/TXT/LOG 文本；内联查看或下载文件。</li>
+</ul>
+<h2>明确不提供的功能</h2>
+<p>当前 Web 不发布 camera，不提供 serial port/position，也没有 motion、probe 或 E-stop 控制。兼容端点会返回 disabled 或 HTTP 410。所有硬件控制仍在本机桌面应用和物理安全装置中完成。</p>
+<h2>环境变量</h2>
+<table class="feature-table">
+<tr><th>变量</th><th>用途</th></tr>
+<tr><td>SEMI_AUTO_PROBE_AUTOTEST_SESSION_DIR</td><td>session root；默认是启动目录下 <code>autotest_session</code>。</td></tr>
+<tr><td>SEMI_AUTO_PROBE_WEB_TOKEN</td><td>启用访问认证；也可作为桌面 Admin token fallback。</td></tr>
+<tr><td>SEMI_AUTO_PROBE_WEB_HOST / ..._PORT</td><td>监听 host 与端口。</td></tr>
+<tr><td>SEMI_AUTO_PROBE_WEB_CORS_ORIGINS</td><td>逗号分隔的允许 origin。</td></tr>
+<tr><td>SEMI_AUTO_PROBE_HOMEPAGE_DIR</td><td>自定义首页静态资源。</td></tr>
+<tr><td>SEMI_AUTO_PROBE_WEB_PID_FILE</td><td>PID 文件；默认 <code>.runtime/semi-auto-probe-web.pid</code>。</td></tr>
+</table>
+<h2>Tray 部署</h2>
+<p>Windows tray 脚本可提供 Open Dashboard、AutoTest Sessions、Restart Web Service、Stop Running、Update Token 与 Check Connections；运行日志位于 <code>.runtime/restart_web.log</code> 和 <code>.runtime/web_tray.log</code>。</p>
+<p class="related"><strong>相关主题：</strong><a href="data-files.htm">会话结构</a> · <a href="troubleshooting.htm">Web 401 / empty session</a></p>
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div></body></html>

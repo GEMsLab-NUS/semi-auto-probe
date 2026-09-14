@@ -212,7 +212,7 @@ class ImgStitchTest(unittest.TestCase):
         )
         positions = stage_positions_from_um(session.tiles, session.um_per_px)
 
-        stage_x_um, stage_y_um = mosaic_pixel_to_stage_um(session, positions, image_x_px=40.0, image_y_px=0.0)
+        stage_x_um, stage_y_um = mosaic_pixel_to_stage_um(session, positions, image_x_px=65.0, image_y_px=20.0)
 
         self.assertAlmostEqual(stage_x_um, -80.0)
         self.assertAlmostEqual(stage_y_um, 0.0)
@@ -401,67 +401,12 @@ class ImgStitchTest(unittest.TestCase):
         self.assertAlmostEqual(positions[(0, 3)][0], 33.0)
 
     def test_green_edge_correction_reverses_right_center_for_left_path(self) -> None:
-        tiles = {
-            (0, 0): np.full((20, 20, 3), 10, dtype=np.uint8),
-            (0, 1): np.full((20, 20, 3), 20, dtype=np.uint8),
-            (0, 2): np.full((20, 20, 3), 30, dtype=np.uint8),
-            (1, 2): np.full((20, 20, 3), 40, dtype=np.uint8),
-            (1, 1): np.full((20, 20, 3), 50, dtype=np.uint8),
-        }
-        session = StitchSession(
-            rows=2,
-            cols=3,
-            tile_width=20,
-            tile_height=20,
-            um_per_px=1.0,
-            objective=20,
-            eyepiece=1.5,
-            range_mode="array",
-            step_x_um=10.0,
-            step_y_um=10.0,
-            origin_stage_x=0,
-            origin_stage_y=0,
-            origin_stage_z=0,
-            settings=StitchSettings(
-                overlap_x=10,
-                overlap_y=10,
-                max_correction_um=100.0,
-                registration_weight=0.0,
-                seam_response_yellow=0.2,
-                seam_response_green=0.5,
-                use_green_edge_correction=True,
-            ),
-            tiles=(
-                TileRecord(0, 0, 1, "a.png", 0, 0, 0, 0.0, 0.0),
-                TileRecord(0, 1, 2, "b.png", -10, 0, 0, -10.0, 0.0),
-                TileRecord(0, 2, 3, "c.png", -20, 0, 0, -20.0, 0.0),
-                TileRecord(1, 2, 4, "d.png", -20, -10, 0, -20.0, -10.0),
-                TileRecord(1, 1, 5, "e.png", -10, -10, 0, -10.0, -10.0),
-            ),
+        # Grid edges are now measured in a canonical direction, independent of
+        # serpentine acquisition order. Opposite-direction fallback stays signed.
+        center = img_stitch_module._center_for_direction(
+            "left", {"right": (11.0, 2.0, 0.5, 3)},
         )
-        original = img_stitch_module.estimate_overlap_shift
-
-        def fake_estimate(_previous, _current, direction, _overlap_x, _overlap_y):
-            del _previous, _current, _overlap_x, _overlap_y
-            if direction == "right":
-                value = fake_estimate.right_values.pop(0)
-            elif direction == "up":
-                value = (0.0, -10.0, 0.9)
-            elif direction == "left":
-                value = (-40.0, 0.0, 0.0)
-            else:
-                value = (10.0, 0.0, 0.9)
-            return value
-
-        try:
-            fake_estimate.right_values = [(10.0, 0.0, 0.9), (12.0, 0.0, 0.9)] * 4  # type: ignore[attr-defined]
-            img_stitch_module.estimate_overlap_shift = fake_estimate  # type: ignore[assignment]
-            _mosaic, positions, edges = recompose_session(session, tile_images=tiles)
-        finally:
-            img_stitch_module.estimate_overlap_shift = original  # type: ignore[assignment]
-
-        self.assertTrue(any(edge.was_corrected for edge in edges))
-        self.assertAlmostEqual(positions[(1, 1)][0], 10.0)
+        self.assertEqual(center, (-11.0, -2.0, 0.5, 3))
 
     def test_green_edge_correction_can_be_disabled(self) -> None:
         tiles = {(0, col): np.full((20, 20, 3), col * 40, dtype=np.uint8) for col in range(4)}

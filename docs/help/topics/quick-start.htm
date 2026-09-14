@@ -1,0 +1,50 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<meta name="generator" content="Semi Auto Probe Help">
+<title>快速开始</title>
+<link rel="stylesheet" type="text/css" href="../assets/help.css">
+</head>
+<body>
+<div class="topic-header">
+  <div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div>
+  <h1>快速开始</h1>
+  <p class="summary">从安装到第一次安全移动、对焦和保存结果。</p>
+</div>
+
+<div class="callout warning"><strong>开始前：</strong>确认机械行程内没有障碍物、探针处于 Separate、样品和夹具固定、控制器及仪器输出处于安全状态。首次使用先阅读 <a href="safety.htm">安全、探针与急停</a>。</div>
+<h2>1. 安装与启动</h2>
+<ol>
+<li>在项目根目录安装依赖：<code>uv sync</code>。使用 DP100 时还需安装可选依赖：<code>uv sync --extra dp100</code>。</li>
+<li>从期望作为工作目录的文件夹启动：<code>uv run semi-auto-probe</code>。配置文件和默认输出目录都以启动工作目录为基准。</li>
+<li>需要恢复上次 FocusMap 与 LayoutMap 时使用 <code>uv run semi-auto-probe --restore-last</code>。</li>
+</ol>
+<h2>2. 建立桌面连接</h2>
+<ol>
+<li>在顶栏 <strong>SERIAL</strong> 选择 Local 或 Remote，选择端口后单击 <strong>Connect</strong>。状态区应显示连接成功。</li>
+<li>单击 <strong>Test</strong> 做协议测试。默认期望接收帧以 <code>A3 AA</code> 开头；失败时转到 <a href="communication.htm">SerialIO</a> 查看 TX/RX。</li>
+<li>在 <strong>CAM</strong> 选择相机源并单击 <strong>Restart</strong>。MainView 应出现实时图像。相机源可为 auto、miicam:0 或 OpenCV/ToupCam 形式。</li>
+</ol>
+<h2>3. 核对 Settings</h2>
+<ol>
+<li>选择实际的 objective 和 eyepiece；用已知尺寸标尺执行 <strong>Calibrate Pixels</strong>。</li>
+<li>核对电机轴映射、方向、microstep、丝杆导程与速度配置。若使用控制器 D5 参数，先 <strong>Read D5 X/Y/Z</strong> 再决定临时 Apply 或掉电保存。</li>
+<li>设置适合样品的 safe Z margin、AutoFocus settling/sample count、Focus score 阈值，然后 <strong>Save Config</strong>。</li>
+<li>只有经过授权的维护人员才应启用 Admin；Set New Zero、Go Home 和 Wire-bond 模式开关受 Admin 保护。</li>
+</ol>
+<h2>4. 第一次移动与对焦</h2>
+<ol>
+<li>打开 <a href="main.htm">MainView</a>，保持 Probe 为 <strong>Separate</strong>。</li>
+<li>选择较小 jog step 和 Safe/Fine 速度，单击 X/Y/Z 的 Fwd/Rev。每次动作后核对位置读回。</li>
+<li>切换到 <a href="autofocus.htm">AutoFocus</a>，用小范围手动 Z 动作确认正负方向，再运行一次自动对焦。</li>
+<li>需要区域对焦时，在 <a href="focusmap.htm">FocusMap</a> 生成小网格并先用 Dry run 验证路径。</li>
+</ol>
+<h2>5. 第一次自动化任务</h2>
+<p>图像任务从 <a href="imgmatrix.htm">ImgMatrix</a> 或 <a href="imgstitch.htm">ImgStitch</a> 开始；电学/光学测量从 <a href="autotest.htm">AutoTest</a> 配置点位，再在 <a href="workflow-editor.htm">Measurement Workflow v2</a> 中连接节点。首次运行应减少点数、关闭高风险输出并使用保守限值。</p>
+<div class="callout note"><strong>输出位置。</strong>配置保存在 <code>probe_config.local.json</code>；ImgMatrix、ImgStitch、AutoTest 和 Mapping 会在启动工作目录下建立各自会话目录。完整清单见 <a href="data-files.htm">文件、会话与导出</a>。</div>
+<p class="related"><strong>相关主题：</strong><a href="interface.htm">界面与状态</a> · <a href="troubleshooting.htm">故障排查</a></p>
+
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div>
+</body>
+</html>

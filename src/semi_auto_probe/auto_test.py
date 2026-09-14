@@ -8,6 +8,9 @@ from pathlib import Path
 from tkinter import filedialog, ttk
 from typing import Callable
 
+from .dp100 import DEFAULT_LASER_PARAMS
+from .virtual_mask import DEFAULT_MASK_PATH, default_binding_text
+from .measurement_workflow import AutoTestFlowStep
 from .gds_stage_mapper import AuxiliaryPointOverlay, AffineCoordinateMapper, GDSCanvasViewer, GDSLayoutModel, MatrixOverlay, ToggleSwitch
 from .img_matrix import fov_polygon_for_stage_target
 
@@ -22,12 +25,6 @@ WOBBTEST_FLOW_CARD_HEIGHT_Z = 464
 WOBBTEST_FLOW_CARD_HEIGHT_ZXY = 544
 IV_FLOW_CARD_HEIGHT = 532
 HP6614C_FLOW_CARD_HEIGHT = 610
-
-
-@dataclass(frozen=True)
-class AutoTestFlowStep:
-    type_id: str
-    params: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -175,9 +172,25 @@ class AutoTestFlowCard:
     type_id: str
     params: dict[str, str]
     expanded: bool = False
+    x: float = 120.0
+    y: float = 100.0
 
 
 AUTOTEST_FLOW_DEFINITIONS: tuple[AutoTestFlowDefinition, ...] = (
+    AutoTestFlowDefinition(
+        "workflow_start",
+        "START",
+        "Workflow entry point.",
+        "#38bdf8",
+        (),
+    ),
+    AutoTestFlowDefinition(
+        "workflow_end",
+        "END",
+        "Workflow completion point.",
+        "#64748b",
+        (),
+    ),
     AutoTestFlowDefinition(
         "wait",
         "Entity Pause",
@@ -401,7 +414,367 @@ AUTOTEST_FLOW_DEFINITIONS: tuple[AutoTestFlowDefinition, ...] = (
             AutoTestFlowParam("label", "Image label", "{point}"),
         ),
     ),
+    AutoTestFlowDefinition(
+        "laser_iv_calibration",
+        "DP100 Laser I-V Calibration",
+        "Measure the DP100 current-to-voltage table once and expose it through a calibration data port.",
+        "#22c55e",
+        (
+            AutoTestFlowParam("calibration_voltage_v", "Voltage ceiling (V)", "3.3"),
+            AutoTestFlowParam("calibration_current_min_a", "Current minimum (A)", "0.001"),
+            AutoTestFlowParam("calibration_current_max_a", "Current maximum (A)", "0.025"),
+            AutoTestFlowParam("calibration_current_step_a", "Current step (A)", "0.001"),
+            AutoTestFlowParam("calibration_settle_ms", "Settle before read (ms)", "100"),
+            AutoTestFlowParam("readback_timeout_s", "Readback timeout per level (s)", "2.0"),
+            AutoTestFlowParam("readback_interval_ms", "Readback retry interval (ms)", "100"),
+            AutoTestFlowParam("ovp_v", "OVP (V)", "3.3"),
+            AutoTestFlowParam("ocp_a", "OCP (A)", "0.028"),
+            AutoTestFlowParam("preset_index", "DP100 preset", "1"),
+        ),
+    ),
+    AutoTestFlowDefinition(
+        "photo_power_steps",
+        "Power-gradient Pulse Response",
+        "At fixed detector bias, measure I-t response while calibrated laser drive power rises and falls in equal steps.",
+        "#0ea5e9",
+        (
+            AutoTestFlowParam("resource_name", "VISA resource", "GPIB0::18::INSTR"),
+            AutoTestFlowParam("output_terminal", "Terminal", "front"),
+            AutoTestFlowParam("bias_v", "Detector bias (V)", "5.0"),
+            AutoTestFlowParam("current_limit_a", "Detector current limit (A)", "0.001"),
+            AutoTestFlowParam("measure_range", "Range (A / auto)", "auto"),
+            AutoTestFlowParam("nplc", "NPLC", "0.01"),
+            AutoTestFlowParam("sample_interval_ms", "Sample interval (ms)", "10"),
+            AutoTestFlowParam("power_min_mw", "Drive power minimum (mW / auto)", "auto"),
+            AutoTestFlowParam("power_max_mw", "Drive power maximum (mW / auto)", "auto"),
+            AutoTestFlowParam("power_levels", "Power levels", "25"),
+            AutoTestFlowParam("power_width_ms", "Pulse width (ms)", "200"),
+            AutoTestFlowParam("pulse_gap_ms", "Dark gap (ms)", "1000"),
+            AutoTestFlowParam("program_lead_ms", "Initial dark baseline (ms)", "100"),
+            AutoTestFlowParam("hold_during_mapping", "Hold detector bias during mapping", "true"),
+            AutoTestFlowParam("verify_bias", "Check measured detector bias", "true"),
+        ),
+    ),
+    AutoTestFlowDefinition(
+        "photo_width_steps",
+        "Pulse-width Gradient Response",
+        "At fixed calibrated laser drive power, measure I-t response for increasing pulse durations.",
+        "#06b6d4",
+        (
+            AutoTestFlowParam("resource_name", "VISA resource", "GPIB0::18::INSTR"),
+            AutoTestFlowParam("output_terminal", "Terminal", "front"),
+            AutoTestFlowParam("bias_v", "Detector bias (V)", "5.0"),
+            AutoTestFlowParam("current_limit_a", "Detector current limit (A)", "0.001"),
+            AutoTestFlowParam("measure_range", "Range (A / auto)", "auto"),
+            AutoTestFlowParam("nplc", "NPLC", "0.01"),
+            AutoTestFlowParam("sample_interval_ms", "Sample interval (ms)", "10"),
+            AutoTestFlowParam("width_power_mw", "Fixed drive power (mW / auto)", "auto"),
+            AutoTestFlowParam("width_min_ms", "Width minimum (ms)", "100"),
+            AutoTestFlowParam("width_max_ms", "Width maximum (ms)", "500"),
+            AutoTestFlowParam("width_step_ms", "Width step (ms)", "100"),
+            AutoTestFlowParam("pulse_gap_ms", "Dark gap (ms)", "1000"),
+            AutoTestFlowParam("program_lead_ms", "Initial dark baseline (ms)", "100"),
+            AutoTestFlowParam("hold_during_mapping", "Hold detector bias during mapping", "true"),
+            AutoTestFlowParam("verify_bias", "Check measured detector bias", "true"),
+        ),
+    ),
+    AutoTestFlowDefinition(
+        "mapping_heatmap",
+        "Mapping Heatmap",
+        "Publish connected numeric feature parameters as selectable spatial heatmaps.",
+        "#a78bfa",
+        (
+            AutoTestFlowParam("primary_label", "Primary map label", "Power-gradient response"),
+            AutoTestFlowParam("secondary_label", "Secondary map label", "Pulse-width response"),
+        ),
+    ),
+    AutoTestFlowDefinition(
+        "laser_output",
+        "DP100 Laser Output",
+        "Set the laser LED supply voltage, current limit and protection limits.",
+        "#ef4444",
+        (
+            AutoTestFlowParam("peak_voltage_v", "Voltage (V)", DEFAULT_LASER_PARAMS["peak_voltage_v"]),
+            AutoTestFlowParam("peak_current_a", "Current limit (A)", DEFAULT_LASER_PARAMS["peak_current_a"]),
+            AutoTestFlowParam("ovp_v", "OVP (V)", DEFAULT_LASER_PARAMS["ovp_v"]),
+            AutoTestFlowParam("ocp_a", "OCP (A)", DEFAULT_LASER_PARAMS["ocp_a"]),
+            AutoTestFlowParam("output_state", "Output", "on"),
+            AutoTestFlowParam("preset_index", "DP100 preset", "1"),
+            AutoTestFlowParam("mapping_once", "Set once per mapping scan", "false"),
+            AutoTestFlowParam("settle_s", "Output settle (s)", "0"),
+        ),
+    ),
+    AutoTestFlowDefinition(
+        "virtual_mask",
+        "Virtual Mask Illumination",
+        "Drive a grayscale image as coordinate-bound illumination during Wire-bond Mapping. Auto uses LayoutMap UV when available, otherwise stage XY.",
+        "#8b5cf6",
+        (
+            AutoTestFlowParam("image_path", "Grayscale mask image", str(DEFAULT_MASK_PATH)),
+            AutoTestFlowParam("coordinate_frame", "Binding coordinates", "xy"),
+            AutoTestFlowParam("bindings", "Scatter bindings: pixel X,Y,target A,B", default_binding_text()),
+            AutoTestFlowParam("black_power_mw", "Black pixel electrical power (mW)", "0"),
+            AutoTestFlowParam("white_power_mw", "White pixel electrical power (mW)", "5"),
+            AutoTestFlowParam("invert_intensity", "Invert grayscale intensity", "false"),
+            AutoTestFlowParam("settle_s", "Light settle (s)", "0.05"),
+        ),
+    ),
+    AutoTestFlowDefinition(
+        "laser_pulse",
+        "DP100 Waveform",
+        "Output a software-timed editable laser LED waveform.",
+        "#f43f5e",
+        (
+            AutoTestFlowParam("peak_voltage_v", "Peak voltage (V)", DEFAULT_LASER_PARAMS["peak_voltage_v"]),
+            AutoTestFlowParam("peak_current_a", "Current limit (A)", DEFAULT_LASER_PARAMS["peak_current_a"]),
+            AutoTestFlowParam("ovp_v", "OVP (V)", DEFAULT_LASER_PARAMS["ovp_v"]),
+            AutoTestFlowParam("ocp_a", "OCP (A)", DEFAULT_LASER_PARAMS["ocp_a"]),
+            AutoTestFlowParam("baseline_voltage_v", "Baseline voltage (V)", "0"),
+            AutoTestFlowParam("baseline_current_a", "Baseline current (A)", "0"),
+            AutoTestFlowParam("delay_ms", "Initial delay (ms)", "100"),
+            AutoTestFlowParam("rise_ms", "Rise (ms)", "0"),
+            AutoTestFlowParam("width_ms", "Pulse width (ms)", "100"),
+            AutoTestFlowParam("fall_ms", "Fall (ms)", "0"),
+            AutoTestFlowParam("period_ms", "Period (ms)", "500"),
+            AutoTestFlowParam("count", "Pulse count", "1"),
+            AutoTestFlowParam("final_state", "Final output", "off"),
+            AutoTestFlowParam("preset_index", "DP100 preset", "1"),
+            AutoTestFlowParam("waveform_points", "Waveform points", ""),
+            AutoTestFlowParam("program", "Generated program", "custom"),
+            AutoTestFlowParam("calibration_voltage_v", "Calibration voltage ceiling (V)", "3.3"),
+            AutoTestFlowParam("calibration_settle_ms", "Calibration settle (ms)", "100"),
+            AutoTestFlowParam("intensity_min_a", "Intensity minimum (A)", "0.001"),
+            AutoTestFlowParam("intensity_max_a", "Intensity maximum (A)", "0.025"),
+            AutoTestFlowParam("intensity_step_a", "Intensity step (A)", "0.001"),
+            AutoTestFlowParam("intensity_width_ms", "Intensity pulse width (ms)", "200"),
+            AutoTestFlowParam("pulse_gap_ms", "Dark gap between pulses (ms)", "1000"),
+            AutoTestFlowParam("program_lead_ms", "Dark baseline before pulses (ms)", "100"),
+            AutoTestFlowParam("width_current_a", "Width-series current (A)", "0.015"),
+            AutoTestFlowParam("width_min_ms", "Width minimum (ms)", "100"),
+            AutoTestFlowParam("width_max_ms", "Width maximum (ms)", "500"),
+            AutoTestFlowParam("width_step_ms", "Width step (ms)", "100"),
+        ),
+    ),
+    AutoTestFlowDefinition(
+        "photo_iv",
+        "Photo IV",
+        "Run an IV sweep while the configured DP100 light output is active.",
+        "#14b8a6",
+        (
+            AutoTestFlowParam("resource", "VISA resource", "GPIB0::18::INSTR"),
+            AutoTestFlowParam("output_terminal", "Output terminal", "rear"),
+            AutoTestFlowParam("start", "Start (V)", "0"),
+            AutoTestFlowParam("stop", "Stop (V)", "1"),
+            AutoTestFlowParam("step", "Step (V)", "0.05"),
+            AutoTestFlowParam("current_limit_a", "Current limit (A)", "1e-3"),
+            AutoTestFlowParam("dark_reference", "Capture dark reference", "true"),
+            AutoTestFlowParam("light_settle_s", "Light settle (s)", "0.2"),
+            AutoTestFlowParam("metric", "Extract metric", "photocurrent_a"),
+            AutoTestFlowParam("bias_v", "Metric bias (V)", "0.1"),
+        ),
+    ),
+    AutoTestFlowDefinition(
+        "photo_transient",
+        "Photo Transient",
+        "Measure current-time response synchronized to a light pulse train.",
+        "#06b6d4",
+        (
+            AutoTestFlowParam("resource_name", "VISA resource", "GPIB0::18::INSTR"),
+            AutoTestFlowParam("output_terminal", "Terminal", "front"),
+            AutoTestFlowParam("bias_v", "Device bias (V)", "0.1"),
+            AutoTestFlowParam("current_limit_a", "Current limit (A)", "1e-3"),
+            AutoTestFlowParam("measure_range", "Range (A / auto)", "auto"),
+            AutoTestFlowParam("nplc", "NPLC", "0.01"),
+            AutoTestFlowParam("duration_s", "Duration (s)", "5"),
+            AutoTestFlowParam("sample_interval_ms", "Sample interval (ms)", "10"),
+            AutoTestFlowParam("trigger_delay_ms", "Trigger delay (ms)", "100"),
+            AutoTestFlowParam("extract", "Extract", "rise_fall_time"),
+            AutoTestFlowParam("hold_during_mapping", "Hold bias during mapping", "true"),
+            AutoTestFlowParam("verify_bias", "Check measured bias (5% / 50 mV)", "true"),
+        ),
+    ),
+    AutoTestFlowDefinition(
+        "math_formula",
+        "Math Formula",
+        "Combine two numeric values and expose a numeric result.",
+        "#a78bfa",
+        (
+            AutoTestFlowParam("operator", "Operation", "+"),
+            AutoTestFlowParam("fallback_a", "Fallback A", "0"),
+            AutoTestFlowParam("fallback_b", "Fallback B", "0"),
+        ),
+    ),
+    AutoTestFlowDefinition(
+        "boolean_compare",
+        "Number Compare",
+        "Compare a numeric input against a threshold and output a Boolean value.",
+        "#f59e0b",
+        (
+            AutoTestFlowParam("operator", "Comparison", ">="),
+            AutoTestFlowParam("threshold", "Threshold", "0"),
+            AutoTestFlowParam("missing_result", "Missing input", "false"),
+        ),
+    ),
+    AutoTestFlowDefinition(
+        "boolean_logic",
+        "Boolean Logic",
+        "Apply AND, OR, XOR or NOT to Boolean inputs.",
+        "#fb923c",
+        (
+            AutoTestFlowParam("operator", "Logic", "AND"),
+            AutoTestFlowParam("fallback_a", "Fallback A", "false"),
+            AutoTestFlowParam("fallback_b", "Fallback B", "false"),
+        ),
+    ),
+    AutoTestFlowDefinition(
+        "condition_boolean",
+        "Boolean Branch",
+        "Branch the control flow using a connected Boolean value.",
+        "#f97316",
+        (
+            AutoTestFlowParam("fallback", "Missing input", "false"),
+        ),
+    ),
+    AutoTestFlowDefinition(
+        "condition_metric",
+        "Metric Condition",
+        "Branch using a scalar extracted from any upstream test result.",
+        "#f59e0b",
+        (
+            AutoTestFlowParam("source_node", "Source node ID", "previous"),
+            AutoTestFlowParam("metric", "Metric path", "statistics.resistance_ohm"),
+            AutoTestFlowParam("operator", "Operator", ">"),
+            AutoTestFlowParam("threshold", "Threshold", "1e9"),
+            AutoTestFlowParam("missing_result", "Missing result", "false"),
+        ),
+    ),
+    AutoTestFlowDefinition(
+        "condition_device_state",
+        "Device State",
+        "Classify a coarse IV result before expensive characterization.",
+        "#fbbf24",
+        (
+            AutoTestFlowParam("source_node", "Coarse IV node ID", "previous"),
+            AutoTestFlowParam("state", "State", "open_circuit"),
+            AutoTestFlowParam("resistance_threshold_ohm", "Resistance threshold (ohm)", "1e9"),
+            AutoTestFlowParam("current_threshold_a", "Short current threshold (A)", "1e-3"),
+            AutoTestFlowParam("missing_result", "Missing result", "false"),
+        ),
+    ),
+    AutoTestFlowDefinition(
+        "condition_compliance",
+        "Compliance Check",
+        "Branch when an upstream sweep reached current or voltage compliance.",
+        "#eab308",
+        (
+            AutoTestFlowParam("source_node", "Source node ID", "previous"),
+            AutoTestFlowParam("expected", "Compliance reached", "true"),
+            AutoTestFlowParam("missing_result", "Missing result", "false"),
+        ),
+    ),
 )
+
+
+AUTOTEST_FLOW_DEFINITIONS += (
+    AutoTestFlowDefinition(
+        "constant_current", "2450 Fixed-bias Current",
+        "Apply a fixed voltage and sample current. Optionally hold bias between mapping points; output closes at scan exit.",
+        "#22c55e",
+        (
+            AutoTestFlowParam("resource_name", "VISA resource", "GPIB0::18::INSTR"),
+            AutoTestFlowParam("output_terminal", "Terminal", "rear"),
+            AutoTestFlowParam("voltage_v", "Bias (V)", "0.1"),
+            AutoTestFlowParam("current_limit_a", "Current limit (A)", "1e-5"),
+            AutoTestFlowParam("measure_range", "Range (A / auto)", "auto"),
+            AutoTestFlowParam("nplc", "NPLC", "1"),
+            AutoTestFlowParam("sample_count", "Samples", "5"),
+            AutoTestFlowParam("settle_s", "Bias settle (s)", "0.2"),
+            AutoTestFlowParam("hold_during_mapping", "Hold bias during mapping", "false"),
+            AutoTestFlowParam("verify_bias", "Check measured bias (5% / 50 mV)", "false"),
+            AutoTestFlowParam("optical_model", "Optical detector", "none"),
+            AutoTestFlowParam("wavelength_nm", "TEMT6000 wavelength (nm)", "650"),
+            AutoTestFlowParam("power_correction", "TEMT6000 power correction (×)", "1"),
+            AutoTestFlowParam("dark_current_a", "TEMT6000 measured dark offset (A)", "0"),
+        ),
+    ),
+)
+
+
+# Public card definitions; port behavior lives in workflow_ports.
+_EXTRA_DEFINITIONS = tuple(
+    AutoTestFlowDefinition(kind, title, "Two numeric inputs; each may be wired or a constant.", "#a78bfa", (
+        AutoTestFlowParam("fallback_a", "Constant A", "0"),
+        AutoTestFlowParam("fallback_b", "Constant B", "0"),
+        AutoTestFlowParam("on_invalid", "Invalid result", "invalid"),
+    )) for kind, title in (("math_add", "Add"), ("math_subtract", "Subtract"),
+                          ("math_multiply", "Multiply"), ("math_divide", "Divide"))
+) + (
+    AutoTestFlowDefinition("boolean_compare_pair", "Compare A / B", "Compare two connected values or constants.", "#f59e0b", (
+        AutoTestFlowParam("operator", "Comparison", ">="), AutoTestFlowParam("fallback_a", "Constant A", "0"),
+        AutoTestFlowParam("fallback_b", "Constant B", "0"), AutoTestFlowParam("on_invalid", "Invalid result", "invalid"),
+    )),
+    AutoTestFlowDefinition("plot_panel", "Plot Panel", "One source / physical quantity per subplot; same-source curve families are supported.", "#38bdf8", (
+        AutoTestFlowParam("layout", "Layout", "1x2"),
+    ) + tuple(param for i in range(1, 7) for param in (
+        AutoTestFlowParam(f"slot{i}_title", f"Plot {i} title", ""),
+        AutoTestFlowParam(f"slot{i}_series", "Curve (all or label)", "all"),
+        AutoTestFlowParam(f"slot{i}_xscale", "X scale", "linear"),
+        AutoTestFlowParam(f"slot{i}_yscale", "Y scale", "linear"),
+        AutoTestFlowParam(f"slot{i}_xlim", "X range (auto or min,max)", "auto"),
+        AutoTestFlowParam(f"slot{i}_ylim", "Y range (auto or min,max)", "auto"),
+        AutoTestFlowParam(f"slot{i}_cscale", "Color scale", "linear"),
+        AutoTestFlowParam(f"slot{i}_clim", "Color range (auto or min,max)", "auto"),
+    ))),
+)
+AUTOTEST_FLOW_DEFINITIONS = tuple(
+    AutoTestFlowDefinition(d.type_id, d.title, "Custom scalar / curve feature expression.", d.accent, (
+        AutoTestFlowParam("expression", "Formula", "a + b"),
+        AutoTestFlowParam("variables", "Inputs (name:type)", "a:number,b:number"),
+        AutoTestFlowParam("constants", "Unwired constants (JSON)", '{"a":0,"b":0}'),
+        AutoTestFlowParam("output_type", "Result type", "number"),
+        AutoTestFlowParam("output_unit", "Result unit", ""),
+        AutoTestFlowParam("curve_series", "Curve label (last or label)", "last"),
+        AutoTestFlowParam("on_invalid", "Invalid result", "invalid"),
+    )) if d.type_id == "math_formula" else d
+    for d in AUTOTEST_FLOW_DEFINITIONS
+) + _EXTRA_DEFINITIONS
+
+AUTOTEST_FLOW_DEFINITIONS = tuple(
+    AutoTestFlowDefinition(d.type_id, d.title, d.description, d.accent,
+        d.parameters + (AutoTestFlowParam("on_invalid", "Invalid result", "invalid"),))
+    if (d.type_id.startswith("condition_") or d.type_id in {"boolean_compare", "boolean_logic"})
+       and not any(p.key == "on_invalid" for p in d.parameters) else d
+    for d in AUTOTEST_FLOW_DEFINITIONS
+)
+
+FLOW_CATEGORIES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("basic", "Basic", ("wait", "photo")),
+    (
+        "electrical",
+        "Electrical",
+        (
+            "iv", "constant_current", "it", "wobb_test",
+            "hp6614c_transfer", "hp6614c_output",
+            "b1500_transfer", "b1500_output",
+        ),
+    ),
+    ("light", "Light Source", ("virtual_mask", "laser_iv_calibration", "laser_output", "laser_pulse", "light_control", "light_pulse", "wavelength")),
+    ("opto", "Optoelectronic", ("photo_iv", "photo_transient", "photo_power_steps", "photo_width_steps")),
+    ("math", "Analysis & Mapping", ("plot_panel", "math_add", "math_subtract", "math_multiply", "math_divide", "math_formula",)),
+    ("conditions", "Conditions", ("boolean_compare", "boolean_compare_pair", "boolean_logic", "condition_boolean", "condition_metric", "condition_device_state", "condition_compliance")),
+)
+
+CONDITION_FLOW_TYPES = frozenset({"condition_boolean", "condition_metric", "condition_device_state", "condition_compliance"})
+
+
+def is_condition_flow_type(type_id: str) -> bool:
+    return type_id in CONDITION_FLOW_TYPES
+
+
+def flow_card_graph_params(card: AutoTestFlowCard) -> dict[str, str]:
+    params = {str(key): str(value) for key, value in card.params.items()}
+    params.update({"_node_id": card.card_id, "_x": f"{card.x:.6g}", "_y": f"{card.y:.6g}"})
+    return params
 
 
 def autotest_flow_definitions_by_type() -> dict[str, AutoTestFlowDefinition]:
@@ -420,9 +793,10 @@ def create_autotest_flow_card(type_id: str, card_id: str, *, expanded: bool = Fa
 
 def summarize_autotest_flow(cards: tuple[AutoTestFlowCard, ...] | list[AutoTestFlowCard]) -> str:
     definitions = autotest_flow_definitions_by_type()
-    if not cards:
+    content = [card for card in cards if card.type_id not in {"workflow_start", "workflow_end"}]
+    if not content:
         return "Measurement flow: not configured"
-    labels = [definitions.get(card.type_id, definitions["wait"]).title for card in cards]
+    labels = [definitions.get(card.type_id, definitions["wait"]).title for card in content]
     return "Measurement flow: " + " -> ".join(labels)
 
 
@@ -440,7 +814,7 @@ def measurement_flow_steps_from_cards(cards: tuple[AutoTestFlowCard, ...] | list
     return tuple(
         AutoTestFlowStep(
             type_id=str(card.type_id),
-            params={str(key): str(value) for key, value in card.params.items()},
+            params=flow_card_graph_params(card),
         )
         for card in cards
     )
@@ -967,8 +1341,12 @@ class AutoTestPanel:
         set_status: Callable[[str], None] | None = None,
         on_overlay_changed: Callable[[list[MatrixOverlay]], None] | None = None,
         on_probe_assist_changed: Callable[[], None] | None = None,
+        shared_measurement: bool = False,
+        open_measurement_flow: Callable[[], None] | None = None,
     ) -> None:
         self.colors = colors
+        self.shared_measurement = shared_measurement
+        self.open_measurement_flow = open_measurement_flow or self._open_measurement_dialog
         self.get_stage_position_um = get_stage_position_um
         self.get_mapper = get_mapper
         self.get_focusmap_ready = get_focusmap_ready
@@ -1343,10 +1721,10 @@ class AutoTestPanel:
     def _build_measurement_section(self, parent: ttk.Frame, row: int) -> int:
         section = self._section(parent, "Measurement", row)
         section.columnconfigure(0, weight=1)
-        tk.Button(
+        self.measurement_button = tk.Button(
             section,
             text="Config Measure Flow",
-            command=self._open_measurement_dialog,
+            command=self.open_measurement_flow,
             bg="#0f5f91",
             activebackground="#0e7490",
             fg="#e0f2fe",
@@ -1360,7 +1738,8 @@ class AutoTestPanel:
             pady=7,
             cursor="hand2",
             font=("Segoe UI Semibold", 10),
-        ).grid(row=0, column=0, sticky="ew")
+        )
+        self.measurement_button.grid(row=0, column=0, sticky="ew")
         ttk.Label(section, textvariable=self.measurement_var, style="Value.TLabel", padding=8, wraplength=320).grid(row=1, column=0, sticky="ew", pady=(8, 0))
         return row + 1
 
@@ -1808,6 +2187,7 @@ class AutoTestPanel:
 
     def set_running(self, running: bool) -> None:
         self.running = running
+        self.measurement_button.configure(state="disabled" if running else "normal")
         self.stop_button.configure(state="normal" if running else "disabled")
         self._update_prerequisite_status()
 
@@ -2095,6 +2475,23 @@ class AutoTestPanel:
                 return
         except tk.TclError:
             pass
+        from .flow_editor import MeasurementFlowEditor
+
+        def allocate_id() -> str:
+            card_id = f"flow_{self.measurement_flow_next_id}"
+            self.measurement_flow_next_id += 1
+            return card_id
+
+        editor = MeasurementFlowEditor(
+            self.frame,
+            self.measurement_flow_cards,
+            self.colors,
+            allocate_id,
+            self._update_measurement_summary,
+        )
+        self._measurement_dialog = editor.window
+        return
+
         self._discard_flow_widget_cache(destroy=False)
         dialog = tk.Toplevel(self.frame)
         self._measurement_dialog = dialog

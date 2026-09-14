@@ -1,0 +1,181 @@
+html {
+  background: #ffffff;
+}
+
+body {
+  margin: 0;
+  padding: 20px 28px 36px 28px;
+  color: #20262e;
+  background: #ffffff;
+  font-family: "Microsoft YaHei UI", "Microsoft YaHei", SimSun, Arial, sans-serif;
+  font-size: 10.5pt;
+  line-height: 1.65;
+}
+
+h1, h2, h3 {
+  color: #17324d;
+  font-weight: bold;
+}
+
+h1 {
+  margin: 0 0 15px 0;
+  padding: 0 0 9px 0;
+  border-bottom: 2px solid #2a6f97;
+  font-size: 21pt;
+}
+
+h2 {
+  margin: 24px 0 9px 0;
+  padding: 0 0 4px 0;
+  border-bottom: 1px solid #ccd7e0;
+  font-size: 15pt;
+}
+
+h3 {
+  margin: 17px 0 6px 0;
+  font-size: 12pt;
+}
+
+p {
+  margin: 7px 0 10px 0;
+}
+
+a {
+  color: #075ea8;
+  text-decoration: underline;
+}
+
+a:visited {
+  color: #5a438a;
+}
+
+ul, ol {
+  margin: 7px 0 12px 26px;
+  padding: 0;
+}
+
+li {
+  margin: 4px 0;
+}
+
+table {
+  width: 100%;
+  margin: 12px 0 18px 0;
+  border-collapse: collapse;
+  border: 1px solid #aebdca;
+}
+
+th, td {
+  padding: 7px 9px;
+  border: 1px solid #aebdca;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  color: #17324d;
+  background: #e8f0f6;
+}
+
+code, pre {
+  font-family: Consolas, "Courier New", monospace;
+}
+
+code {
+  padding: 1px 3px;
+  color: #7b2d00;
+  background: #f6f0ea;
+}
+
+pre {
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid #c8d2da;
+  color: #1e2730;
+  background: #f5f7f9;
+  white-space: pre-wrap;
+}
+
+img.screenshot,
+.screenshot img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 12px auto 6px auto;
+  border: 1px solid #9eacb8;
+}
+
+.caption {
+  margin: 0 0 16px 0;
+  color: #56616b;
+  font-size: 9pt;
+  text-align: center;
+}
+
+.lead {
+  margin: 0 0 17px 0;
+  color: #34495e;
+  font-size: 12pt;
+}
+
+.note,
+.tip,
+.warning,
+.danger {
+  margin: 13px 0;
+  padding: 9px 12px;
+  border-left: 5px solid #2a6f97;
+  background: #eef6fb;
+}
+
+.tip {
+  border-left-color: #34834a;
+  background: #eef8f0;
+}
+
+.warning {
+  border-left-color: #b36a00;
+  background: #fff6df;
+}
+
+.danger {
+  border-left-color: #b3261e;
+  background: #fff0ef;
+}
+
+.label {
+  font-weight: bold;
+  white-space: nowrap;
+}
+
+.breadcrumb {
+  margin: 0 0 13px 0;
+  color: #64717d;
+  font-size: 9pt;
+}
+
+.related {
+  margin-top: 28px;
+  padding-top: 9px;
+  border-top: 1px solid #ccd7e0;
+}
+
+.kbd {
+  padding: 1px 5px;
+  border: 1px solid #8997a3;
+  color: #20262e;
+  background: #f3f5f6;
+  font-family: Consolas, "Courier New", monospace;
+  white-space: nowrap;
+}
+
+@media print {
+  body {
+    padding: 0;
+    color: #000000;
+  }
+
+  a {
+    color: #000000;
+  }
+}

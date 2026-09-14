@@ -1,0 +1,52 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<meta name="generator" content="Semi Auto Probe Help">
+<title>界面与状态</title>
+<link rel="stylesheet" type="text/css" href="../assets/help.css">
+</head>
+<body>
+<div class="topic-header">
+  <div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div>
+  <h1>界面与状态</h1>
+  <p class="summary">认识顶栏、页面导航、任务状态和互锁提示。</p>
+</div>
+
+<img class="screenshot" src="../assets/main.png" alt="Semi Auto Probe 主界面">
+<p class="caption">当前桌面界面。手册截图使用离线文档模式，因此设备连接显示为离线；控件布局与当前代码一致。</p>
+<h2>顶栏</h2>
+<table class="feature-table">
+<tr><th>区域</th><th>用途</th></tr>
+<tr><td>PROBE</td><td>在 Separate 与 Contact 状态之间切换。Contact 会触发与横向运动相关的安全检查。</td></tr>
+<tr><td>SERIAL</td><td>选择 Local/Remote、端口，刷新、连接及测试控制器。</td></tr>
+<tr><td>CAM</td><td>选择相机源并重新启动采集。</td></tr>
+<tr><td>EMERGENCY STOP</td><td>向已连接控制器发送全轴停止，并设置 AutoFocus、FocusMap、ImgMatrix 与 AutoTest/Mapping 的停止标志。当前不会设置 ImgStitch 或 EdgeTrace 的循环停止标志；同时使用页面 Stop。详见 <a href="safety.htm">安全主题</a>。</td></tr>
+</table>
+<h2>主页面</h2>
+<table class="feature-table">
+<tr><th>界面标签</th><th>职责</th></tr>
+<tr><td>MainView</td><td>实时视觉、手动运动、坐标与速度。</td></tr>
+<tr><td>AutoFocus / FocusMap</td><td>单点自动对焦与区域焦平面建模。</td></tr>
+<tr><td>LayoutMap</td><td>GDS 坐标、载台坐标与视场映射。</td></tr>
+<tr><td>ImgStitch / ImgMatrix</td><td>拼接采集与独立图像矩阵采集。</td></tr>
+<tr><td>AutoTest</td><td>Probe Test、Wire-bond Mapping 与 Measurement Workflow v2。</td></tr>
+<tr><td>EdgeTrace</td><td>通过 scratch / safe / contact 状态追踪样品边缘。</td></tr>
+<tr><td>AI Agent</td><td>解释状态、生成计划并执行受约束步骤。</td></tr>
+<tr><td>SerialIO</td><td>原始协议发送、读取与通信历史。</td></tr>
+<tr><td>Settings</td><td>光学、相机、电机、对焦、Agent 和 Admin 配置。</td></tr>
+</table>
+<h2>状态与任务占用</h2>
+<p>页面底部或卡片内的状态文本是首要诊断信息。自动工作流运行时，应用会锁住可能冲突的运动、配置或原始通信操作。看到 “Motion busy”“workflow is running” 或 “locked” 时，先等待当前步骤终止，或使用该工作流的 Stop；紧急情况使用顶栏急停。</p>
+<ul>
+<li><span class="status good">绿色/青色</span> 通常表示已连接、完成或满足条件。</li>
+<li><span class="status caution">黄色</span> 通常表示离线、等待、部分有效或需要检查。</li>
+<li><span class="status bad">红色</span> 表示失败、被阻止或危险动作。</li>
+</ul>
+<h2>窗口与 F1</h2>
+<p>按 <kbd>F1</kbd> 会读取当前页面并打开对应 CHM context ID。焦点位于输入框时也可使用 F1，不会把按键交给运动控制。Measurement Workflow 等带有独立帮助上下文的子窗口会打开更具体的主题。</p>
+<p class="related"><strong>相关主题：</strong><a href="shortcuts.htm">快捷键</a> · <a href="troubleshooting.htm">故障排查</a></p>
+
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div>
+</body>
+</html>

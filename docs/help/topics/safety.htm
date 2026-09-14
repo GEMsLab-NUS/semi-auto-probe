@@ -1,0 +1,50 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<meta name="generator" content="Semi Auto Probe Help">
+<title>安全、探针与急停</title>
+<link rel="stylesheet" type="text/css" href="../assets/help.css">
+</head>
+<body>
+<div class="topic-header">
+  <div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div>
+  <h1>安全、探针与急停</h1>
+  <p class="summary">设备动作前的互锁、停止方式与恢复检查。</p>
+</div>
+
+<div class="callout danger"><strong>物理安全优先。</strong>软件急停不能替代控制器硬件急停、限位、联锁或实验室断电流程。人员、探针、样品或夹具存在碰撞风险时，立即使用可到达的硬件安全装置。</div>
+<h2>Probe 状态</h2>
+<p><strong>Separate</strong> 表示探针已离开接触状态，是 XY 移动、自动对焦、FocusMap 和成像扫描的正常前置条件。<strong>Contact</strong> 表示探针接触或被视作接触；应用会阻止不安全的独立运动和部分自动流程。</p>
+<p>软件状态不能检测所有机械事实。切换为 Separate 后仍应从相机或现场确认探针确实抬起。</p>
+<h2>开始动作前</h2>
+<ul>
+<li>检查目标坐标、运动模式（Relative/Absolute）、轴方向、jog step 与速度配置。</li>
+<li>确认目标在机械行程内，且安全 Z 足以越过探针、夹具和样品表面变化。</li>
+<li>对自动路径先使用小网格、少量点或 Dry run；检查首点、末点、蛇形顺序和返回路径。</li>
+<li>连接仪器输出前核对电压、电流、功率、compliance、量程和样品极性。</li>
+<li>不要在另一个工作流运行时发送 SerialIO raw command。</li>
+</ul>
+<h2>Stop、Cancel 与 EMERGENCY STOP</h2>
+<table class="feature-table">
+<tr><th>控制</th><th>行为</th></tr>
+<tr><td>页面内 Stop</td><td>设置对应工作流的 cooperative stop；通常要等当前阻塞运动/仪器调用返回。AutoFocus、Probe Test、Mapping、ImgMatrix 与停止中的 ImgStitch/EdgeTrace 不保证回起点或 safe Z，必须现场确认。部分仪器步骤会尝试关闭输出。</td></tr>
+<tr><td>AI Agent Cancel Plan</td><td>丢弃尚未执行的计划步骤；已经运行的硬件步骤不会因此立即中断。</td></tr>
+<tr><td>AI Agent Stop</td><td>请求当前 Agent 任务及它启动的工作流停止；Agent 直接载台动作会触发急停。</td></tr>
+<tr><td>EMERGENCY STOP</td><td>在串口可用时发送全轴停止，并设置 realtime、AutoFocus、FocusMap、ImgMatrix 与 AutoTest/Mapping 的停止请求。当前版本不会设置 ImgStitch 或 EdgeTrace 的循环停止标志；按急停后还要按相应页面 Stop。它也不保证外部仪器或独立电源已进入安全状态。</td></tr>
+</table>
+<h2>急停后的恢复</h2>
+<ol>
+<li>现场确认所有轴、探针与仪器输出已经停止。</li>
+<li>另按 ImgStitch 或 EdgeTrace 页内 Stop（如果它们正在运行），查看页面状态与日志，确认任务线程已终止；不要直接重复失败命令。</li>
+<li>核对位置读回。若控制器复位、失步或坐标不可信，按实验室校准流程重新建立参考。</li>
+<li>检查未完成会话。Mapping 中断可能保留 loose point artifacts；ImgMatrix/AutoTest 可能保留部分 manifest 或节点结果。</li>
+<li>保持 Probe Separate，以低速小步验证每个轴方向，再恢复自动流程。</li>
+</ol>
+<h2>受保护的维护命令</h2>
+<p>Set New Zero、Go Home、控制器掉电参数保存和 Wire-bond 模式启用会改变长期状态或参考坐标。它们需要 Admin 或应仅由授权人员使用。Admin token 只解锁软件控件，不等于现场风险评估。</p>
+<p class="related"><strong>相关主题：</strong><a href="main.htm">MainView 运动</a> · <a href="config.htm">Settings 与 Admin</a> · <a href="troubleshooting.htm">故障排查</a></p>
+
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div>
+</body>
+</html>

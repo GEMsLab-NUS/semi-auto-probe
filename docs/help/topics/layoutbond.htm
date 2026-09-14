@@ -1,0 +1,26 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="generator" content="Semi Auto Probe Help"><title>LayoutMap / LayoutBond</title><link rel="stylesheet" type="text/css" href="../assets/help.css"></head><body><div class="topic-header"><div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div><h1>LayoutMap / LayoutBond</h1><p class="summary">把 GDS 版图的 U/V 坐标拟合到载台 X/Y，并为定位、成像和测试提供共享映射。</p></div>
+<img class="screenshot" src="../assets/layoutbond.png" alt="LayoutMap 页面">
+<div class="callout note"><strong>名称说明。</strong>界面页签显示 LayoutMap；配置文件、代码和部分历史文档使用 LayoutBond。两者指同一功能。</div>
+<h2>页面结构</h2>
+<p>左侧显示 microscope、Stage XY 与 Layout UV、八向 jog 和坐标操作；中央为 GDS 画布；右侧依次提供 GDS View、Cursor and Selection、Calibration Points、Mapping 与 Move to Selected Target。</p>
+<h2>载入与查看 GDS</h2>
+<ol>
+<li>单击 <strong>Load GDS</strong> 选择文件，再选择 top cell 和需要显示/拾取的 layer。</li>
+<li>用滚轮缩放、左拖平移、单击选择目标；右拖框选缩放，右双击恢复 Fit View。</li>
+<li>查看 Cursor/Selection 的 U/V 与目标信息。界面中的 <strong>Peak</strong> 用于记录相应版图指示点。</li>
+<li>输入 FOV width/height 与 rotation，必要时从 Settings 完成像素和 FOV rotation 标定。</li>
+</ol>
+<h2>建立仿射映射</h2>
+<ol>
+<li>在 GDS 中选择第一个已知特征，记录其 U/V；把显微镜中心移动到同一物理特征并记录 Stage X/Y。</li>
+<li>对 P1、P2、P3、P4 重复。当前实现要求四个点全部完整；点集必须能建立非退化的二维仿射变换。</li>
+<li>单击 <strong>Fit</strong>，检查各点 residual 与 RMS error。结果必须低于现场允许误差，且在整个目标区域抽查。</li>
+<li>单击 <strong>Save Calibration</strong>。自动上下文文件为 <code>last_layoutbond_mapping.json</code>；启动参数 <code>--restore-last</code> 会尝试恢复。</li>
+</ol>
+<div class="callout warning"><strong>映射有效性。</strong>更换 GDS、top cell、样品方向、夹具、载台零点、相机姿态或光学倍率后，旧映射可能不再有效。载入 mapping 时必须能找到原始 GDS，并重新检查基准点。</div>
+<h2>移动到版图目标</h2>
+<p>选择 GDS 目标后使用 <strong>Use Target</strong> 或 Move to Selected Target。若已有 FocusMap，可使用 FocusZ 计算目标 Z。Shift+左双击也可触发 XY 移动；该手势会真实运动，使用前确认 Probe Separate、目标在安全范围、映射残差合格。</p>
+<h2>Overlay 与复用</h2>
+<p><strong>Overlay</strong> 把 FOV 和已选路径叠加在 GDS/图像上。ImgMatrix、AutoTest、EdgeTrace、AI Agent 的 GDS move 与 overlay 都使用此页当前 mapper；它们不会自行重新标定。</p>
+<p class="related"><strong>相关主题：</strong><a href="focusmap.htm">FocusMap</a> · <a href="imgmatrix.htm">ImgMatrix</a> · <a href="autotest.htm">AutoTest</a></p>
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div></body></html>

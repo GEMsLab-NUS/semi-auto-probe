@@ -32,6 +32,11 @@ from semi_auto_probe.auto_test import (
 from semi_auto_probe.app import ProbeApp
 from semi_auto_probe.gds_stage_mapper import AffineCoordinateMapper, CalibrationPoint
 from semi_auto_probe.keithley2450 import IVSweepConfig, IVSweepSample, IVSweepStatistics
+from semi_auto_probe.dp100 import DP100Setpoint, SimulatedDP100Driver
+from semi_auto_probe.flow_graph import evaluate_condition, graph_start_node, resolve_data_input, validate_flow_graph
+from semi_auto_probe.flow_editor import MeasurementFlowEditor
+from semi_auto_probe.waveform import WaveformPoint, parse_waveform_points, run_dp100_waveform, serialize_waveform_points
+from semi_auto_probe.workflow_library import DEFAULT_USERS, builtin_templates, cards_from_template, ensure_workflow_library, load_workflow, save_workflow
 
 
 class AutoTestTests(unittest.TestCase):
@@ -369,6 +374,257 @@ class AutoTestTests(unittest.TestCase):
         self.assertEqual(panel._flow_entry_vars[("card_1", "resource")], "kept")
         self.assertEqual(panel._flow_card_widgets, {})
         self.assertEqual(panel._flow_card_render_state, {})
+
+    def test_flow_cards_serialize_graph_position_and_edges(self) -> None:
+        coarse = create_autotest_flow_card("iv", "coarse")
+        coarse.x, coarse.y = 120, 240
+        coarse.params["_next"] = "check"
+        check = create_autotest_flow_card("condition_metric", "check")
+        check.params.update({"source_node": "coarse", "metric": "statistics.resistance_ohm", "operator": ">", "threshold": "1e9", "_true": "skip"})
+        skip = create_autotest_flow_card("photo", "skip")
+
+        steps = measurement_flow_steps_from_cards([coarse, check, skip])
+
+        self.assertEqual(steps[0].params["_node_id"], "coarse")
+        self.assertEqual(steps[0].params["_x"], "120")
+        self.assertEqual(graph_start_node(steps), "coarse")
+        self.assertEqual(validate_flow_graph(steps), ())
+
+    def test_metric_condition_reads_upstream_nested_statistics(self) -> None:
+        condition = AutoTestFlowStep(
+            "condition_metric",
+            {"source_node": "coarse", "metric": "statistics.resistance_ohm", "operator": ">=", "threshold": "1e9"},
+        )
+        self.assertTrue(evaluate_condition(condition, {"coarse": {"statistics": {"resistance_ohm": 2e9}}}))
+        self.assertFalse(evaluate_condition(condition, {"coarse": {"statistics": {"resistance_ohm": 2e6}}}))
+
+    def test_math_and_boolean_data_chain_drives_boolean_branch(self) -> None:
+        iv = create_autotest_flow_card("iv", "coarse")
+        iv.params["_outputs"] = "statistics.resistance_ohm"
+        iv.params["_next"] = "branch"
+        math_node = create_autotest_flow_card("math_formula", "scaled")
+        math_node.params.update(
+            {
+                "operator": "/",
+                "fallback_b": "1000",
+                "_input_a_source": "coarse",
+                "_input_a_output": "statistics.resistance_ohm",
+                "_input_a_type": "number",
+            }
+        )
+        compare = create_autotest_flow_card("boolean_compare", "is_open")
+        compare.params.update(
+            {
+                "operator": ">=",
+                "threshold": "1000000",
+                "_input_value_source": "scaled",
+                "_input_value_output": "result",
+                "_input_value_type": "number",
+            }
+        )
+        branch = create_autotest_flow_card("condition_boolean", "branch")
+        branch.params.update(
+            {
+                "_input_predicate_source": "is_open",
+                "_input_predicate_output": "result",
+                "_input_predicate_type": "bool",
+                "_true": "end",
+                "_false": "end",
+            }
+        )
+        end = create_autotest_flow_card("workflow_end", "end")
+        steps = measurement_flow_steps_from_cards([iv, math_node, compare, branch, end])
+        results = {"coarse": {"statistics": {"resistance_ohm": 2e9}}}
+
+        self.assertEqual(validate_flow_graph(steps), ())
+        self.assertEqual(graph_start_node(steps), "coarse")
+        self.assertEqual(resolve_data_input(steps[3], "predicate", steps, results), True)
+        self.assertTrue(evaluate_condition(steps[3], results, "coarse", steps))
+
+    def test_validation_rejects_incompatible_typed_data_link(self) -> None:
+        math_node = create_autotest_flow_card("math_formula", "number_source")
+        logic = create_autotest_flow_card("boolean_logic", "logic")
+        logic.params.update(
+            {
+                "_input_a_source": "number_source",
+                "_input_a_output": "result",
+                "_input_a_type": "bool",
+            }
+        )
+        start = create_autotest_flow_card("workflow_start", "start")
+        end = create_autotest_flow_card("workflow_end", "end")
+        start.params["_next"] = "end"
+
+        errors = validate_flow_graph(measurement_flow_steps_from_cards([start, end, math_node, logic]))
+
+        self.assertTrue(any("expects bool" in error and "outputs number" in error for error in errors))
+
+    def test_light_waveform_is_dependency_not_second_graph_start(self) -> None:
+        waveform = create_autotest_flow_card("laser_pulse", "waveform")
+        photo_iv = create_autotest_flow_card("photo_iv", "photo_iv")
+        photo_iv.params["_light_source"] = waveform.card_id
+
+        steps = measurement_flow_steps_from_cards([waveform, photo_iv])
+
+        self.assertEqual(validate_flow_graph(steps), ())
+        self.assertEqual(graph_start_node(steps), "photo_iv")
+
+    def test_workflow_library_round_trip_preserves_graph_and_positions(self) -> None:
+        cards = cards_from_template("PD / Pulse Response")
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_workflow(Path(directory) / "photo_test", cards)
+            restored = load_workflow(path)
+
+        self.assertEqual([(c.type_id, c.params, c.x, c.y) for c in restored],
+                         [(c.type_id, c.params, c.x, c.y) for c in cards])
+        response = next(c for c in restored if c.type_id == "photo_transient")
+        self.assertEqual(response.params["_light_source"], "pulse")
+
+    def test_light_route_does_not_cross_an_intermediate_waveform_card(self) -> None:
+        source = create_autotest_flow_card("laser_pulse", "source")
+        source.x, source.y = 0, 350
+        obstacle = create_autotest_flow_card("laser_pulse", "obstacle")
+        obstacle.x, obstacle.y = 110, 0
+        target = create_autotest_flow_card("photo_iv", "target")
+        target.x, target.y = 230, 300
+        editor = object.__new__(MeasurementFlowEditor)
+        editor.cards = [source, obstacle, target]
+
+        route = editor._orthogonal_route(source, target, "light", target_kind="light")
+
+        self.assertFalse(editor._route_hits_obstacle(route, [editor._node_bounds(obstacle, 18)]))
+
+    def test_workflow_library_creates_named_user_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = ensure_workflow_library(Path(directory))
+
+            self.assertEqual({path.name for path in root.iterdir()}, set(DEFAULT_USERS))
+
+    def test_custom_dp100_waveform_round_trip_and_execution(self) -> None:
+        points = [WaveformPoint(0, 0, 0), WaveformPoint(0.001, 2.5, 0.2), WaveformPoint(0.002, 0, 0)]
+        params = {
+            "waveform_points": serialize_waveform_points(points),
+            "count": "1",
+            "preset_index": "1",
+            "ovp_v": "3",
+            "ocp_a": "0.3",
+        }
+        driver = SimulatedDP100Driver()
+        driver.connect()
+
+        run_dp100_waveform(driver, params)
+
+        self.assertEqual(parse_waveform_points(params), points)
+        self.assertTrue(any(enabled and point.voltage_v == 2.5 for point, enabled in driver.commands))
+        self.assertFalse(driver.commands[-1][1])
+
+    def test_empty_editor_flow_gets_fixed_connected_boundaries(self) -> None:
+        editor = object.__new__(MeasurementFlowEditor)
+        editor.cards = []
+
+        editor._ensure_boundary_nodes()
+
+        self.assertEqual([card.type_id for card in editor.cards], ["workflow_start", "workflow_end"])
+        self.assertEqual(editor.cards[0].params["_next"], editor.cards[1].card_id)
+
+    def test_node_drag_snaps_centers_to_nearby_nodes(self) -> None:
+        moving = create_autotest_flow_card("iv", "moving")
+        fixed = create_autotest_flow_card("photo_iv", "fixed")
+        fixed.x, fixed.y = 320, 192
+        editor = object.__new__(MeasurementFlowEditor)
+        editor.cards = [moving, fixed]
+
+        x, y, guides = editor._snap_card_position(moving, 315, 188)
+
+        self.assertEqual((x, y), (320, 192))
+        self.assertIn(("v", 320), guides)
+        self.assertIn(("h", 192), guides)
+
+    def test_routes_leave_and_enter_nodes_horizontally(self) -> None:
+        source = create_autotest_flow_card("workflow_start", "start")
+        source.x, source.y = 0, 0
+        target = create_autotest_flow_card("wobb_test", "test")
+        target.x, target.y = 260, 150
+        editor = object.__new__(MeasurementFlowEditor)
+        editor.cards = [source, target]
+
+        route = editor._orthogonal_route(source, target, "next")
+
+        self.assertEqual(route[0][1], route[1][1])
+        self.assertGreaterEqual(route[1][0] - route[0][0], 30)
+        self.assertEqual(route[-2][1], route[-1][1])
+        self.assertGreaterEqual(route[-1][0] - route[-2][0], 30)
+
+    def test_cut_gesture_removes_crossed_flow_connection(self) -> None:
+        source = create_autotest_flow_card("workflow_start", "start")
+        target = create_autotest_flow_card("iv", "test")
+        source.x, source.y = 0, 0
+        target.x, target.y = 300, 0
+        source.params["_next"] = target.card_id
+        editor = object.__new__(MeasurementFlowEditor)
+        editor.cards = [source, target]
+
+        removed = editor._cut_edges((220, -50), (220, 100))
+
+        self.assertEqual(removed, 1)
+        self.assertNotIn("_next", source.params)
+
+    def test_result_output_connection_configures_condition_source(self) -> None:
+        source = create_autotest_flow_card("iv", "coarse")
+        source.params["_outputs"] = "statistics.resistance_ohm"
+        condition = create_autotest_flow_card("condition_metric", "check")
+        editor = object.__new__(MeasurementFlowEditor)
+        editor.cards = [source, condition]
+        editor.status_var = type("Status", (), {"set": lambda self, value: None})()
+        editor._changed = lambda redraw=True: None
+
+        editor._connect(source.card_id, "result@statistics.resistance_ohm", condition.card_id)
+
+        self.assertEqual(condition.params["source_node"], source.card_id)
+        self.assertEqual(condition.params["metric"], "statistics.resistance_ohm")
+        self.assertEqual(condition.params["_result_source"], source.card_id)
+
+    def test_all_builtin_workflow_templates_validate_with_boundaries(self) -> None:
+        for name in builtin_templates():
+            editor = object.__new__(MeasurementFlowEditor)
+            editor.cards = cards_from_template(name)
+            editor._ensure_boundary_nodes()
+
+            with self.subTest(name=name):
+                self.assertEqual(validate_flow_graph(measurement_flow_steps_from_cards(editor.cards)), ())
+
+    def test_multiple_edges_enter_shared_target_at_separate_ports(self) -> None:
+        first = create_autotest_flow_card("photo", "first")
+        second = create_autotest_flow_card("photo", "second")
+        target = create_autotest_flow_card("workflow_end", "end")
+        first.x, first.y = 0, 0
+        second.x, second.y = 0, 200
+        target.x, target.y = 600, 100
+        first.params["_next"] = target.card_id
+        second.params["_next"] = target.card_id
+        editor = object.__new__(MeasurementFlowEditor)
+        editor.cards = [first, second, target]
+
+        first_route = editor._orthogonal_route(first, target, "next")
+        second_route = editor._orthogonal_route(second, target, "next")
+
+        self.assertNotEqual(first_route[-1][1], second_route[-1][1])
+        self.assertEqual(len(editor._incoming_flow_offsets(target)), 2)
+
+    def test_dp100_setpoint_converts_si_units_to_vendor_units(self) -> None:
+        point = DP100Setpoint(5.25, 0.125, 2)
+        driver = SimulatedDP100Driver()
+        self.assertTrue(driver.connect())
+        driver.set_output(point, True)
+        self.assertEqual(point.voltage_mv, 5250)
+        self.assertEqual(point.current_ma, 125)
+        self.assertEqual(driver.commands, [(point, True)])
+
+    def test_dp100_rejects_zero_energy_enable(self) -> None:
+        driver = SimulatedDP100Driver()
+        driver.connect()
+        with self.assertRaisesRegex(ValueError, "non-zero"):
+            driver.set_output(DP100Setpoint(0, 0, 1), True)
 
 
 if __name__ == "__main__":

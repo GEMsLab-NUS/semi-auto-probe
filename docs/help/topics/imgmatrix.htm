@@ -1,0 +1,29 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="generator" content="Semi Auto Probe Help"><title>ImgMatrix</title><link rel="stylesheet" type="text/css" href="../assets/help.css"></head><body><div class="topic-header"><div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div><h1>ImgMatrix</h1><p class="summary">在 GDS 基向量定义的矩阵上采集独立图像，并保留可复现的 manifest。</p></div>
+<img class="screenshot" src="../assets/imgmatrix.png" alt="ImgMatrix 页面">
+<h2>适用场景</h2>
+<p>ImgMatrix 用于按版图 U/V 网格逐点保存图像。与 ImgStitch 不同，它的主要产物是每点独立图像和 manifest，不要求生成连续 mosaic。</p>
+<h2>前置条件</h2>
+<ul>
+<li>LayoutMap 已载入 GDS、选择 top cell/layer 并完成有效 stage↔GDS mapping。</li>
+<li>相机产生稳定 frame；Serial 已连接；Probe Separate；没有其他运动任务。</li>
+<li>如需随表面调整 Z，FocusMap 必须有效且覆盖目标区域，并在 MainView 启用 FocusMap Z。</li>
+</ul>
+<h2>定义矩阵</h2>
+<ol>
+<li>在 GDS 画布选择 origin，或输入 U/V。</li>
+<li>设置 U step、V step、Rows 与 Columns。步长沿 GDS basis，不等同于未经映射的载台 X/Y。</li>
+<li>单击 <strong>Preview Matrix</strong>，检查 viewport 中的全部点、顺序和覆盖范围。</li>
+<li>选择 Single、T-stack 或 Z-stack，以及对应的 frame/interval/Z 参数。</li>
+</ol>
+<h2>执行与停止</h2>
+<p>单击 <strong>Run</strong> 后，状态区显示当前点、总数与 session。任务在点间移动、等待稳定并保存图像；<strong>Stop</strong> 等当前阻塞动作返回后结束，保留 partial manifest，载台停在最后 tile。判断完整性时以 manifest 和 completed 数量为准。</p>
+<h2>输出</h2>
+<p>每次运行创建唯一目录：</p>
+<pre>imgmatrix_session/
+  YYYYMMDD_HHMMSS[_NN]/
+    images/
+      rNNN_cNNN_u..._v....png
+    manifest.json</pre>
+<p><code>manifest.json</code> 包含格式版本、时间戳、完成状态、矩阵设置及每张图像的坐标/文件信息。目录名若同秒冲突会增加编号，不会覆盖上一次独立 session。</p>
+<p class="related"><strong>相关主题：</strong><a href="layoutbond.htm">LayoutMap</a> · <a href="focusmap.htm">FocusMap</a> · <a href="data-files.htm">文件格式</a></p>
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div></body></html>

@@ -1,0 +1,49 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="generator" content="Semi Auto Probe Help"><title>快捷键与画布手势</title><link rel="stylesheet" type="text/css" href="../assets/help.css"></head><body><div class="topic-header"><div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div><h1>快捷键与画布手势</h1><p class="summary">当前桌面版的键盘、鼠标和编辑器交互。</p></div>
+<h2>全局</h2>
+<table class="feature-table">
+<tr><th>操作</th><th>作用/条件</th></tr>
+<tr><td><kbd>F1</kbd></td><td>打开当前页面或子窗口的 CHM 帮助。</td></tr>
+<tr><td><kbd>Alt+X</kbd> / <kbd>Alt+Y</kbd> / <kbd>Alt+Z</kbd></td><td>循环相应轴的 jog step level。</td></tr>
+<tr><td><kbd>Space</kbd> / <kbd>Enter</kbd></td><td>焦点位于 ToggleSwitch 时切换。</td></tr>
+</table>
+<h2>MainView 运动</h2>
+<table class="feature-table">
+<tr><th>默认 Arrow scheme</th><th>WASD/QE scheme</th><th>动作</th></tr>
+<tr><td>Right / Left</td><td>D / A</td><td>X+ / X−</td></tr>
+<tr><td>Up / Down</td><td>W / S</td><td>Y− / Y+</td></tr>
+<tr><td>PageUp / PageDown</td><td>Q / E</td><td>Z− / Z+</td></tr>
+</table>
+<p>只在 MainView 且 KeyboardMove 开启时有效；Entry、Text、Spinbox 或 Combobox 有焦点时忽略。长按从约 420 ms 逐步加速到最低约 95 ms 重复间隔。Main 相机画布上的滚轮移动 Z。</p>
+<h2>Main Position 与 Vision</h2>
+<ul>
+<li>坐标数值单击：Relative；双击：Absolute；Enter 执行；Esc 清除；Tab/Shift+Tab 换轴。</li>
+<li>Main microscope 中 Shift+click：把所选图像点移动到画面中心；需要像素/载台标定。</li>
+<li>Polygon Area：按页面提示完成点选；双击或右击完成多边形。</li>
+</ul>
+<h2>SerialIO 与 AI Agent</h2>
+<p>两个输入框都用 <kbd>Ctrl+Enter</kbd> 发送。Agent 的发送仍遵循当前权限模式；SerialIO raw send 是维护接口，可能绕过高层互锁。</p>
+<h2>GDS / LayoutMap</h2>
+<ul>
+<li>滚轮：zoom；左拖：pan；单击：选择目标。</li>
+<li>右拖：框选 zoom；右双击：Fit View。</li>
+<li>Shift+左双击：触发到选中位置的真实 XY move。</li>
+<li>坐标输入 Enter：移动；Esc：清除。</li>
+</ul>
+<h2>ImgStitch 与 Mapping</h2>
+<ul>
+<li>ImgStitch mosaic：滚轮 zoom，左拖 pan，Shift+click move center。</li>
+<li>Mapping canvas：Enter 提交 cell edit，Esc 取消，Backspace undo；滚轮 zoom，中/右拖 pan。</li>
+</ul>
+<h2>Measurement Flow Editor</h2>
+<ul>
+<li>Delete：删除选中节点；左拖 card；中键拖 canvas；右拖切断连线；滚轮缩放。</li>
+<li>各参数输入仍应使用 Validate；画布手势不会自动验证硬件限值。</li>
+</ul>
+<h2>DP100 Waveform Editor</h2>
+<ul>
+<li>Ctrl+Z / Ctrl+Y：Undo / Redo；A：auto-range；Delete：删除点。</li>
+<li>双击或 Ctrl+click：加点；Alt+click：删除点；拖点：编辑；背景拖动/滚轮：pan/zoom。</li>
+</ul>
+<div class="callout warning"><strong>手势可真实运动。</strong>所有 move center、GDS move、键盘 jog 和滚轮 Z 在前置条件满足时会发送硬件动作。使用前确认当前焦点、Probe 状态、方向和 step。</div>
+<p class="related"><strong>相关主题：</strong><a href="main.htm">MainView</a> · <a href="safety.htm">安全</a></p>
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div></body></html>

@@ -39,6 +39,7 @@ imgstitch_session/
 imgmatrix_session/
 autotest_session/
 autotest_session*.zip
+workflow_library/
 last_autofocus_history*.csv
 tmp_check*
 tmp_output*
@@ -49,3 +50,6 @@ assets/TEST_NEW_DEVICE.gds
 
 # Local landing homepage assets served from /homepage.
 src/semi_auto_probe/homepage/
+
+# Local test and diagnostic artifacts
+/.cache/

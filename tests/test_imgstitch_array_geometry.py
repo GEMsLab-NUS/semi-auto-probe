@@ -76,7 +76,7 @@ class ImgStitchArrayGeometryTests(unittest.TestCase):
         )
         app.imgstitch_latest_positions = stage_positions_from_um(app.imgstitch_session.tiles, app.imgstitch_session.um_per_px)
 
-        target = ProbeApp._imgstitch_stage_target_from_canvas_point(app, 30.0, 20.0)
+        target = ProbeApp._imgstitch_stage_target_from_canvas_point(app, 42.5, 30.0)
 
         self.assertEqual(target, (920, 2000, 3333))
 

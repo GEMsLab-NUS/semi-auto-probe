@@ -1,0 +1,33 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="generator" content="Semi Auto Probe Help"><title>SerialIO：控制器通信</title><link rel="stylesheet" type="text/css" href="../assets/help.css"></head>
+<body><div class="topic-header"><div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div><h1>SerialIO：控制器通信</h1><p class="summary">发送协议帧、读取原始响应并诊断本地或远程串口。</p></div>
+
+<img class="screenshot" src="../assets/communication.png" alt="SerialIO 页面">
+<div class="callout warning"><strong>维护功能。</strong>SerialIO 可绕过高层动作语义。仅发送已确认的控制器命令；自动测量或 Mapping 运行时，应用会锁住 raw command。</div>
+<h2>顶栏连接</h2>
+<ol>
+<li>选择 <strong>Local</strong> 使用本机 COM 端口，或选择 Remote 使用已配置的 SSH 串口桥。</li>
+<li>单击 <strong>Refresh</strong> 更新端口；选择目标端口后单击 <strong>Connect</strong>。</li>
+<li>单击 <strong>Test</strong> 执行默认通信测试。控制器、RS-232 接线、端口占用和协议参数均正确时，状态应成功，默认 RX 前缀为 <code>A3 AA</code>。</li>
+</ol>
+<h2>Manual Command</h2>
+<table class="feature-table">
+<tr><th>控件</th><th>说明</th></tr>
+<tr><td>Hex / Text</td><td>Hex 按字节输入十六进制；Text 发送文本负载。不要把含空格的文本误当成 Hex。</td></tr>
+<tr><td>Read bytes</td><td>发送后尝试读取的字节数，必须为 0 或正整数。</td></tr>
+<tr><td>Load Test</td><td>载入默认通信测试帧和说明。</td></tr>
+<tr><td>Send</td><td>发送输入内容；输入框中 Ctrl+Enter 也会发送。</td></tr>
+<tr><td>Clear</td><td>清除 TX/RX 与通信历史显示，不改变控制器状态。</td></tr>
+</table>
+<h2>诊断读法</h2>
+<p><strong>LAST TX</strong> 是最近发送帧，<strong>LAST RX</strong> 是最近响应，<strong>HEX COMMUNICATION HISTORY</strong> 按时间保留交互。诊断时记录命令、完整响应、端口模式和顶栏状态。</p>
+<table class="feature-table">
+<tr><th>现象</th><th>检查</th></tr>
+<tr><td>没有端口</td><td>Windows 设备管理器、USB/串口驱动、线缆，再按 Refresh。</td></tr>
+<tr><td>Connect 失败</td><td>端口是否被其他程序占用；控制器电源与 RS-232；默认 115200、8 data bits、no parity、1 stop bit。</td></tr>
+<tr><td>Test 无响应或前缀错误</td><td>核对协议、read bytes、发送模式和控制器固件；查看完整历史，不要只依据状态摘要。</td></tr>
+<tr><td>Remote 不可用</td><td>SSH key、远端 host、串口桥状态及远端设备占用。</td></tr>
+</table>
+<p class="related"><strong>相关主题：</strong><a href="quick-start.htm">首次连接</a> · <a href="troubleshooting.htm">故障排查</a></p>
+
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div></body></html>

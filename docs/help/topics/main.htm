@@ -1,0 +1,37 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="generator" content="Semi Auto Probe Help"><title>MainView：手动运动与实时视觉</title><link rel="stylesheet" type="text/css" href="../assets/help.css"></head>
+<body><div class="topic-header"><div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div><h1>MainView：手动运动与实时视觉</h1><p class="summary">在一个页面中观察相机、标记图像、读取坐标并安全控制三轴载台。</p></div>
+
+<img class="screenshot" src="../assets/main.png" alt="MainView 页面">
+<h2>前置条件</h2>
+<ul>
+<li>顶栏 Serial 已连接；相机预览需要 CAM 已启动并产生有效 frame。</li>
+<li>Settings 中的轴映射、方向和速度已验证。基于像素或微米的移动还需要当前 objective/eyepiece 的 pixel calibration 与载台换算参数。</li>
+<li>横向运动前确认 Probe 为 Separate。</li>
+</ul>
+<h2>Live Vision</h2>
+<p>主画布显示最新相机帧。<strong>Point-Point</strong>、<strong>Point-Line</strong> 和 <strong>Polygon Area</strong> 用于图像标注与测量；<strong>Clear</strong> 清除当前选择。<strong>GDS Overlay</strong> 在已有 LayoutMap 映射时叠加版图；<strong>Probe Assist</strong> 提供探针定位辅助。</p>
+<p>图像坐标转换依赖保存的像素标定、相机 FOV rotation 与载台方向。若状态提示 calibration required，先到 <a href="config.htm">Settings</a> 完成标定。</p>
+<h2>Position：Move、Read、Continue</h2>
+<ul>
+<li><strong>Move：</strong>显示目标输入。单击 X/Y/Z 数值进入 Relative 输入；双击进入 Absolute 输入。Enter 执行，Esc 清除，Tab/Shift+Tab 切换轴。</li>
+<li><strong>Read：</strong>读取控制器位置并更新 X/Y/Z。</li>
+<li><strong>Continue：</strong>开启/暂停周期性位置读回。自动流程开始时可能临时暂停实时读回，结束后恢复。</li>
+</ul>
+<div class="callout note"><strong>坐标单位。</strong>主位置与 Agent stage_move 使用控制器 pulse 整数。Absolute 的 0 是当前控制器坐标零点，不代表机械限位。</div>
+<h2>Electrode Control</h2>
+<p>每轴可设置 jog step，使用 <strong>Fwd</strong>、<strong>Rev</strong> 和 <strong>Stop</strong>。Fwd/Rev 的物理方向取决于 Settings 中的 motor mapping 与 axis direction。首次配置后应以小步长逐轴验证。</p>
+<ul>
+<li><strong>Set New Zero：</strong>把当前位置定义为 X/Y/Z 零点，受 Admin 保护。</li>
+<li><strong>Go Home：</strong>执行控制器 homing，受 Admin 保护；其含义取决于控制器协议和现场机构。</li>
+<li><strong>Go Zero：</strong>移动到控制器坐标 X=Y=Z=0，不是寻限位。</li>
+<li><strong>Speed Profile：</strong>Fast、Fine、Safe 使用 Settings 保存的速度比例。</li>
+<li><strong>FocusMap Z：</strong>启用后，XY 目标会从当前焦平面计算 Z；手动 Z 输入和滚轮 Z 被锁定。</li>
+</ul>
+<h2>KeyboardMove</h2>
+<p>开启后，默认方向键控制 XY，PageUp/PageDown 控制 Z；也可在 Settings 改为 WASD/QE。长按会逐步缩短重复间隔。Alt+X/Y/Z 循环对应轴的 jog step。只有 MainView 且焦点不在文本输入控件时才会运动；完整表见 <a href="shortcuts.htm">快捷键</a>。</p>
+<h2>正常结果与停止</h2>
+<p>每次动作应产生命令状态、终止状态和位置读回。单轴 <strong>Stop</strong> 会向对应控制器轴发送停止；当前版本的自动位置刷新存在已知错误，停止后请手动单击 <strong>Read</strong> 核对位置。紧急情况使用顶栏 <strong>EMERGENCY STOP</strong>，然后按 <a href="safety.htm">恢复检查</a> 操作。</p>
+<p class="related"><strong>相关主题：</strong><a href="communication.htm">SerialIO</a> · <a href="focusmap.htm">FocusMap Z</a> · <a href="config.htm">运动与光学校准</a></p>
+
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div></body></html>

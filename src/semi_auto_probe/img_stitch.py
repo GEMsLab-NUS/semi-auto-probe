@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -142,6 +142,7 @@ class StitchEdgeQuality:
     raw_shift_px: tuple[float, float] | None = None
     corrected_shift_px: tuple[float, float] | None = None
     was_corrected: bool = False
+    correction_limited: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -157,6 +158,7 @@ class StitchEdgeQuality:
             "raw_shift_px": list(self.raw_shift_px or self.measured_shift_px),
             "corrected_shift_px": list(self.corrected_shift_px or self.measured_shift_px),
             "was_corrected": self.was_corrected,
+            "correction_limited": self.correction_limited,
         }
 
     @classmethod
@@ -174,6 +176,7 @@ class StitchEdgeQuality:
             raw_shift_px=tuple(data.get("raw_shift_px", data["measured_shift_px"])),  # type: ignore[arg-type]
             corrected_shift_px=tuple(data.get("corrected_shift_px", data["measured_shift_px"])),  # type: ignore[arg-type]
             was_corrected=bool(data.get("was_corrected", False)),
+            correction_limited=bool(data.get("correction_limited", False)),
         )
 
 
@@ -517,6 +520,58 @@ def compose_mosaic(
     return np.clip(mosaic, 0, 255).astype(np.uint8)
 
 
+class IncrementalStitchPreview:
+    """Bounded-resolution stage preview; each captured tile is resized once.
+
+    Registration, white balance and seam diagnostics belong to final composition.
+    Preview coordinates must never be used for stage navigation.
+    """
+
+    def __init__(self, session: StitchSession, max_extent: int = 1600):
+        self.session = session
+        self.scale = min(1.0, max_extent / max(
+            1, session.cols * session.tile_width + session.rows * session.tile_height,
+        ))
+        self.origin = session.tiles[0]
+        self.accum = np.zeros((0, 0, 3), dtype=np.float32)
+        self.weights = np.zeros((0, 0, 1), dtype=np.float32)
+        self.left = self.top = 0
+        self.keys: set[GridIndex] = set()
+
+    def add(self, tile: TileRecord, image: np.ndarray) -> np.ndarray:
+        if tile.key in self.keys:
+            raise ValueError(f"Preview already contains tile {tile.key}.")
+        cv2_module = require_cv2()
+        height = max(1, round(image.shape[0] * self.scale))
+        width = max(1, round(image.shape[1] * self.scale))
+        small = cv2_module.resize(image, (width, height), interpolation=cv2_module.INTER_AREA)
+        x, y = stage_delta_um_to_image_delta_px(
+            tile.stage_x_um - self.origin.stage_x_um,
+            tile.stage_y_um - self.origin.stage_y_um,
+            self.session.um_per_px, self.session.camera_fov_rotation_deg,
+        )
+        x, y = round(x * self.scale), round(y * self.scale)
+        if not self.keys:
+            self.left, self.top = x, y
+        left, top = min(self.left, x), min(self.top, y)
+        right = max(self.left + self.accum.shape[1], x + width)
+        bottom = max(self.top + self.accum.shape[0], y + height)
+        if (bottom - top, right - left) != self.accum.shape[:2]:
+            accum = np.zeros((bottom - top, right - left, 3), dtype=np.float32)
+            weights = np.zeros((bottom - top, right - left, 1), dtype=np.float32)
+            ox, oy = self.left - left, self.top - top
+            h, w = self.accum.shape[:2]
+            accum[oy:oy+h, ox:ox+w] = self.accum
+            weights[oy:oy+h, ox:ox+w] = self.weights
+            self.accum, self.weights = accum, weights
+            self.left, self.top = left, top
+        x, y = x - self.left, y - self.top
+        self.accum[y:y+height, x:x+width] += small
+        self.weights[y:y+height, x:x+width] += 1.0
+        self.keys.add(tile.key)
+        return np.clip(self.accum / np.maximum(self.weights, 1.0), 0, 255).astype(np.uint8)
+
+
 def stage_positions_from_um(
     tiles: Iterable[TileRecord],
     um_per_px: float,
@@ -556,14 +611,26 @@ def mosaic_pixel_to_stage_um(
     min_y = min(position[1] for position in positions.values())
     raw_x_px = float(image_x_px) + min_x
     raw_y_px = float(image_y_px) + min_y
+    candidates = []
+    for tile in session.tiles:
+        if tile.key not in positions:
+            continue
+        x, y = positions[tile.key]
+        local_x, local_y = raw_x_px - x, raw_y_px - y
+        if 0 <= local_x < session.tile_width and 0 <= local_y < session.tile_height:
+            dx = local_x - session.tile_width / 2.0
+            dy = local_y - session.tile_height / 2.0
+            candidates.append((dx * dx + dy * dy, tile.order, tile, dx, dy))
+    if not candidates:
+        raise ValueError("Selected point is outside the captured tiles.")
+    # Capture coordinates describe the optical center, not the top-left corner.
+    # Use the nearest covering tile to account for its registration displacement.
+    _, _, tile, dx, dy = min(candidates, key=lambda item: item[:2])
     stage_dx_um, stage_dy_um = image_delta_px_to_stage_delta_um(
-        raw_x_px,
-        raw_y_px,
-        session.um_per_px,
-        session.camera_fov_rotation_deg,
+        dx, dy, session.um_per_px, session.camera_fov_rotation_deg,
     )
-    first_tile = session.tiles[0]
-    return first_tile.stage_x_um + stage_dx_um, first_tile.stage_y_um + stage_dy_um
+    return tile.stage_x_um + stage_dx_um, tile.stage_y_um + stage_dy_um
+
 
 
 def _direction_from_expected_shift(previous: GridIndex, current: GridIndex, shift: tuple[float, float]) -> str:
@@ -617,31 +684,11 @@ def _measure_edge_shift(
             settings.overlap_x,
             settings.overlap_y,
         )
+        if not np.all(np.isfinite((measured_dx, measured_dy, response))):
+            return direction, expected_shift, expected_shift, 0.0
         return direction, expected_shift, (measured_dx, measured_dy), float(response)
     except Exception:
         return direction, expected_shift, expected_shift, 0.0
-
-
-def _position_from_shift(
-    previous_position: tuple[float, float],
-    base_position: tuple[float, float],
-    shift: tuple[float, float],
-    max_correction_px: float,
-    registration_weight: float,
-) -> tuple[float, float]:
-    measured_position = (
-        previous_position[0] + shift[0],
-        previous_position[1] + shift[1],
-    )
-    raw_correction = (
-        measured_position[0] - base_position[0],
-        measured_position[1] - base_position[1],
-    )
-    clamped_correction = _clamp_vector(raw_correction[0], raw_correction[1], max_correction_px)
-    return (
-        base_position[0] + clamped_correction[0] * registration_weight,
-        base_position[1] + clamped_correction[1] * registration_weight,
-    )
 
 
 def _green_edge_centers(edges: Iterable[StitchEdgeQuality], minimum_edges: int = 2) -> dict[str, tuple[float, float, float, int]]:
@@ -770,87 +817,6 @@ def _all_adjacent_edges(
     return edges
 
 
-def _path_positions_and_edges(
-    session: StitchSession,
-    settings: StitchSettings,
-    tile_images: dict[GridIndex, np.ndarray],
-    base_positions: dict[GridIndex, tuple[float, float]],
-    correction_centers: dict[str, tuple[float, float, float, int]] | None = None,
-) -> tuple[dict[GridIndex, tuple[float, float]], list[StitchEdgeQuality]]:
-    positions: dict[GridIndex, tuple[float, float]] = {}
-    path_edges: list[StitchEdgeQuality] = []
-    max_correction_px = settings.max_correction_um / session.um_per_px if session.um_per_px > 0 else 0.0
-    ordered_keys = [tile.key for tile in sorted(session.tiles, key=lambda tile: tile.order)]
-    previous_key: GridIndex | None = None
-
-    for key in ordered_keys:
-        if key not in tile_images:
-            raise KeyError(f"Missing image for tile {key}.")
-        if previous_key is None:
-            positions[key] = base_positions[key]
-            previous_key = key
-            continue
-
-        direction, expected_shift, measured_shift, response = _measure_edge_shift(previous_key, key, settings, tile_images, base_positions)
-        provisional_position = _position_from_shift(
-            positions[previous_key],
-            base_positions[key],
-            measured_shift,
-            max_correction_px,
-            settings.registration_weight,
-        )
-        provisional_shift = (
-            provisional_position[0] - positions[previous_key][0],
-            provisional_position[1] - positions[previous_key][1],
-        )
-        provisional_correction_um = float(
-            np.hypot(provisional_shift[0] - expected_shift[0], provisional_shift[1] - expected_shift[1]) * session.um_per_px
-        )
-        quality = _quality_from_metrics(float(response), provisional_correction_um, settings)
-        corrected_shift = measured_shift
-        was_corrected = False
-        # Low-confidence path edges borrow the robust green-edge displacement
-        # only when the user enables the conservative correction mode.
-        if settings.use_green_edge_correction and correction_centers and quality != "good":
-            center = _center_for_direction(direction, correction_centers)
-            if center is not None:
-                corrected_shift = (center[0], center[1])
-                was_corrected = True
-
-        layout_weight = 1.0 if was_corrected else settings.registration_weight
-        final_position = _position_from_shift(
-            positions[previous_key],
-            base_positions[key],
-            corrected_shift,
-            max_correction_px,
-            layout_weight,
-        )
-        applied_shift = (
-            final_position[0] - positions[previous_key][0],
-            final_position[1] - positions[previous_key][1],
-        )
-        correction_um = float(np.hypot(applied_shift[0] - expected_shift[0], applied_shift[1] - expected_shift[1]) * session.um_per_px)
-        positions[key] = final_position
-        path_edges.append(
-            StitchEdgeQuality(
-                previous=previous_key,
-                current=key,
-                direction=direction,
-                expected_shift_px=expected_shift,
-                measured_shift_px=measured_shift,
-                applied_shift_px=applied_shift,
-                response=float(response),
-                correction_um=correction_um,
-                quality=quality,
-                raw_shift_px=measured_shift,
-                corrected_shift_px=corrected_shift,
-                was_corrected=was_corrected,
-            )
-        )
-        previous_key = key
-    return positions, path_edges
-
-
 def recompose_session(
     session: StitchSession,
     settings: StitchSettings | None = None,
@@ -866,15 +832,70 @@ def recompose_session(
                 raise FileNotFoundError(tile.image_path)
             tile_images[tile.key] = image
 
+    for tile in session.tiles:
+        if tile.key not in tile_images:
+            raise KeyError(f"Missing image for tile {tile.key}.")
+
     if settings.white_balance_correction:
         tile_images = white_balance_tile_set(tile_images)
 
     base_positions = stage_positions_from_um(session.tiles, session.um_per_px, session.camera_fov_rotation_deg)
-    initial_positions, _initial_path_edges = _path_positions_and_edges(session, settings, tile_images, base_positions)
-    initial_edges = _all_adjacent_edges(session, settings, tile_images, base_positions, initial_positions)
-    correction_centers = _green_edge_centers(initial_edges) if settings.use_green_edge_correction else {}
-    positions, _path_edges = _path_positions_and_edges(session, settings, tile_images, base_positions, correction_centers)
-    edges = _all_adjacent_edges(session, settings, tile_images, base_positions, positions, correction_centers)
+    # Measure all grid neighbors once. Sequential path integration ignores loop
+    # closure and used to clamp accumulated camera skew against the stage grid.
+    measured = _all_adjacent_edges(session, settings, tile_images, base_positions, base_positions)
+    measured = [replace(edge, quality=_quality_from_metrics(
+        edge.response,
+        float(np.linalg.norm(np.subtract(edge.measured_shift_px, edge.expected_shift_px))) * session.um_per_px,
+        settings,
+    )) for edge in measured]
+    centers = _green_edge_centers(measured) if settings.use_green_edge_correction else {}
+    keys = list(base_positions)
+    index = {key: i for i, key in enumerate(keys)}
+    max_px = settings.max_correction_um / session.um_per_px
+    equations, targets, confidences, edges = [], [], [], []
+    for edge in measured:
+        shift = edge.measured_shift_px
+        center = _center_for_direction(edge.direction, centers)
+        corrected = edge.quality != "good" and center is not None
+        if corrected:
+            shift = (center[0], center[1])
+        delta = np.subtract(shift, edge.expected_shift_px)
+        weight = 1.0 if corrected else settings.registration_weight
+        correction_limited = weight > 0 and float(np.linalg.norm(delta)) > max_px + 1e-6
+        delta = np.asarray(_clamp_vector(*delta, max_px))
+        delta *= weight
+        row = np.zeros(len(keys))
+        row[index[edge.current]] = 1.0
+        row[index[edge.previous]] = -1.0
+        equations.append(row)
+        targets.append(delta)
+        confidences.append(0.1 if corrected else max(0.01, min(1.0, edge.response)))
+        edges.append(replace(edge, corrected_shift_px=shift, was_corrected=corrected,
+                             correction_limited=correction_limited))
+
+    positions = dict(base_positions)
+    if equations:
+        matrix = np.asarray(equations)
+        target = np.asarray(targets)
+        weights = np.sqrt(confidences)[:, None]
+        # Fix the first capture as origin; a tiny prior anchors disconnected
+        # components without suppressing accumulated, measured camera skew.
+        reduced = matrix[:, 1:]
+        solution = np.linalg.lstsq(
+            np.vstack((reduced * weights, np.eye(len(keys) - 1) * 1e-6)),
+            np.vstack((target * weights, np.zeros((len(keys) - 1, 2)))),
+            rcond=None,
+        )[0]
+        for key, correction in zip(keys[1:], solution):
+            positions[key] = tuple(np.asarray(base_positions[key]) + correction)
+    final_edges = []
+    for edge in edges:
+        applied = tuple(np.subtract(positions[edge.current], positions[edge.previous]))
+        correction_um = float(np.linalg.norm(np.subtract(applied, edge.expected_shift_px))) * session.um_per_px
+        residual_um = float(np.linalg.norm(np.subtract(applied, edge.corrected_shift_px))) * session.um_per_px
+        quality = _quality_from_metrics(edge.response, max(correction_um, residual_um), settings)
+        final_edges.append(replace(edge, applied_shift_px=applied, correction_um=correction_um, quality=quality))
+    edges = final_edges
     return compose_mosaic(tile_images, positions), positions, edges
 
 

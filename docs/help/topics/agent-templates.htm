@@ -1,0 +1,46 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="generator" content="Semi Auto Probe Help"><title>AI Agent 可直接测试的模板</title><link rel="stylesheet" type="text/css" href="../assets/help.css"></head><body><div class="topic-header"><div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div><h1>AI Agent 可直接测试的模板</h1><p class="summary">从无设备帮助到受控硬件步骤，逐项验证路由、blocker、审批和状态机。</p></div>
+<div class="callout note"><strong>加载不会执行。</strong>AI Agent → Templates → 选择条目 → Load into input → Send。默认 Authorized Step 下，执行步骤仍需单击 Run Next Step。</div>
+<h2>正式界面模板</h2>
+<table class="feature-table">
+<tr><th>ID</th><th>复制到输入框</th><th>预期</th></tr>
+<tr><td>help</td><td><code>/help</code></td><td>能力与边界；Steps 为空。</td></tr>
+<tr><td>status</td><td><code>/status</code></td><td>显示真实当前状态，不启动硬件。</td></tr>
+<tr><td>workflow_help</td><td><code>/help workflow</code></td><td>解释控制线、数据线、公式和 Plot Panel。</td></tr>
+<tr><td>mapping_help</td><td><code>/help mapping</code></td><td>解释 Probe 与 Wire-bond 的不同前置条件。</td></tr>
+<tr><td>open</td><td><code>/open AutoTest</code></td><td>生成页面导航步骤，不运行测量。</td></tr>
+<tr><td>check</td><td><code>/check</code></td><td>检查当前图与扫描 geometry；不连接仪器。</td></tr>
+<tr><td>capture</td><td><code>capture and save one image</code></td><td>有 camera frame 才执行；保存带时间戳图片且不清空 ImgStitch session。</td></tr>
+<tr><td>focus_capture</td><td><code>Run autofocus, then capture and save one image</code></td><td>只有 AutoFocus terminal 后才开放 capture。</td></tr>
+<tr><td>stage</td><td><code>move relative X=10 pulses</code></td><td>预览相对 X +10 pulse；确认前核对方向、Probe 与空间。</td></tr>
+<tr><td>measure</td><td><code>/run measurement</code></td><td>显示模式、点数、节点和 fingerprint；确认后运行当前流程。</td></tr>
+<tr><td>help_intent</td><td><code>如何运行 autofocus？</code></td><td>只解释方法，不产生 Z 运动。</td></tr>
+<tr><td>unsupported</td><td><code>执行任意 Python 调整所有仪器</code></td><td>说明不支持或请求澄清，不执行代码。</td></tr>
+</table>
+<h2>无设备命令行试用</h2>
+<pre>uv run python -m semi_auto_probe.agent_demo --list
+uv run python -m semi_auto_probe.agent_demo --all
+uv run python -m semi_auto_probe.agent_demo --all --ready
+uv run python -m semi_auto_probe.agent_demo --template focus_capture --ready
+uv run python -m semi_auto_probe.agent_demo --preview --ready
+uv run python -m semi_auto_probe.agent_demo --all --ready --output .runtime/agent-v2/templates-ready.jsonl</pre>
+<p><code>--ready</code> 只构造虚拟就绪状态，不代表真实连接。演示始终使用本地规则；结果标为 SIMULATION，不建立硬件客户端或正式测量文件。<code>--output</code> 保存 UTF-8 JSONL。</p>
+<h2>Measurement 试用顺序</h2>
+<ol>
+<li>在 AutoTest → Config Measure Flow 载入一个符合当前设备的 Workflow v2 模板，并核对每个仪器限值。</li>
+<li>配置 Probe 点表或 Wire-bond Mapping 区域。</li>
+<li>发送 <code>/check</code> 并解决 blockers。通过只代表本地结构/geometry 通过。</li>
+<li>发送 <code>/run measurement</code>，核对右侧 Steps 中的模式、点数、节点和 fingerprint，再 Run Next Step。</li>
+<li>在原 AutoTest/Mapping 与 Plot Panel 检查真实结果和输出文件。</li>
+</ol>
+<h2>状态机回归</h2>
+<ul>
+<li>AutoFocus→capture 第一步运行中再次 Run Next Step：不得提前拍照。</li>
+<li>运行中 Cancel Plan：当前动作继续，后续取消；Stop 才请求停硬件。</li>
+<li>计划未运行前按 Stop：所有 pending 步骤取消。</li>
+<li>第一步运行中 Stop：等待原工作流清理，不自动继续第二步。</li>
+<li>Conversation Only 加载任意硬件模板：只预览。</li>
+<li>生成 measurement 计划后修改 flow 或区域：旧计划必须 blocked。</li>
+<li>关闭 camera 后 capture：报告缺 frame；恢复后重新检查/规划。</li>
+</ul>
+<p class="related"><strong>相关主题：</strong><a href="ai-agent.htm">Agent 操作说明</a> · <a href="troubleshooting.htm">Agent blockers</a></p>
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div></body></html>

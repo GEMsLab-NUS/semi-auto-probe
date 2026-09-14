@@ -274,7 +274,7 @@ class AgentPlannerTests(unittest.TestCase):
 
         self.assertTrue(agent_context.camera_frame_available)
 
-    def test_agent_single_capture_falls_back_to_current_stitch_frame(self) -> None:
+    def test_agent_single_capture_preserves_session_and_creates_unique_files(self) -> None:
         app = ProbeApp.__new__(ProbeApp)
         app.camera_running = True
         app.camera_lock = threading.Lock()
@@ -292,12 +292,34 @@ class AgentPlannerTests(unittest.TestCase):
             try:
                 os.chdir(directory)
                 app.imgstitch_session_dir = Path("imgstitch_session")
+                tiles = app.imgstitch_session_dir / "tiles"
+                tiles.mkdir(parents=True)
+                sentinels = {
+                    app.imgstitch_session_dir / "session.json": b"existing session",
+                    app.imgstitch_session_dir / "stack_result.png": b"existing stack",
+                    app.imgstitch_session_dir / "last_imgstitch.png": b"existing session latest",
+                    tiles / "tile_000.png": b"existing tile",
+                }
+                for path, payload in sentinels.items():
+                    path.write_bytes(payload)
 
-                message = ProbeApp.capture_agent_single_frame(app)
+                messages = [
+                    ProbeApp.capture_agent_single_frame(app),
+                    ProbeApp.capture_agent_single_frame(app),
+                ]
+                captures = sorted(app.imgstitch_session_dir.glob("agent_single_frame_*.png"))
+
+                self.assertTrue((Path.cwd() / "last_imgstitch.png").is_file())
+                self.assertEqual(len(captures), 2)
+                self.assertNotEqual(captures[0].name, captures[1].name)
+                for capture in captures:
+                    self.assertRegex(capture.name, r"agent_single_frame_\d{8}_\d{6}_\d{9}(?:_\d{2})?\.png")
+                for path, payload in sentinels.items():
+                    self.assertEqual(path.read_bytes(), payload)
             finally:
                 os.chdir(old_cwd)
 
-        self.assertIn("Agent captured one frame", message)
+        self.assertTrue(all("Agent captured one frame" in message for message in messages))
 
 
 if __name__ == "__main__":

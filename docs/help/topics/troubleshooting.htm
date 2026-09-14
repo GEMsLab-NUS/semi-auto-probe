@@ -1,0 +1,63 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="generator" content="Semi Auto Probe Help"><title>故障排查</title><link rel="stylesheet" type="text/css" href="../assets/help.css"></head><body><div class="topic-header"><div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div><h1>故障排查</h1><p class="summary">按状态、前置条件、连接和完成证据定位问题。</p></div>
+<h2>应用启动或配置异常</h2>
+<table class="feature-table">
+<tr><th>现象</th><th>处理</th></tr>
+<tr><td>设置像恢复默认</td><td>确认启动工作目录及其中的 <code>probe_config.local.json</code>。无效 JSON 会回退默认并只写 logger；用 JSON parser 检查格式，保留损坏副本。</td></tr>
+<tr><td>页面过窄或控件不可见</td><td>主窗最小 1040×600；最大化或使用页面滚动栏。不要依赖旧 manual-deck 截图。</td></tr>
+<tr><td>F1 无法打开</td><td>确认安装目录的 <code>SemiAutoProbeHelp.chm</code> 存在；可用 <code>SEMI_AUTO_PROBE_HELP_FILE</code> 指向本地 CHM。若从浏览器下载，文件属性中解除阻止；避免从 UNC/network 直接打开。</td></tr>
+</table>
+<h2>Serial / motion</h2>
+<ul>
+<li><strong>没有 COM：</strong>设备管理器、驱动、线缆，再 Refresh。</li>
+<li><strong>连接失败：</strong>端口占用、电源/RS-232、Local/Remote 模式；默认协议 115200 8-N-1。</li>
+<li><strong>Test 失败：</strong>查看 SerialIO 的完整 LAST TX/RX 和 history；默认响应前缀应为 <code>A3 AA</code>。</li>
+<li><strong>Motion busy / locked：</strong>等待当前 workflow 或用对应 Stop；检查位置读回任务、FocusMap/AF/ImgStitch 占用。</li>
+<li><strong>方向错误：</strong>停止，保持 Separate；在 Settings 核对 motor mapping 与 axis direction，以最小 jog step 重试。</li>
+<li><strong>FocusMap Z 锁住 Z：</strong>关闭 MainView 的 FocusMap Z，或使用随平面的 XY 目标。</li>
+</ul>
+<h2>Camera / image</h2>
+<ul>
+<li>换用 auto、miicam:0 或正确 OpenCV/ToupCam source；关闭占用相机的软件并按 Restart。</li>
+<li>自定义 MiiCam SDK 路径用 <code>SEMI_AUTO_PROBE_MIICAM_SDK</code>；检查 DLL 架构与驱动。</li>
+<li>Vision move disabled 通常表示缺当前倍率/分辨率的 pixel calibration 或 stage conversion。</li>
+<li>曝光饱和、噪声或自动白平衡漂移会破坏 focus score 与拼接；先固定照明和相机参数。</li>
+</ul>
+<h2>AutoFocus / FocusMap</h2>
+<ul>
+<li><strong>No camera frame：</strong>相机未产生 frame；先在 MainView 验证。</li>
+<li><strong>峰值在边界：</strong>搜索范围不足、初始 Z 偏离、步长过大或方向错误；停止并重新设范围。</li>
+<li><strong>阈值 invalid：</strong>Settings 的 green 必须 ≥ yellow。</li>
+<li><strong>平面 fit pending：</strong>需要至少 3 个有效非共线点；检查 failed/retry 与残差。</li>
+<li><strong>导入后不匹配：</strong>确认样品、零点、光学倍率和 mesh 坐标未改变。</li>
+</ul>
+<h2>LayoutMap / imaging</h2>
+<ul>
+<li>GDS 载入失败时确认 gdstk 已安装、文件有效、top cell/layer 存在。</li>
+<li>Mapping residual 高时重新选择分布良好的 P1-P3/P4；不要用近共线点。</li>
+<li>拼接接缝差时检查 overlap、stage step、曝光、flat/background correction、纹理重复、FocusMap 和 settle。</li>
+<li>ImgMatrix 路径错位时检查 U/V basis、FOV rotation 和 stage↔GDS mapping。</li>
+</ul>
+<h2>Workflow / instruments</h2>
+<ul>
+<li>Validate 先处理断开的 control/data edge、类型、START/END、条件分支和非法参数。</li>
+<li>IT、Light Control、Light Pulse、Switch Wavelength 是占位节点，正式预检会拒绝。</li>
+<li>VISA 失败时核对 resource、前/后 terminal、驱动、仪器锁和连接；本地 <code>/check</code> 不会测试连通性。</li>
+<li>触及 compliance、Stop 或异常后，现场确认 Keithley/HP/B1500/DP100 输出已关闭。</li>
+<li>Photo IV 当前执行为通用 IV，未产生其声明的 dark/photocurrent/responsivity 特征；WobbTest 当前不产出 contact_resistance_ohm。下游应检查 invalid/missing。</li>
+</ul>
+<h2>AI Agent</h2>
+<ul>
+<li><strong>API off：</strong>无 key 仍可使用本地 help/status/check/open/run routing，不是故障。</li>
+<li><strong>Provider failed：</strong>查看错误原因；系统会退到本地规则。</li>
+<li><strong>Planning already running / empty input：</strong>等待当前请求或输入有效指令。</li>
+<li><strong>Blocked：</strong>逐条解决 Probe Contact、serial/camera、motion busy、mesh/mapping/target 或 measurement fingerprint blocker，再重新规划。</li>
+<li>Cancel Plan 不停止已经运行的动作；使用 Stop。</li>
+</ul>
+<h2>Web / data</h2>
+<ul>
+<li>401：核对服务进程中的 WEB_TOKEN 与浏览器 localStorage/header。</li>
+<li>没有 session：核对 <code>SEMI_AUTO_PROBE_AUTOTEST_SESSION_DIR</code> 和服务启动工作目录。</li>
+<li>只有部分文件：检查任务 status、completed points、manifest、execution JSON、SQLite 和 loose <code>points/</code>，不要只看 PNG。</li>
+</ul>
+<p class="related"><strong>仍无法解决：</strong>保存启动命令、版本/commit、脱敏 config、相关 session、日志、Serial TX/RX 与复现步骤。</p>
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div></body></html>

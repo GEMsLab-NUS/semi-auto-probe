@@ -1,0 +1,26 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="generator" content="Semi Auto Probe Help"><title>Measurement Workflow v2</title><link rel="stylesheet" type="text/css" href="../assets/help.css"></head><body><div class="topic-header"><div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div><h1>Measurement Workflow v2</h1><p class="summary">用类型化图连接控制步骤与数据结果，并保存为可复用工作流。</p></div>
+<h2>打开方式</h2>
+<p>在 AutoTest 的 Probe Test 或 Wire-bond Mapping 中单击 <strong>Config Measure Flow</strong>。独立调试入口为 <code>uv run semi-auto-probe-measure</code>。正式编辑器是一个约 1480×820 的三栏窗口：左侧 Library，中间 Canvas，右侧 Inspector，底部为 Validate、Clear 与 Close。</p>
+<h2>图模型</h2>
+<ul>
+<li><strong>控制线：</strong>规定执行先后、分支和终止路径。每个正式工作流从 START 进入，并应有可达 END。</li>
+<li><strong>数据线：</strong>把标量、Boolean、curve 或 calibration 等端口传给下游节点。端口类型不兼容时 Validate 会报错。</li>
+<li><strong>Inspector：</strong>编辑选中节点参数。参数变化会改变 workflow fingerprint，已生成的 Agent 执行计划会失效。</li>
+</ul>
+<h2>基本操作</h2>
+<ol>
+<li>在左侧 <strong>Nodes</strong> 选择节点并放到 Canvas；拖动卡片安排位置。</li>
+<li>从彩色输出端口拖到高亮的兼容输入端口，靠近后吸附；Esc 取消。平滑曲线自动避开节点。中键拖动平移，滚轮缩放，右拖可切断连线；Delete 删除选中节点。</li>
+<li>点击节点内常用参数值直接编辑，Enter 或失焦提交、Esc 取消。双击节点标题打开 Inspector，设定 resource、范围、compliance、delay、save/plot 和输出策略。</li>
+<li>单击 <strong>Validate</strong>。修复缺少 START/END、断开的控制路径、无效类型、必需参数、非法公式或不支持的 Mapping 动作。</li>
+<li>保存到 Library，并以少量点执行 commissioning。</li>
+</ol>
+<h2>Workflow Library</h2>
+<p>库根目录为 <code>workflow_library/</code>，可按 Xinchuan、Leo、Micheal 或自建文件夹组织。编辑器支持 Save、New Folder、Load、Copy、Move 和 Delete。文件格式标识为 <code>semi_auto_probe.measurement_workflow</code>，版本必须是 2；旧 v1 或没有版本的文件会被拒绝。</p>
+<div class="callout note"><strong>共享语义。</strong>Probe Test 与 Wire-bond Mapping 使用同一组 flow cards/graph。切换模式不会清空工作流，但 Mapping 会额外限制会移动探针的节点。</div>
+<h2>条件与结果</h2>
+<p>Boolean Branch、Metric Condition、Device State 和 Compliance Check 可选择不同控制出口。Math、Compare 与 Formula 通过数据线处理结果。缺失或无效值遵循节点的 fallback/on_invalid；应显式验证失败支路也能到达安全 END。</p>
+<h2>Virtual Mask 与 DP100 Waveform</h2>
+<p>Virtual Mask 配置窗口把灰度图像像素绑定到 Stage XY 或 LayoutMap UV，再映射到功率。DP100 Waveform Editor 支持 Pulse/Ramp/Staircase、自定义点、Undo/Redo、范围与最终输出状态。两者都会改变硬件输出设计，保存前核对坐标、校准、OVP/OCP 和 final state。</p>
+<p class="related"><strong>相关主题：</strong><a href="measurement-nodes.htm">全部 37 个节点</a> · <a href="autotest.htm">Probe Test</a> · <a href="wirebond-mapping.htm">Mapping</a></p>
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div></body></html>

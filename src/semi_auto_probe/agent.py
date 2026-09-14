@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import math
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+from .agent_knowledge import help_markdown, knowledge_markdown
 
 
 AGENT_ACTION_MOVE_GDS = "move_gds_target"
@@ -19,8 +22,56 @@ AGENT_ACTION_FOCUSMAP = "focusmap_current_settings"
 AGENT_ACTION_LAYOUT_OVERLAY = "layout_image_overlay"
 AGENT_ACTION_STATUS = "status_summary"
 AGENT_ACTION_CLARIFY = "clarify"
+AGENT_ACTION_HELP = "help"
+AGENT_ACTION_OPEN_PAGE = "open_page"
+AGENT_ACTION_CHECK_WORKFLOW = "check_measurement_workflow"
+AGENT_ACTION_RUN_MEASUREMENT = "run_current_measurement"
+AGENT_PAGES = ("Main", "AutoFocus", "FocusMap", "LayoutBond", "ImgStitch", "ImgMatrix", "AutoTest", "EdgeTrace", "AI Agent", "Communication", "Config")
+AGENT_PAGE_ALIASES = {
+    "MainView": "Main",
+    "LayoutMap": "LayoutBond",
+    "SerialIO": "Communication",
+    "Settings": "Config",
+}
+AGENT_PAGE_INPUTS = (*AGENT_PAGES, *AGENT_PAGE_ALIASES)
+READ_ONLY_ACTIONS = {AGENT_ACTION_STATUS, AGENT_ACTION_HELP, AGENT_ACTION_CHECK_WORKFLOW, AGENT_ACTION_CLARIFY}
+
+
+def canonical_agent_page(page: object) -> str | None:
+    """Resolve current page names and user-facing compatibility aliases case-insensitively."""
+    value = str(page).strip()
+    for name in AGENT_PAGES:
+        if value.casefold() == name.casefold():
+            return name
+    for alias, name in AGENT_PAGE_ALIASES.items():
+        if value.casefold() == alias.casefold():
+            return name
+    return None
+
+
+def action_parameter_schema(action: str) -> dict[str, object]:
+    """JSON-schema subset published to providers; local validation is authoritative."""
+    schema: dict[str, object] = {"type": "object", "properties": {}, "additionalProperties": False}
+    if action == AGENT_ACTION_OPEN_PAGE:
+        schema.update(properties={"page": {"type": "string", "enum": list(AGENT_PAGE_INPUTS)}}, required=["page"])
+    elif action == AGENT_ACTION_HELP:
+        schema.update(properties={"topic": {"type": "string"}})
+    elif action == AGENT_ACTION_RUN_MEASUREMENT:
+        schema.update(properties={"fingerprint": {"type": "string", "minLength": 1}}, required=["fingerprint"])
+    elif action == AGENT_ACTION_STAGE_MOVE:
+        axes = {"type": "array", "items": {"enum": ["X", "Y", "Z"]}, "minItems": 1, "uniqueItems": True}
+        values = {"type": "object", "properties": {axis: {"type": "integer", "minimum": -(2**31), "maximum": 2**31-1} for axis in "XYZ"}, "additionalProperties": False, "minProperties": 1}
+        schema = {"oneOf": [
+            {"type": "object", "properties": {"mode": {"const": "zero"}, "axes": axes}, "required": ["mode", "axes"], "additionalProperties": False},
+            *[{"type": "object", "properties": {"mode": {"const": mode}, "axes": axes, key: values}, "required": ["mode", key], "additionalProperties": False} for mode, key in (("absolute", "targets"), ("relative", "deltas"))],
+        ]}
+    return schema
 
 AGENT_ACTIONS = {
+    AGENT_ACTION_HELP,
+    AGENT_ACTION_OPEN_PAGE,
+    AGENT_ACTION_CHECK_WORKFLOW,
+    AGENT_ACTION_RUN_MEASUREMENT,
     AGENT_ACTION_MOVE_GDS,
     AGENT_ACTION_STAGE_MOVE,
     AGENT_ACTION_AUTOFOCUS,
@@ -81,9 +132,26 @@ class AgentContext:
     focusmap_points: int = 0
     focusmap_valid_points: int = 0
     focusmap_has_plane: bool = False
+    autotest_running: bool = False
+    mapping_running: bool = False
+    other_busy: bool = False
+    probe_contact: bool = False
+    measurement_mode: str = "probe"
+    measurement_summary: dict[str, object] = field(default_factory=dict)
+    measurement_blockers: tuple[str, ...] = ()
+    measurement_fingerprint: str = ""
 
     def to_prompt_dict(self) -> dict[str, object]:
         return {
+            "contract_version": 2,
+            "autotest_running": self.autotest_running,
+            "mapping_running": self.mapping_running,
+            "other_busy": self.other_busy,
+            "probe_contact": self.probe_contact,
+            "measurement_mode": self.measurement_mode,
+            "measurement_summary": self.measurement_summary,
+            "measurement_blockers": list(self.measurement_blockers),
+            "measurement_fingerprint": self.measurement_fingerprint,
             "positions": self.positions,
             "serial_connected": self.serial_connected,
             "motion_busy": self.motion_busy,
@@ -136,6 +204,7 @@ class AgentCapability:
     def to_prompt_dict(self) -> dict[str, object]:
         return {
             "action_id": self.action_id,
+            "parameters_schema": action_parameter_schema(self.action_id),
             "title": self.title,
             "module": self.module,
             "purpose": self.purpose,
@@ -165,6 +234,7 @@ class AgentWorkflowStep:
     blockers: tuple[str, ...] = ()
     recovery_suggestions: tuple[str, ...] = ()
     status: str = "pending"
+    local_blockers: tuple[str, ...] = ()
 
     @property
     def executable(self) -> bool:
@@ -225,6 +295,8 @@ class AgentPlan:
 
     def next_pending_step_index(self) -> int | None:
         for index, step in enumerate(self.steps):
+            if step.status not in {"pending", "done"}:
+                return None
             if step.status == "pending":
                 return index if step.executable else None
         return None
@@ -270,6 +342,13 @@ def build_agent_planner_from_config(
 
 def context_blockers_for_action(action: str, context: AgentContext) -> tuple[str, ...]:
     blockers: list[str] = []
+    if context.probe_contact and action in {AGENT_ACTION_STAGE_MOVE, AGENT_ACTION_MOVE_GDS, AGENT_ACTION_AUTOFOCUS, AGENT_ACTION_FOCUSMAP, AGENT_ACTION_IMAGE_CAPTURE}:
+        blockers.append("Retract probes and select Separate before Agent motion.")
+    if action not in READ_ONLY_ACTIONS | {AGENT_ACTION_OPEN_PAGE}:
+        if context.autotest_running or context.mapping_running:
+            blockers.append("AutoTest / Mapping is already running.")
+        if context.other_busy:
+            blockers.append("Another application workflow is running.")
     motion_busy = context.motion_busy or context.keyboard_motion_busy
     needs_idle_hardware = {
         AGENT_ACTION_MOVE_GDS,
@@ -278,6 +357,7 @@ def context_blockers_for_action(action: str, context: AgentContext) -> tuple[str
         AGENT_ACTION_IMAGE_CAPTURE,
         AGENT_ACTION_SINGLE_CAPTURE,
         AGENT_ACTION_FOCUSMAP,
+        AGENT_ACTION_RUN_MEASUREMENT,
     }
     if action in needs_idle_hardware:
         if motion_busy:
@@ -313,6 +393,8 @@ def context_blockers_for_action(action: str, context: AgentContext) -> tuple[str
         if not context.camera_running or not context.camera_frame_available:
             blockers.append("Camera frame is not available.")
     elif action == AGENT_ACTION_FOCUSMAP:
+        if not context.camera_running or not context.camera_frame_available:
+            blockers.append("Camera frame is not available.")
         if context.focusmap_points < 1:
             blockers.append("No FocusMap mesh is generated.")
     elif action == AGENT_ACTION_LAYOUT_OVERLAY:
@@ -320,7 +402,11 @@ def context_blockers_for_action(action: str, context: AgentContext) -> tuple[str
             blockers.append("GDS-to-stage mapping is not ready.")
         if not context.last_stitch_path or not Path(context.last_stitch_path).exists():
             blockers.append("No recent stitched image is available.")
-    elif action in {AGENT_ACTION_STATUS, AGENT_ACTION_CLARIFY}:
+    elif action == AGENT_ACTION_RUN_MEASUREMENT:
+        blockers.extend(context.measurement_blockers)
+        if not context.measurement_fingerprint:
+            blockers.append("Current measurement configuration is not available.")
+    elif action in READ_ONLY_ACTIONS | {AGENT_ACTION_OPEN_PAGE}:
         pass
     else:
         blockers.append("Unsupported Agent action.")
@@ -329,6 +415,20 @@ def context_blockers_for_action(action: str, context: AgentContext) -> tuple[str
 
 def build_agent_capabilities(context: AgentContext) -> tuple[AgentCapability, ...]:
     catalog = (
+        AgentCapability(AGENT_ACTION_HELP, "Explain current features", "Help", "Answer from bundled current-version help; never start hardware for a how-to question.", (), requires_confirmation=False),
+        AgentCapability(
+            AGENT_ACTION_OPEN_PAGE,
+            "Open an existing page",
+            "Navigation",
+            "Open a page using parameters {page: page name}; no hardware change. Pages: "
+            + ", ".join(AGENT_PAGES)
+            + ". Accepted aliases: "
+            + ", ".join(f"{alias} -> {name}" for alias, name in AGENT_PAGE_ALIASES.items()),
+            (),
+            requires_confirmation=False,
+        ),
+        AgentCapability(AGENT_ACTION_CHECK_WORKFLOW, "Check current measurement", "AutoTest", "Read the current workflow and scan geometry; report local validation. No instrument connection.", (), requires_confirmation=False),
+        AgentCapability(AGENT_ACTION_RUN_MEASUREMENT, "Run current measurement", "AutoTest / Mapping", "Run current UI settings, including Workflow v2, through existing Probe or Wire-bond executor. Parameters must include the current measurement_fingerprint as fingerprint.", ("Valid workflow and scan geometry.", "Review current parameters and mode."), hardware_effects=("Stage movement, probe contact in Probe mode, instrument output and measurement files as configured.",)),
         AgentCapability(
             action_id=AGENT_ACTION_STATUS,
             title="Summarize current software state",
@@ -431,6 +531,9 @@ def capabilities_to_markdown(context: AgentContext, capabilities: tuple[AgentCap
         f"- Camera: {'running' if context.camera_running else 'not running'}; frame: {'available' if context.camera_frame_available else 'missing'}",
         f"- Motion: {'busy' if context.motion_busy or context.keyboard_motion_busy else 'idle'}; position read: {'pending' if context.position_read_pending else 'idle'}",
         f"- Workflows: AutoFocus {'running' if context.autofocus_running else 'idle'}, FocusMap {'running' if context.focusmap_running else 'idle'}, ImgStitch {'running' if context.imgstitch_running else 'idle'}",
+        f"- Measurement: {context.measurement_mode}; AutoTest {'running' if context.autotest_running else 'idle'}, Mapping {'running' if context.mapping_running else 'idle'}; points: {context.measurement_summary.get('point_count', 'not inspected')}",
+        f"- Probe: {'contact' if context.probe_contact else 'Separate'}; other workflow: {'busy' if context.other_busy else 'idle'}",
+        "- Measurement checks: " + ("; ".join(context.measurement_blockers) or "local checks clear; instrument connectivity not verified"),
         f"- Stage XYZ um: X={context.stage_position_um.get('X', 0.0):.6g}, Y={context.stage_position_um.get('Y', 0.0):.6g}, Z={context.stage_position_um.get('Z', 0.0):.6g}",
         f"- Current GDS UV: {_format_pair(context.current_mapped_gds_uv)}",
         f"- Selected GDS UV: {_format_pair(context.gds_selected_uv)}",
@@ -483,20 +586,36 @@ def merge_context_blockers(plan: AgentPlan, context: AgentContext) -> AgentPlan:
     plan_blockers = list(plan.blockers)
     steps: list[AgentWorkflowStep] = []
     for step in plan.steps:
-        blockers = list(step.blockers)
+        blockers = [value for value in step.blockers if value not in step.local_blockers]
+        local_blockers = list(action_parameter_blockers(step.action_id, step.parameters))
         if step.action_id not in AGENT_ACTIONS:
             blockers.append("Unsupported Agent action.")
-        if step.action_id == AGENT_ACTION_STAGE_MOVE:
-            for blocker in stage_move_parameter_blockers(step.parameters):
-                if blocker not in blockers:
-                    blockers.append(blocker)
-        for blocker in context_blockers_for_action(step.action_id, context):
+        local_blockers.extend(context_blockers_for_action(step.action_id, context))
+        for blocker in local_blockers:
             if blocker not in blockers:
                 blockers.append(blocker)
-        steps.append(replace(step, blockers=tuple(blockers)))
-    if not steps:
-        plan_blockers.append("No executable Agent steps were returned.")
+        # Permission and effect metadata are owned locally, never by the model.
+        changing = step.action_id not in READ_ONLY_ACTIONS | {AGENT_ACTION_OPEN_PAGE}
+        motion = step.action_id in {AGENT_ACTION_STAGE_MOVE, AGENT_ACTION_MOVE_GDS, AGENT_ACTION_AUTOFOCUS, AGENT_ACTION_FOCUSMAP, AGENT_ACTION_IMAGE_CAPTURE, AGENT_ACTION_RUN_MEASUREMENT}
+        steps.append(replace(step, blockers=tuple(blockers), requires_confirmation=changing,
+                             involves_motion=motion, changes_experiment_state=changing,
+                             involves_autofocus=step.action_id in {AGENT_ACTION_AUTOFOCUS, AGENT_ACTION_FOCUSMAP},
+                             involves_capture=step.action_id in {AGENT_ACTION_SINGLE_CAPTURE, AGENT_ACTION_IMAGE_CAPTURE},
+                             local_blockers=tuple(local_blockers)))
     return replace(plan, steps=tuple(steps), blockers=tuple(dict.fromkeys(plan_blockers)))
+
+
+def action_parameter_blockers(action: str, parameters: dict[str, object]) -> tuple[str, ...]:
+    if action == AGENT_ACTION_STAGE_MOVE:
+        return stage_move_parameter_blockers(parameters)
+    allowed = {AGENT_ACTION_OPEN_PAGE: {"page"}, AGENT_ACTION_HELP: {"topic"}, AGENT_ACTION_RUN_MEASUREMENT: {"fingerprint"}}
+    if set(parameters) - allowed.get(action, set()):
+        return ("Unsupported parameters for this action; use the current UI settings.",)
+    if action == AGENT_ACTION_OPEN_PAGE and canonical_agent_page(parameters.get("page")) is None:
+        return ("Unknown application page.",)
+    if action == AGENT_ACTION_RUN_MEASUREMENT and (not isinstance(parameters.get("fingerprint"), str) or not parameters["fingerprint"]):
+        return ("Measurement fingerprint is required.",)
+    return ()
 
 
 def stage_move_parameter_blockers(parameters: dict[str, object]) -> tuple[str, ...]:
@@ -505,6 +624,14 @@ def stage_move_parameter_blockers(parameters: dict[str, object]) -> tuple[str, .
     if mode not in {"zero", "absolute", "relative"}:
         blockers.append("Stage move mode must be zero, absolute, or relative.")
         return tuple(blockers)
+    allowed = {"mode", "axes"} | ({"targets"} if mode == "absolute" else {"deltas"} if mode == "relative" else set())
+    if set(parameters) - allowed:
+        blockers.append("Unknown stage move parameters or units; only integer controller pulses are supported.")
+    raw_axes = parameters.get("axes", [])
+    if isinstance(raw_axes, str):
+        raw_axes = [raw_axes]
+    if not isinstance(raw_axes, list) or any(str(axis).upper() not in {"X", "Y", "Z", "XY", "XYZ"} for axis in raw_axes):
+        blockers.append("Invalid stage axes.")
     axes = stage_move_axes(parameters)
     if not axes:
         blockers.append("Stage move must specify at least one axis.")
@@ -515,11 +642,17 @@ def stage_move_parameter_blockers(parameters: dict[str, object]) -> tuple[str, .
     if not isinstance(values, dict):
         blockers.append(f"Stage move {mode} mode requires {values_key}.")
         return tuple(blockers)
+    if set(values) - {"X", "Y", "Z"}:
+        blockers.append("Unknown stage axis in values.")
+    if set(values) != set(axes):
+        blockers.append("Stage axes and values must match exactly.")
     for axis in axes:
         try:
-            int(float(values[axis]))
-        except (KeyError, TypeError, ValueError):
-            blockers.append(f"Stage move {values_key} must include numeric {axis}.")
+            value = float(values[axis])
+            if isinstance(values[axis], bool) or not math.isfinite(value) or not value.is_integer() or not -(2**31) <= value < 2**31:
+                raise ValueError("Invalid pulse value")
+        except (KeyError, TypeError, ValueError, OverflowError):
+            blockers.append(f"Stage move {values_key} must include finite signed 32-bit integer pulses for {axis}.")
     return tuple(blockers)
 
 
@@ -598,8 +731,8 @@ class OpenAICompatibleLLMPlanner:
     @staticmethod
     def _read_spec(spec_path: Path | None) -> str:
         if spec_path is None or not spec_path.exists():
-            return ""
-        return spec_path.read_text(encoding="utf-8")
+            return knowledge_markdown()
+        return knowledge_markdown() + "\n\n" + spec_path.read_text(encoding="utf-8")
 
     def plan(self, instruction: str, context: AgentContext) -> AgentPlan:
         try:
@@ -630,6 +763,7 @@ class OpenAICompatibleLLMPlanner:
                             "instruction": instruction,
                             "context": context.to_prompt_dict(),
                             "capability_brief_markdown": capability_brief,
+                            "capabilities": [capability.to_prompt_dict() for capability in capabilities],
                             "function_spec_template": self.function_spec,
                         },
                         ensure_ascii=False,
@@ -665,7 +799,8 @@ class OpenAICompatibleLLMPlanner:
         return (
             "You are the planning layer for a semi-auto probe station. "
             "Return one JSON object only. No markdown fences. "
-            "Write user-visible reply_markdown in English by default unless the user explicitly requests another language. "
+            "Reply in the user's language. For help/how-to/status/check questions return an answer with an empty steps array, never movement steps. "
+            "Distinguish documented features from currently executable actions. Use the provided current-version help. "
             "Use only high-level action_id values from the capability brief. "
             "Never invent raw serial commands, protocol frames, direct controller operations, or arbitrary file writes. "
             "Every hardware-changing or experiment-state-changing step must set requires_confirmation true. "
@@ -721,13 +856,20 @@ class OpenAICompatibleLLMPlanner:
             action_id = str(item.get("action_id", item.get("action", AGENT_ACTION_CLARIFY)))
             if action_id not in AGENT_ACTIONS:
                 action_id = AGENT_ACTION_CLARIFY
+            parameters = dict(item.get("parameters", {})) if isinstance(item.get("parameters"), dict) else {}
+            step_title = str(item.get("title", "Step"))
+            if action_id == AGENT_ACTION_OPEN_PAGE:
+                page = canonical_agent_page(parameters.get("page"))
+                if page is not None:
+                    parameters["page"] = page
+                    step_title = "Open " + page
             steps.append(
                 AgentWorkflowStep(
                     action_id=action_id,
-                    title=str(item.get("title", "Step")),
+                    title=step_title,
                     module=str(item.get("module", "Agent Panel")),
                     detail=str(item.get("detail", "")),
-                    parameters=dict(item.get("parameters", {})) if isinstance(item.get("parameters"), dict) else {},
+                    parameters=parameters,
                     requires_confirmation=bool(item.get("requires_confirmation", action_id not in {AGENT_ACTION_STATUS, AGENT_ACTION_CLARIFY})),
                     involves_motion=bool(item.get("involves_motion", False)),
                     involves_autofocus=bool(item.get("involves_autofocus", False)),
@@ -739,14 +881,14 @@ class OpenAICompatibleLLMPlanner:
                     recovery_suggestions=self._strings(item.get("recovery_suggestions", [])),
                 )
             )
-        if not steps:
+        if not steps and not str(payload.get("reply_markdown", "")).strip():
             steps.append(self._clarify_step("No detailed steps were returned by the LLM."))
         return AgentPlan(
             title=str(payload.get("title", "AI Agent plan")),
             understanding=str(payload.get("understanding", "")),
             reply_markdown=str(payload.get("reply_markdown", payload.get("understanding", ""))),
             steps=tuple(steps),
-            needs_clarification=bool(payload.get("needs_clarification", False)),
+            needs_clarification=bool(payload.get("needs_clarification", False)) or any(step.action_id == AGENT_ACTION_CLARIFY for step in steps),
             blockers=self._strings(payload.get("blockers", [])),
             recovery_suggestions=self._strings(payload.get("recovery_suggestions", [])),
             planner_source="llm",
@@ -768,6 +910,17 @@ class OpenAICompatibleLLMPlanner:
 class RuleBasedAgentPlanner:
     def plan(self, instruction: str, context: AgentContext) -> AgentPlan:
         current_instruction = self._current_request_text(instruction)
+        direct = self.local_request(current_instruction, context)
+        if direct is not None:
+            return direct
+        clauses = [part.strip(" ,，。") for part in re.split(r"\bthen\b|然后|接着|之后", current_instruction, flags=re.IGNORECASE) if part.strip(" ,，。")]
+        if len(clauses) > 1:
+            parts = [self.plan(clause, context) for clause in clauses]
+            if any(part.needs_clarification or not part.steps for part in parts):
+                return AgentPlan("Clarify sequence", current_instruction, "Please specify each step explicitly; no partial sequence will execute.", (), needs_clarification=True)
+            steps = [step for part in parts for step in part.steps]
+            title = self._title_for_steps(steps)
+            return self._plan(title, current_instruction, self._reply_for_steps(title, steps), steps, context)
         normalized = self._normalize(current_instruction)
         steps: list[AgentWorkflowStep] = []
         is_layout_overlay = self._is_layout_overlay(normalized)
@@ -801,6 +954,38 @@ class RuleBasedAgentPlanner:
         reply = self._reply_for_steps(title, steps)
         return self._plan(title, title, reply, steps, context)
 
+    def local_request(self, text: str, context: AgentContext) -> AgentPlan | None:
+        """Deterministic commands and help intent work without an API key."""
+        value = text.strip()
+        lower = value.lower()
+        command = re.sub(r"^(?:(?:请|帮我)|please\s+)+", "", lower).strip()
+        answer = None
+        if lower.startswith("/help") or re.search(r"如何|怎么|怎样|是什么|有什么|能做什么|哪些|为什么|帮助|介绍|说明|what (?:is|are|does|can)|how (?:do|to|can)|\bwhy\b|explain|\bhelp\b", lower):
+            topic = lower.removeprefix("/help").strip()
+            if not topic or topic == lower:
+                topic = next((key for key, words in {"workflow": ("workflow", "流程", "plot", "公式"), "mapping": ("mapping", "wire-bond", "扫描"), "instruments": ("仪器", "dp100", "b1500", "temt6000"), "imaging": ("focus", "拍照", "聚焦", "stitch", "gds")}.items() if any(word in lower for word in words)), "overview")
+            answer = help_markdown(topic)
+        elif command in {"/status", "status", "当前状态", "查看状态"}:
+            answer = capabilities_to_markdown(context)
+        elif command in {"/check", "检查当前测量流程", "检查当前流程", "check current workflow"}:
+            answer = "## 当前测量检查 / Measurement check\n" + json.dumps(context.measurement_summary, ensure_ascii=False, indent=2)
+            answer += "\n" + ("\n".join(context.measurement_blockers) if context.measurement_blockers else "Local checks passed; instrument connectivity is not verified.")
+        if answer is not None:
+            return AgentPlan("Help / Inspect", value, answer, (), planner_source="local-help")
+        if lower.startswith("/open "):
+            requested_page = value[6:].strip()
+            page = canonical_agent_page(requested_page) or requested_page
+            step = AgentWorkflowStep(AGENT_ACTION_OPEN_PAGE, "Open " + page, "Navigation", "Open existing application page.", {"page": page}, requires_confirmation=False)
+            return AgentPlan(step.title, value, step.detail, (step,))
+        if command in {"/run measurement", "运行当前测量流程", "运行当前流程", "run current measurement"}:
+            detail = json.dumps(context.measurement_summary, ensure_ascii=False, indent=2)
+            step = AgentWorkflowStep(AGENT_ACTION_RUN_MEASUREMENT, "Run current measurement", "AutoTest / Mapping", detail, {"fingerprint": context.measurement_fingerprint}, involves_motion=True, changes_experiment_state=True, risks=("Uses configured stage/probe and instrument outputs.",))
+            return AgentPlan(step.title, value, detail, (step,))
+        # Explicit units cannot silently become pulses; negation cannot become a move.
+        if re.search(r"不要|别执行|不执行|do not|don't|微米|毫米|(?:\d\s*|\b)(?:um|µm|μm|mm)\b", lower):
+            return AgentPlan("Clarify", value, "Please specify whether this is help or execution. Stage commands require explicit integer controller pulses; configure physical units in the existing UI.", (), needs_clarification=True)
+        return None
+
     @staticmethod
     def _normalize(text: str) -> str:
         return "".join(text.lower().split())
@@ -833,6 +1018,9 @@ class RuleBasedAgentPlanner:
             axes = self._axes_from_text(normalized, default=("X", "Y"))
             return self._stage_move_step("zero", axes, title=f"Move {'/'.join(axes)} stage to zero")
         parsed = self._parse_axis_values(original_text)
+        named_axes = {axis.upper() for axis in re.findall(r"\b([a-zA-Z])\s*[=:]", original_text)}
+        if named_axes - set(parsed):
+            return self._clarify_step()
         if not parsed:
             return None
         mode = "relative" if self._has_any(normalized, ("relative", "\u76f8\u5bf9", "delta")) or any(value < 0 for value in parsed.values()) else "absolute"
@@ -860,13 +1048,16 @@ class RuleBasedAgentPlanner:
         return tuple(axes or default)
 
     @staticmethod
-    def _parse_axis_values(text: str) -> dict[str, int]:
-        values: dict[str, int] = {}
-        for match in re.finditer(r"\b([xyzXYZ])\s*(?:=|to|:)?\s*([+-]?\d+(?:\.\d+)?)", text):
-            values[match.group(1).upper()] = int(round(float(match.group(2))))
+    def _parse_axis_values(text: str) -> dict[str, int | float]:
+        values: dict[str, int | float] = {}
+        for match in re.finditer(r"\b([xyzXYZ])\s*(?:=|to|:)?\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)", text):
+            value = float(match.group(2))
+            values[match.group(1).upper()] = int(value) if math.isfinite(value) and value.is_integer() else value
         return values
 
     def _is_autofocus(self, text: str) -> bool:
+        if self._is_focusmap(text):
+            return False
         return self._has_any(text, ("\u81ea\u52a8\u5bf9\u7126", "\u81ea\u52a8\u805a\u7126", "autofocus", "auto-focus", "focus"))
 
     def _is_single_capture(self, text: str) -> bool:
@@ -948,7 +1139,7 @@ class RuleBasedAgentPlanner:
             action_id=AGENT_ACTION_SINGLE_CAPTURE,
             title="Capture and save one frame",
             module="ImgStitch",
-            detail="Capture the current microscope frame and save it to the ImgStitch session outputs.",
+            detail="Capture the current microscope frame to a unique file without clearing or replacing the active ImgStitch session.",
             requires_confirmation=True,
             involves_capture=True,
             changes_experiment_state=True,
@@ -1056,7 +1247,10 @@ class AgentPlanner:
         self.llm_planner = llm_planner
 
     def plan(self, instruction: str, context: AgentContext) -> AgentPlan:
-        if not instruction.strip():
+        direct = self.rule_planner.local_request(self.rule_planner._current_request_text(instruction), context)
+        if direct is not None:
+            plan = direct
+        elif not instruction.strip():
             plan = self.rule_planner.plan(instruction, context)
         else:
             plan = self.llm_planner.plan(instruction, context) if self.llm_planner is not None else self.rule_planner.plan(instruction, context)

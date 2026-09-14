@@ -182,6 +182,74 @@ AutoTest can combine motion, imaging, contact handling, and instrument measureme
 
 VISA-backed measurement flows require the relevant instrument, driver stack, and resource names to be available on the acquisition PC. The app validates parameters locally and writes outputs under `autotest_session/`.
 
+### DP100 laser defaults
+
+The DP100 laser nodes and built-in light-waveform templates default to the installed **3–5 V, <30 mA, <5 mW laser module**: **3.0 V supply, 10 mA current limit, 3.3 V OVP and 25 mA OCP**. The three-drive-level template uses 3.0 V with 5/8/10 mA limits. These are electrical settings, not calibrated optical power or guaranteed distinct optical intensities. Previously saved custom workflows keep their explicit settings; newly created nodes/templates use the new defaults. Set the constant laser drive in **Config Measure Flow → DP100 Laser Output → Output → Voltage (V) / Current limit (A)**; enter `0.010` A for 10 mA. Waveforms finish with output off by default.
+
+### Wire-bond Test and the shared measurement workflow
+
+In **Config → ADMIN MODE**, unlock the existing admin controls and select **Enable Wire-bond Test in AutoTest**. The setting is saved in `probe_config.local.json`. Only an admin can change it, and changes are blocked during active tasks or motion. Operators can run the mode an admin has enabled. AutoTest automatically shows either Probe Test or Wire-bond Test; there are no mode tabs in AutoTest.
+
+Both modes use the same **Config Measure Flow** button, editor, node parameters, graph connections, conditions, light-source links, and workflow library. Switching modes preserves the workflow. Probe Test retains device coordinates and contact/approach settings. Wire-bond Test substitutes a rectangular stage scan and fixed-Z XY motion, executing the shared workflow at every settled position.
+
+1. Enable Wire-bond Test in Config and keep the probes in **Separate**. Chip and bonded wiring move with the stage. Alignment/autofocus can be performed before the scan.
+2. Jog to opposite corners and use **Record corner A/B**, or enter stage-coordinate bounds in µm.
+3. Set ΔX/ΔY, `serpentine` (alternating rows) or `raster` (+X each row), and move-settle time.
+4. Use **Config Measure Flow** to configure the instruments. **Electrical → 2450 Fixed-bias Current** applies a bias, waits and samples current, then closes its output when the node exits by default; Mapping can optionally hold that bias until scan exit. It is available in both modes. IV, HP6614C, B1500 and implemented laser nodes use their existing executors. WobbTest is rejected before a fixed-Z scan because it moves the probes. Unimplemented placeholder nodes are also rejected rather than reported as measurements.
+5. **Preview plan** displays coverage, path, point count and the workflow size. **Start mapping** moves XY, waits for settling, then runs the workflow. No workflow runs during a move or row return. Camera, GDS, LayoutMap and FocusMap are not prerequisites; a Photo node requires a camera frame.
+6. Choose a numeric workflow result in the heatmap selector, or display workflow completion. Click a cell to inspect metrics, sample readings and artifact paths. **Load mapping…** reloads completed or partial results without hardware.
+
+The grid starts at `(Xmin, Ymin)`, with X as the fast axis. Each axis uses `min + k × step` up to its maximum; an unaligned endpoint is not appended. The preview reports the unsampled remainder. Each axis is limited to 500 points, and steps that collapse to duplicate controller positions are rejected. Heatmap axes are **stage coordinates**, not registered chip/image coordinates. The scan captures the current Z and never commands Z motion.
+
+Sessions save `mapping.json` (workflow snapshot, geometry, calibration, fixed Z and final status), `samples.csv` (2450 samples with node/position associations), `mapping.csv` (per-point status and workflow metrics), `mapping.png`, and `mapping_artifacts.sqlite3`. Successful points store their complete node outputs and execution records as compressed, transactional SQLite artifacts, then remove the temporary `points/<point>/` tree; failed or interrupted points keep their loose directory for diagnosis. Artifact paths in `mapping.csv` remain stable and can be read from either old loose-file sessions or the compact database. Different nodes or biases are never averaged together. Pending cells are gray, interrupted cells amber, failed cells red, and completed cells without the selected scalar are green. Previous version-1 fixed-bias and version-2 loose-file mapping sessions remain readable. Existing Web file browsing and downloads include the compact artifact database.
+
+Bias lifetime follows the workflow: the fixed-bias current node closes its output on node exit unless Mapping bias holding is enabled; an IV node with `Output off after=false` can retain bias between nodes/positions. All outputs used and retained by Wire-bond Test are closed at scan exit. A DP100 used by the workflow is also shut down. **Stop mapping** cancels waits and exits after an outstanding move/read returns. Emergency stop also stops stage motion; the UI stays locked until cleanup completes. Acquired partial results are preserved, cleanup errors are displayed, and the stage remains at its last position. There is no automatic dark-current subtraction, refocusing during a scan, or resume of interrupted scans.
+
+Set **Move settle (s; 0 = fast)** to `0` for the fast reached-position path. After the controller reports that each move has finished, Mapping performs one XYZ read to verify target X/Y and fixed Z, rather than waiting for three identical XYZ reads. Samples and the point result are flushed together at every point boundary. A controlled Stop or point error still flushes samples acquired at that point. This remains settled point sampling rather than continuous-motion synchronized acquisition. For the quickest TEMT6000 workflow use `NPLC=0.1`, `Samples=1`, and `Bias settle=0`; increase NPLC or samples when lower noise matters more than scan time. Existing saved workflows keep their explicit values.
+
+Hardware acceptance: use a small 3×3 area with experiment-appropriate workflow limits; verify scan direction, fixed Z, node order, Stop/output OFF, and correspondence between manual readings and map cells. Automated tests use simulated instruments and do not validate physical illumination or bonding clearance.
+
+### TEMT6000 spatial-response template
+
+Open **Config Measure Flow → Template → TEMT6000 Mapping - Fixed Bias + Constant Laser**. This connects a constant DP100 laser-output node to a 2450 fixed-bias current node:
+
+| Setting | Template default |
+| --- | --- |
+| Detector connection | Keithley 2450 **front** SOURCE HI → collector, SOURCE LO → emitter |
+| Detector bias / compliance | **+5.0 V / 1 mA**; VISA `GPIB0::18::INSTR` |
+| Current acquisition | Auto range, NPLC 0.1, 1 sample per position (fast mapping default) |
+| Detector bias settling | No additional delay (fast mapping default) |
+| Laser electrical drive | **3.0 V**, 10 mA limit, OVP 3.3 V, OCP 25 mA; preset 1 |
+| Laser settling | 2 s after first enabling output |
+| Optical conversion | TEMT6000, **650 nm**, power correction ×1, measured dark offset 0 A |
+
+The detector default uses the 5 V characterization condition in the [Vishay TEMT6000X01 datasheet](https://www.vishay.com/docs/81579/temt6000.pdf). Wiring assumes direct access to the phototransistor collector/emitter. A breakout board with an emitter/load resistor does not necessarily hold the transistor itself at the applied supply voltage; check its circuit before using this connection. The 1 mA compliance is a starting limit, not a promised maximum illuminated current.
+
+In Mapping, **Set once per mapping scan=true** applies DP100 settings only at the first visited laser node. **Hold bias during mapping=true** establishes the 2450 bias at the first measurement node, then reuses the session at subsequent positions. Neither output is cycled between points or during row returns; only settled positions are sampled. Completion, Stop, or an error closes both outputs. A conflicting node using the same held 2450 resource, or another DP100 node alongside a set-once laser node, is rejected before scanning. In Probe Test these Mapping-only options leave the usual per-point execution unchanged.
+
+The template enables **Check measured bias**: a voltage deviation exceeding the larger of 5% and 50 mV stops the scan and retains partial data, with a message to check compliance and wiring. Mapping defaults to two plots: signed total current and **estimated irradiance** (mW/cm²). Set the wavelength in the detector node (default 650 nm). Both use the sequential Inferno color map, equal XY scales and independent automatic color ranges. Standard deviation, raw samples, conversion parameters and derived irradiance are saved. A power correction factor and measured dark-current offset support user calibration; defaults are ×1 and 0 A. The irradiance estimate uses the datasheet spectral response normalized to its illuminant-A characterization, with typical-device and beam-geometry limitations. See [the conversion model and calibration notes](docs/temt6000-irradiance.md). The DP100 settings hold electrical drive, and do not measure or regulate optical output power.
+
+### Virtual-mask illumination mapping
+
+In Wire-bond Test, open **Config Measure Flow → Template → Virtual Mask Mapping - NUS Logo**. The `Virtual Mask Illumination` Canvas node uses the packaged grayscale NUS mask by default, or accepts PNG/JPEG/BMP/TIFF/PGM images. Corner A/B, ΔX, ΔY and Path on the main Mapping page define every stage scan point. At each point the node inverse-maps XY (or LayoutMap UV) into the image, samples its grayscale, and maps that value linearly between the configured black-pixel and white-pixel powers; points outside the positioned image use black. Before stage scanning, the workflow sweeps DP100 current from 1 to 25 mA, reads the actual laser voltage, builds a measured electrical power-to-voltage curve from P=VI, and reuses that curve for every mask point. Targets below the calibrated minimum are dark; targets above the calibrated maximum are rejected. These are calibrated electrical drive powers, not measured optical powers. Raw hexadecimal traffic printed by the vendor DLL is suppressed; normal application logs use compact English DP100 summaries.
+
+Use **Configure mask, mapping & power…** only to position the mask and set its power endpoints: first switch explicitly between **Stage XY** and **GDS UV**, then click a pixel in the image and enter the correspondingly labelled X/Y or U/V coordinate before adding/updating the row. Enable **Invert grayscale intensity (black ↔ white)** to use `1 - grayscale`; the image preview updates immediately and the setting is saved with the workflow. The table headings change with the selected mode. At least three non-collinear points are required, and **Reset corners** provides a four-corner 100 × 50 default. UV requires a fitted LayoutMap; XY directly uses logical stage micrometers. Preview and result plots are cell heatmaps in actual stage coordinates. The default workflow displays only the **Measured Current (A)** heatmap. Each saved point includes image pixel, normalized gray level, target power, stage XY and optional GDS UV. The virtual-mask node must have exclusive DP100 control and cannot share a workflow with another DP100 laser-output/waveform node.
+
+### TEMT6000 calibrated pulse-response mapping template
+
+Open **Config Measure Flow -> Template -> TEMT6000 Mapping - Calibrated Pulse Response**. The Canvas now presents four explicit modules:
+
+1. **DP100 Laser I-V Calibration** sweeps 1-25 mA in 1 mA steps at a 3.3 V ceiling and exposes the measured current-to-voltage table through a green Calibration port.
+2. **Power-gradient Pulse Response** receives that calibration table, measures fixed-bias TEMT6000 I-t while laser current rises 1->25 mA and falls 24->1 mA, and exposes response amplitude and intensity-sensitivity feature ports.
+3. **Pulse-width Gradient Response** also receives the calibration table and runs after the power test through the control-flow connection. It measures 15 mA pulses from 100 to 500 ms in 100 ms steps and exposes response amplitude and width-sensitivity features.
+4. **Mapping Heatmap** accepts two connected numeric features. Its user-visible labels become the default selectable spatial maps.
+
+The calibration readback no longer treats the first DP100 callback as final. After each output command it waits for the configured settle time and retries voltage/current callbacks for up to **Readback timeout per level** (default 2 s, retry every 100 ms). This filters stale OFF snapshots such as 0 V/0 mA. A persistent zero readback still stops the scan and reports that the DP100 output/load connection or DLL callback should be checked. Calibration runs once per Mapping session and saves one root-level CSV/JSON table.
+
+At each spatial point the power-gradient and pulse-width tests run serially while reusing the same held Keithley 2450 front-terminal +5 V bias. Each test starts detector acquisition before releasing its laser waveform, saves a separate I-t trace, analyzes pulse-relative baselines, and publishes maximum/mean pulse response plus the phase-specific sensitivity. Every pulse has a full 1 s dark gap by default. Clicking a completed heatmap cell opens both I-t curves and overlays their corresponding laser target-current programs.
+
+The DP100 pulse edges remain software-timed and actual 2450 sampling cadence is limited by VISA/read latency. Use a hardware pulse/trigger source where deterministic timing is required. The template is bounded by 3.3 V OVP and 28 mA OCP for the specified <30 mA laser module.
+
 ## Getting Started
 
 ### Requirements
@@ -192,6 +260,7 @@ VISA-backed measurement flows require the relevant instrument, driver stack, and
 - A Windows-visible USB microscope camera
 - A probe stage wired so the first three controller axes map to application axes `X`, `Y`, and `Z`
 - Optional VISA instruments for automated electrical measurements: Keithley 2450 and/or Keysight B1500
+- Optional ATK-DP100 supply for laser LED output; the vendor x64 DLL is loaded only by the Windows measurement process
 
 #### Software
 
@@ -199,6 +268,7 @@ VISA-backed measurement flows require the relevant instrument, driver stack, and
 - Recommended dependency manager: `uv`
 - Python packages are declared in `pyproject.toml` and mirrored in `requirements.txt` for pip-based installs.
 - GDS layout loading requires `gdstk`. If it is missing, the application still starts, but the `LayoutBond` page will ask you to install it.
+- MII USB microscope cameras use the MiiCam SDK. The app discovers `MII/ImageView/x64/miicam.dll` (or `x86` for a 32-bit process) under the Windows Program Files directories, as well as downloaded `mmgr.*` SDKs. Set `SEMI_AUTO_PROBE_MIICAM_SDK` for a custom SDK location. Select `miicam:0` to require the microscope camera; `auto` can fall back to a built-in webcam if the microscope SDK is unavailable.
 - Web monitoring requires the declared `fastapi` and `uvicorn[standard]` dependencies.
 - VISA measurement workflows require the declared `pyvisa` / `qcodes` packages plus a working local VISA backend.
 
@@ -228,6 +298,26 @@ Run the GUI:
 ```powershell
 uv run python -m semi_auto_probe
 ```
+
+### F1 / CHM help
+
+Press `F1` in the desktop app to open the help topic for the current page or dialog. Build the Windows manual with `.\docs\help\build-help.ps1`; the packaged artifact is `src\semi_auto_probe\assets\SemiAutoProbeHelp.chm`. See the [CHM source and build guide](docs/help/README.md) for validation, compiler setup, and maintenance details.
+
+Run the standalone measurement bench without camera, stage, FocusMap, or LayoutMap startup:
+
+```powershell
+uv run semi-auto-probe-measure
+```
+
+The standalone measurement bench starts in simulation mode; clear `Simulation` to connect a real DP100 without starting the camera, stage, FocusMap, or LayoutMap subsystems. In the main AutoTest workflow, a linked DP100 waveform connects to the device automatically when the light-driven test runs. For real ATK-DP100 control on Windows, install the optional adapter and place the vendor x64 DLL in `refs/`:
+
+```powershell
+uv sync --extra dp100
+```
+
+The DP100 DLL exposes output on/off and setpoint commands, but no hardware arbitrary-waveform trigger. DP100 waveform nodes therefore execute editable time/voltage/current points with software timing and are intended for millisecond-scale illumination; use a dedicated pulse driver for precision edges or deterministic synchronization.
+
+The workflow editor uses typed ports and links: cyan for control flow, purple for numbers, orange for Boolean values, and yellow for light waveforms. The waveform editor runs as a separate PySide6/pyqtgraph process so direct point dragging, pan/zoom, snapping, undo/redo, and editable voltage/current curves do not compete with Tk's event loop.
 
 Restore the latest FocusMap plane and LayoutMap calibration on startup:
 
@@ -346,11 +436,21 @@ See [`docs/web-deploy.md`](docs/web-deploy.md) and [`src/semi_auto_probe/web/REA
 
 ### AI Agent
 
-- Collects live serial, camera, position, LayoutMap, FocusMap, ImgStitch, and configuration context
-- Plans only supported high-level actions; it does not emit raw serial commands
-- Falls back to a rule-based planner when no LLM API key is configured
-- Supports conversation-only, authorized-step, and automatic-step permission modes
-- Re-checks local blockers before executing each step
+- Offline help: `/help`, `/help workflow`, `/help mapping`, `/status`; how-to questions do not create hardware actions.
+- Current Workflow v2 support: `/check` inspects the configured graph/scan locally; `/run measurement` reviews and runs the current Probe or Wire-bond workflow with a configuration fingerprint.
+- Existing stage, GDS, AutoFocus, FocusMap and image workflows run through local guards. Completion events release the next step; failure or Stop prevents later steps from running.
+- Keeps conversation-only, authorized-step (default) and automatic-step modes. Right-side tabs provide Steps, Help, 12 Templates and the original task Preview.
+- Rule planning and bundled help work without an API key; configured compatible providers can plan other supported natural-language requests.
+
+Try the isolated simulator without connecting devices:
+
+```powershell
+.venv/Scripts/python.exe -m semi_auto_probe.agent_demo --preview --ready
+.venv/Scripts/python.exe -m semi_auto_probe.agent_demo --all --ready
+```
+
+`--ready` is fictitious state, not hardware readiness. See [copyable test templates](docs/agent-test-templates.md),
+[execution and maintenance interfaces](docs/agent-execution-spec.md), and [provider contract](docs/agent-function-spec.md).
 
 ### Web dashboard
 
@@ -499,3 +599,9 @@ For GDS viewer tests or manual GDS loading, the interpreter also needs `gdstk`.
 - Confirm the coordinate origin before using `Set New Zero`
 - Keep the emergency-stop path accessible during any automated motion
 - Use conservative `Z` ranges until sample clearance is known
+
+### Measurement Workflow v2
+
+Desktop AutoTest and Mapping now share typed data connections, custom scalar/curve-feature formulas, and a configurable 1×1 / 1×2 / 2×2 / 2×3 Plot Panel. See [workflow setup, file format and performance validation](docs/measurement-workflow-v2.md).
+
+The template library is organized as a tree by FET, PD, MR, Cap and general electrical tests. Device recipes are shared by probe and bonded-position scans; workflow files use version 2 only. See [template selection, editable thresholds, and feature definitions](docs/device-workflow-templates.md).

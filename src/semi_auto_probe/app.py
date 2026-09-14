@@ -9,6 +9,7 @@ import math
 import os
 import re
 import shutil
+import statistics
 import threading
 import time
 import tkinter as tk
@@ -42,7 +43,9 @@ from .agent import (
     build_agent_planner_from_config,
     stage_move_axes,
     stage_move_parameter_blockers,
+    context_blockers_for_action,
 )
+from .agent_runtime import DesktopAgentRuntime, inspect_measurement
 from .auto_test import (
     AutoTestFlowStep,
     AutoTestPanel,
@@ -52,6 +55,17 @@ from .auto_test import (
     wobbtest_xy_offsets_um,
     wobbtest_z_offsets_um,
 )
+from .dp100 import DEFAULT_LASER_PARAMS, DP100Driver, DP100Setpoint
+from .mapping import MappingPoint, MappingSettings, MappingSession, generate_mapping_plan, run_mapping, collect_workflow_data
+from .mapping_panel import MappingPanel
+from .flow_graph import evaluate_condition, graph_start_node, resolve_data_input, step_node_id, is_graph_workflow
+from .help_system import open_help
+from .ui.device_status_panel import DeviceStatusWindow
+from .workflow_ports import DATA_ONLY_TYPES, CURVE_NODES
+from .workflow_runtime import NodeCapture, json_value
+from .workflow_formula import InvalidValue
+import uuid
+from .waveform import calibrated_power_setpoint, calibrated_response_program, run_dp100_waveform, serialize_waveform_points
 from .b1500 import B1500_TEST_OUTPUT, B1500_TEST_TRANSFER, B1500SweepConfig, KeysightB1500Runner, b1500_config_from_params
 from .camera import CameraSettings, UsbCamera, camera_source_choices, normalize_camera_source
 from .camera_stage_transform import (
@@ -113,6 +127,7 @@ from .focusmap_3d import create_focusmap_3d_view
 from .gds_stage_mapper import GDSStageMapperPanel, LAYOUTBOND_AUTOSAVE_FILENAME, stage_move_plan_from_um, stage_xyz_move_plan_from_um
 from .img_matrix import ImgMatrixPanel, ImgMatrixPoint, ImgMatrixSettings, generate_imgmatrix_points, session_manifest_path
 from .img_stitch import (
+    IncrementalStitchPreview,
     StitchEdgeQuality,
     StitchSession,
     StitchSettings,
@@ -157,6 +172,7 @@ from .protocol import COMM_TEST_COMMAND, FUNCTION_READ_POSITION, RESPONSE_HEAD, 
 from .protocol import payload_contains_clear_position_command, payload_contains_go_home_command
 from .serial_client import ControllerSerialClient, CommunicationTestResult, list_serial_ports
 from .ssh_tunnel import RemoteBridgeStatus, SshSerialTunnel, probe_remote_bridge_status
+from .display_calibration import CalibrationGate, CalibrationPublisher, SshCalibrationHTTP, DisplayFocusReference, coordinate_basis
 from .ui.calibration_dialog import PixelCalibrationDialog
 from .ui.fov_rotation_dialog import FOVRotationCalibrationDialog
 from .ui.agent_panel import AgentPanel
@@ -181,6 +197,15 @@ REALTIME_POSITION_UI_INTERVAL_SECONDS = 0.05
 IV_PLOT_MIN_DRAW_INTERVAL_SECONDS = 0.12
 AUTOFOCUS_POST_SETTLE_DISCARD_FRAMES = 2
 FOCUSMAP_AUTOSAVE_FILENAME = "last_focusmap_mapping.json"
+
+
+def is_high_frequency_dp100_status(message: str) -> bool:
+    """Normal per-point light updates belong in the GUI, not the INFO console."""
+    text = str(message).strip()
+    return text.startswith((
+        "Virtual mask:", "DP100 ON:", "DP100 OFF:",
+        "DP100 constant drive retained",
+    ))
 ADMIN_TOKEN_ENV = "SEMI_AUTO_PROBE_ADMIN_TOKEN"
 WEB_ACCESS_TOKEN_ENV = "SEMI_AUTO_PROBE_WEB_TOKEN"
 
@@ -1426,6 +1451,11 @@ class ProbeApp(tk.Tk):
         self.remote_bridge_check_generation = 0
         self.remote_bridge_status: RemoteBridgeStatus | None = None
         self.remote_bridge_status_checked_at = 0.0
+        self._startup_connection_attempted = False
+        self._startup_connection_pending = False
+        self._startup_remote_generation: int | None = None
+        self._startup_connection_errors: list[str] = []
+        self._startup_local_candidates: list[str] = []
         self.camera_index_var = tk.StringVar(value=normalize_camera_source(os.environ.get("SEMI_AUTO_PROBE_CAMERA_SOURCE") or self.probe_config.camera_source))
         self.status_var = tk.StringVar(value="Ready")
         self.rx_var = tk.StringVar(value="-")
@@ -1660,7 +1690,7 @@ class ProbeApp(tk.Tk):
         self.after(300, self.connect_and_test_serial)
         self.after(RESULT_POLL_INTERVAL_MS, self._poll_result_queue)
         if restore_last:
-            self.after_idle(self.restore_last_focusmap_layoutmap)
+            self.after_idle(self._restore_startup_context_without_display_calibration)
 
     def _set_window_icon(self) -> None:
         icon_path = Path(__file__).parent / "assets" / "logo-system-diagram.png"
@@ -1773,6 +1803,20 @@ class ProbeApp(tk.Tk):
             bordercolor=[("focus", self.colors["border_focus"]), ("invalid", "#fb7185"), ("!disabled", self.colors["border"])],
             arrowcolor=[("active", self.colors["accent"]), ("focus", self.colors["accent"]), ("!disabled", self.colors["muted"])],
         )
+        # Tk controls have no per-widget alpha: preblend a light red wash over
+        # the input background to give a translucent highlight without dimming text.
+        tint = "#fb7185"
+        base = self.colors["input"]
+        limit_fill = "#" + "".join(
+            f"{round(int(base[i:i+2], 16) * 0.82 + int(tint[i:i+2], 16) * 0.18):02x}"
+            for i in (1, 3, 5)
+        )
+        style.configure("CorrectionLimit.TSpinbox", fieldbackground=limit_fill,
+                        background=limit_fill, bordercolor="#a96470")
+        style.map("CorrectionLimit.TSpinbox",
+                  fieldbackground=[("!disabled", limit_fill), ("disabled", limit_fill)],
+                  background=[("!disabled", limit_fill), ("disabled", limit_fill)],
+                  bordercolor=[("!disabled", "#a96470"), ("disabled", "#a96470")])
         style.configure("Error.TSpinbox", fieldbackground="#3f1018", background="#4c0519", foreground="#fecdd3", bordercolor="#be123c", lightcolor="#be123c", darkcolor="#be123c", arrowcolor="#fecdd3", relief="flat", borderwidth=1, padding=(10, 7), arrowsize=14)
         style.configure("Treeview", background=self.colors["input"], fieldbackground=self.colors["input"], foreground=self.colors["text"], bordercolor=self.colors["border"], lightcolor=self.colors["border"], darkcolor=self.colors["border"], rowheight=28, relief="flat", borderwidth=1)
         style.configure("Treeview.Heading", background=self.colors["surface_3"], foreground=self.colors["text"], relief="flat", borderwidth=0, padding=(8, 7), font=("Segoe UI Semibold", 9))
@@ -2298,9 +2342,20 @@ class ProbeApp(tk.Tk):
 
     def _build_autotest_page(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+        self.mapping_running = False
+        self.wire_bond_enabled_var = tk.BooleanVar(value=self.probe_config.wire_bond_enabled)
+        workflow_bar = ttk.Frame(parent, padding=8)
+        workflow_bar.grid(row=0, column=0, sticky="ew")
+        workflow_bar.columnconfigure(1, weight=1)
+        self.autotest_mode_label = ttk.Label(workflow_bar)
+        self.autotest_mode_label.grid(row=0, column=0, padx=(0, 15))
+        self.device_test_page = device_page = ttk.Frame(parent)
+        device_page.grid(row=1, column=0, sticky="nsew")
+        device_page.columnconfigure(0, weight=1)
+        device_page.rowconfigure(0, weight=1)
         self.autotest_panel = AutoTestPanel(
-            parent,
+            device_page,
             self.colors,
             get_stage_position_um=self._gds_mapper_current_stage_um,
             get_mapper=self._imgmatrix_mapper,
@@ -2315,8 +2370,81 @@ class ProbeApp(tk.Tk):
             set_status=self.status_var.set,
             on_overlay_changed=self._set_layoutbond_matrix_overlay,
             on_probe_assist_changed=self._on_autotest_probe_assist_changed,
+            shared_measurement=True,
+            open_measurement_flow=self._open_shared_measurement_flow,
         )
+        self.mapping_panel = MappingPanel(
+            parent, get_scales=self._mapping_scales,
+            record_corner=self._record_mapping_corner, start_run=self.start_autotest,
+            stop_run=self.stop_autotest,
+            get_workflow=self.autotest_panel.measurement_flow,
+            get_mapper=self._imgmatrix_mapper,
+            get_system_status=self._mapping_system_status,
+            open_measurement_flow=self._open_shared_measurement_flow,
+            measurement_var=self.autotest_panel.measurement_var,
+            move_to_xy=lambda x, y: self.move_gds_mapper_stage_target(x, y, None),
+            colors=self.colors,
+        )
+        self.mapping_panel.grid(row=1, column=0, sticky="nsew")
+        self.workflow_buttons = (self.autotest_panel.measurement_button, self.mapping_panel.workflow_button)
+        self._sync_autotest_mode()
         self._sync_autotest_from_layoutbond()
+
+    def _mapping_system_status(self) -> dict:
+        coordinates = {}
+        if self.serial_client is not None:
+            xyz = self._gds_mapper_current_stage_um()
+            coordinates.update(zip(("X", "Y", "Z"), xyz))
+            mapper = self._imgmatrix_mapper()
+            if mapper is not None:
+                coordinates.update(zip(("U", "V"), mapper.stage_to_gds(*xyz[:2])))
+        return {
+            "stage": self.serial_client is not None,
+            "motion": "Busy" if self.motion_busy else "Idle",
+            "focusmap": self._autotest_focusmap_ready(),
+            "layoutmap": self._autotest_layoutmap_ready(),
+            "coordinates": coordinates,
+            "microscope": self.panel_microscope_preview("AutoTest"),
+        }
+
+    def _open_shared_measurement_flow(self) -> None:
+        if self.autotest_running or self.__dict__.get("_mapping_corner_busy", False):
+            self.status_var.set("Measurement workflow is locked while AutoTest is running.")
+            return
+        self.autotest_panel._open_measurement_dialog()
+
+    def _sync_autotest_mode(self) -> None:
+        enabled = self.probe_config.wire_bond_enabled
+        self.wire_bond_enabled_var.set(enabled)
+        self.autotest_mode_label.configure(text="Wire-bond Test" if enabled else "Probe Test")
+        if enabled:
+            self.device_test_page.grid_remove()
+            self.mapping_panel.grid()
+            self.workflow_button = self.mapping_panel.workflow_button
+            self.mapping_panel.refresh_system_status()
+        else:
+            self.mapping_panel.grid_remove()
+            self.device_test_page.grid()
+            self.workflow_button = self.autotest_panel.measurement_button
+
+    def _change_wire_bond_mode(self) -> None:
+        requested = self.wire_bond_enabled_var.get()
+        self.wire_bond_enabled_var.set(self.probe_config.wire_bond_enabled)
+        if not self._require_admin_mode("Change Wire-bond mode"):
+            return
+        if self.autotest_running or self.motion_busy or self.keyboard_motion_busy or self.position_read_pending:
+            self.status_var.set("Wait for the active task/motion to finish before changing AutoTest mode.")
+            return
+        try:
+            updated = replace(self.probe_config, wire_bond_enabled=requested)
+            save_probe_config(updated, self.config_path)
+        except Exception as exc:
+            self.status_var.set(f"Could not save AutoTest mode: {exc}")
+            return
+        self.probe_config = updated
+        self._sync_autotest_mode()
+        self.config_status_var.set(f"Saved {self.config_path.name}")
+        self.status_var.set(f"AutoTest mode: {'Wire-bond Test' if requested else 'Probe Test'}. Measurement workflow retained.")
 
     def _build_edge_trace_page(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -2349,6 +2477,14 @@ class ProbeApp(tk.Tk):
 
     def _autotest_layoutmap_ready(self) -> bool:
         return self.gds_stage_mapper_panel is not None and self.gds_stage_mapper_panel.mapper is not None
+
+    def _restore_startup_context_without_display_calibration(self) -> None:
+        self.restore_last_focusmap_layoutmap()
+        panel = self.__dict__.get("gds_stage_mapper_panel")
+        # Restoring yesterday's files is not a new host calibration. Keep them
+        # available in the desktop, but start the slave display uncalibrated.
+        self._display_startup_mapper = panel.mapper if panel is not None else None
+        self._display_startup_plane = get_sample_plane_model()
 
     def restore_last_focusmap_layoutmap(self) -> None:
         restored: list[str] = []
@@ -2434,14 +2570,16 @@ class ProbeApp(tk.Tk):
         )
 
     def _build_agent_page(self, parent: ttk.Frame) -> None:
+        self.agent_runtime = DesktopAgentRuntime(self)
         self.agent_panel = AgentPanel(
             parent,
             self.colors,
             get_context=self.agent_context,
+            get_live_context=lambda: self.agent_context(inspect_workflow=False),
             get_microscope_preview=lambda: self.panel_microscope_preview("AI Agent"),
             draw_autofocus_plot=self.draw_agent_autofocus_plot,
-            plan_instruction=self.plan_agent_instruction,
-            execute_plan=self.execute_agent_plan,
+            plan_instruction=lambda instruction, context: self.agent_planner.plan(instruction, context),
+            execute_plan=self.agent_runtime.execute,
             cancel_plan=self.cancel_agent_plan,
             stop_task=self.stop_agent_task,
         )
@@ -2449,7 +2587,7 @@ class ProbeApp(tk.Tk):
     def draw_agent_autofocus_plot(self, canvas: tk.Canvas) -> None:
         self._draw_af_z_score_plot(canvas, compact=True)
 
-    def agent_context(self) -> AgentContext:
+    def agent_context(self, *, inspect_workflow: bool = True) -> AgentContext:
         gds_target_stage_um: tuple[float, float] | None = None
         gds_selected_uv: tuple[float, float] | None = None
         current_mapped_gds_uv: tuple[float, float] | None = None
@@ -2475,7 +2613,19 @@ class ProbeApp(tk.Tk):
         with self.camera_lock:
             agent_frame_available = self.latest_stitch_frame is not None
         focusmap_model = get_sample_plane_model()
+        if inspect_workflow:
+            self._agent_measurement_snapshot = inspect_measurement(self)[:4]
+        mode, measurement_summary, measurement_blockers, fingerprint = self.__dict__.get(
+            "_agent_measurement_snapshot", ("wire-bond" if self.probe_config.wire_bond_enabled else "probe", {}, ("Use /check to inspect the current measurement.",), ""))
         return AgentContext(
+            autotest_running=self.__dict__.get("autotest_running", False),
+            mapping_running=self.__dict__.get("mapping_running", False),
+            other_busy=any(self.__dict__.get(flag, False) for flag in ("imgmatrix_running", "edge_trace_running", "_mapping_corner_busy")),
+            probe_contact=bool(self.__dict__.get("probe_down_var") and self.probe_down_var.get()),
+            measurement_mode=mode,
+            measurement_summary=measurement_summary,
+            measurement_blockers=measurement_blockers,
+            measurement_fingerprint=fingerprint,
             positions=dict(self.current_position_values),
             serial_connected=bool(self.serial_client and self.serial_client.is_open),
             motion_busy=self.motion_busy,
@@ -2588,6 +2738,9 @@ class ProbeApp(tk.Tk):
         return "Pending Agent plan cancelled."
 
     def stop_agent_task(self) -> str:
+        runtime = self.__dict__.get("agent_runtime")
+        if runtime is not None:
+            runtime.request_stop()
         stopped: list[str] = []
         if self.imgstitch_running:
             self.stop_imgstitch()
@@ -2604,6 +2757,9 @@ class ProbeApp(tk.Tk):
         if self.edge_trace_running:
             self.stop_edge_trace()
             stopped.append("EdgeTrace")
+        if runtime is not None and runtime.active is not None and runtime.active.action_id in {AGENT_ACTION_STAGE_MOVE, AGENT_ACTION_MOVE_GDS}:
+            self.emergency_stop()
+            stopped.append("Stage")
         if stopped:
             message = f"Agent stop requested for {', '.join(stopped)}."
         else:
@@ -2613,7 +2769,7 @@ class ProbeApp(tk.Tk):
 
     def execute_agent_plan(self, plan: AgentPlan) -> str:
         step_index = plan.next_pending_step_index()
-        if step_index is None:
+        if not plan.executable or step_index is None:
             message = "Agent plan has no pending executable step."
             self.status_var.set(message)
             return message
@@ -2667,7 +2823,9 @@ class ProbeApp(tk.Tk):
         try:
             import cv2
 
-            self._prepare_imgstitch_session_dir()
+            # A one-off Agent capture must never reset an active or completed
+            # ImgStitch session; it only needs a writable output directory.
+            self.imgstitch_session_dir.mkdir(parents=True, exist_ok=True)
             try:
                 frame = self._capture_stitch_frame(stop_event=threading.Event())
             except RuntimeError:
@@ -2676,21 +2834,24 @@ class ProbeApp(tk.Tk):
                 if frame is None:
                     raise
 
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            timestamp = f"{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns() % 1_000_000_000:09d}"
             output_path = Path.cwd() / "last_imgstitch.png"
-            session_last_path = self.imgstitch_session_dir / "last_imgstitch.png"
-            stack_path = self.imgstitch_session_dir / "stack_result.png"
             capture_path = self.imgstitch_session_dir / f"agent_single_frame_{timestamp}.png"
-            for path in (output_path, session_last_path, stack_path, capture_path):
-                cv2.imwrite(str(path), frame)
+            suffix = 1
+            while capture_path.exists():
+                capture_path = self.imgstitch_session_dir / f"agent_single_frame_{timestamp}_{suffix:02d}.png"
+                suffix += 1
+            for path in (output_path, capture_path):
+                if not cv2.imwrite(str(path), frame):
+                    raise OSError(f"Could not save image: {path}")
             self.result_queue.put(("imgstitch_preview", frame))
-            self.result_queue.put(("imgstitch_done", output_path))
+            self.result_queue.put(("imgstitch_done", capture_path))
         except Exception as exc:
             message = f"Agent single-frame capture failed: {exc}"
             self.status_var.set(message)
             self._set_agent_status(message)
             return message
-        message = f"Agent captured one frame: {output_path}"
+        message = f"Agent captured one frame: {capture_path}"
         self.status_var.set(message)
         self._set_agent_status(message)
         return message
@@ -2753,7 +2914,7 @@ class ProbeApp(tk.Tk):
 
     def _agent_execution_blockers(self, action: str) -> list[str]:
         context = self.agent_context()
-        blockers: list[str] = []
+        blockers: list[str] = list(context_blockers_for_action(action, context))
         motion_workflow_running = context.motion_busy or context.keyboard_motion_busy or context.position_read_pending
         other_workflow_running = context.autofocus_running or context.focusmap_running or context.imgstitch_running
         if action in {AGENT_ACTION_MOVE_GDS, AGENT_ACTION_STAGE_MOVE, AGENT_ACTION_AUTOFOCUS, AGENT_ACTION_IMAGE_CAPTURE, AGENT_ACTION_FOCUSMAP}:
@@ -3236,7 +3397,7 @@ class ProbeApp(tk.Tk):
         except Exception as exc:
             self.result_queue.put(("motor_error", "GDS_MAPPER", exc))
         finally:
-            self.result_queue.put(("motor_done",))
+            self.result_queue.put(("motor_done", "gds_mapper"))
 
     def _build_position_panel(self, parent: ttk.Frame) -> None:
         panel = ttk.Frame(parent, style="Panel.TFrame")
@@ -3991,6 +4152,7 @@ class ProbeApp(tk.Tk):
         self.imgstitch_mode_widgets["XY Stitch"].append(recompose_label)
         row += 1
         _ = add_spinbox(row, "Max correction (um)", self.imgstitch_max_correction_um_var, "XY Stitch", self.imgstitch_mode_widgets, column=0, from_value=0, increment=0.5, kind="float")
+        self.imgstitch_max_correction_spinbox = self.imgstitch_mode_widgets["XY Stitch"][-1]
         row = add_spinbox(row, "Reg weight (0-1)", self.imgstitch_registration_weight_var, "XY Stitch", self.imgstitch_mode_widgets, column=1, from_value=0, to_value=1, increment=0.05, kind="float")
         add_toggle_row(row, "White balance correction", self.imgstitch_white_balance_var, mode="XY Stitch", registry=self.imgstitch_mode_widgets)
         row += 1
@@ -4096,6 +4258,9 @@ class ProbeApp(tk.Tk):
 
         system_panel, system_canvas = _build_config_column(2, (8, 0))
         system_panel.columnconfigure((1, 2), weight=1, uniform="af_thresholds")
+
+        ttk.Button(system_panel, text="Device connections  ↗", command=self._show_device_status,
+                   style="Ghost.TButton").grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
 
         ttk.Label(optical_panel, text="OPTICAL CALIBRATION", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Label(optical_panel, text="Objective", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(16, 4))
@@ -4353,7 +4518,7 @@ class ProbeApp(tk.Tk):
         ttk.Button(motion_panel, text="Apply Mapping", style="Accent.TButton", command=self.apply_config).grid(row=12, column=0, columnspan=2, sticky="ew", pady=(18, 0))
 
         autofocus_panel = ttk.Frame(system_panel, style="Panel.TFrame")
-        autofocus_panel.grid(row=0, column=0, columnspan=3, sticky="ew")
+        autofocus_panel.grid(row=1, column=0, columnspan=3, sticky="ew")
         autofocus_panel.columnconfigure((1, 2), weight=1, uniform="af_thresholds")
         ttk.Label(autofocus_panel, text="AUTOFOCUS CONFIG", style="Section.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
         ttk.Label(autofocus_panel, text="Settle after Z move (ms)", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
@@ -4383,7 +4548,7 @@ class ProbeApp(tk.Tk):
                 self._numeric_entry(autofocus_panel, variable, kind="float", minimum=0, maximum=1_000_000_000).grid(row=row_index, column=column, sticky="ew", padx=(8, 0), pady=2, ipady=5)
 
         agent_config_panel = ttk.Frame(system_panel, style="Panel.TFrame")
-        agent_config_panel.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(24, 0))
+        agent_config_panel.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(24, 0))
         agent_config_panel.columnconfigure(1, weight=1)
         ttk.Label(agent_config_panel, text="AI AGENT API", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
         ttk.Label(agent_config_panel, text="Provider", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
@@ -4412,7 +4577,7 @@ class ProbeApp(tk.Tk):
         ttk.Button(agent_config_panel, text="Save Agent API", style="Accent.TButton", command=self.apply_config).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10, 0))
 
         admin_panel = ttk.Frame(system_panel, style="Panel.TFrame")
-        admin_panel.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(24, 0))
+        admin_panel.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(24, 0))
         admin_panel.columnconfigure(1, weight=1)
         ttk.Label(admin_panel, text="ADMIN MODE", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
         ttk.Label(admin_panel, text="Token", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
@@ -4424,10 +4589,60 @@ class ProbeApp(tk.Tk):
         ).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
         ttk.Button(admin_panel, text="Enable Admin", style="Accent.TButton", command=self.enable_admin_mode).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         ttk.Label(admin_panel, textvariable=self.admin_mode_status_var, style="Status.TLabel", wraplength=360, padding=10).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.wire_bond_mode_switch = ttk.Checkbutton(
+            admin_panel, text="Enable Wire-bond Test in AutoTest", variable=self.wire_bond_enabled_var,
+            command=self._change_wire_bond_mode, state="disabled",
+        )
+        self.wire_bond_mode_switch.grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ttk.Label(admin_panel, text="Admin only. Changes the scan region and motion strategy; both modes use the same measurement workflow.",
+                  wraplength=360).grid(row=5, column=0, columnspan=2, sticky="w", pady=6)
 
         _bind_config_column_scroll(optical_panel, optical_canvas)
         _bind_config_column_scroll(motion_panel, motion_canvas)
         _bind_config_column_scroll(system_panel, system_canvas)
+
+    def _show_device_status(self):
+        window = self.__dict__.get("_device_status_window")
+        if window is None or not window.winfo_exists():
+            window = DeviceStatusWindow(
+                self,
+                busy=lambda: self.autotest_running or self.__dict__.get("mapping_running", False),
+                local_status=self._local_device_status,
+                addresses=self._device_status_addresses,
+            )
+            self._device_status_window = window
+            self.device_status_panel = window.panel
+        window.show()
+
+    def _local_device_status(self):
+        rows = []
+        for name, attribute, state_property, address in (
+            ("DP100", "_dp100_driver", "connected", "USB / vendor DLL"),
+            ("Stage controller", "serial_client", "is_open", self.port_var.get()),
+            ("Camera", "camera", "is_open", self.camera_index_var.get()),
+        ):
+            device = self.__dict__.get(attribute)
+            try:
+                connected = bool(device is not None and getattr(device, state_property, False))
+                rows.append(dict(device=name, address=address,
+                                 status="App connected" if connected else "App not connected",
+                                 detail="Current application connection; not a physical device scan."))
+            except Exception as exc:
+                rows.append(dict(device=name, address=address, status="Unknown", detail=str(exc)))
+        return rows
+
+    def _device_status_addresses(self):
+        addresses = {"GPIB0::18::INSTR", "GPIB0::17::INSTR", "GPIB0::5::INSTR"}
+        panel = self.__dict__.get("autotest_panel")
+        for card in getattr(panel, "measurement_flow_cards", ()):
+            for key, value in card.params.items():
+                if key.endswith("resource_name") and str(value).strip():
+                    addresses.add(str(value).strip())
+        return sorted(addresses)
+
+    def _device_scan_in_progress(self):
+        panel = self.__dict__.get("device_status_panel")
+        return panel is not None and panel.scanning
 
     def _update_comm_note(self) -> None:
         if self.comm_input_mode_var.get() == "Hex":
@@ -4449,6 +4664,9 @@ class ProbeApp(tk.Tk):
         self.status_var.set("Communication history cleared.")
 
     def send_manual_command(self) -> str:
+        if self.__dict__.get("mapping_running", False) or self.__dict__.get("_mapping_corner_busy", False):
+            self.status_var.set("Raw commands are locked during mapping acquisition.")
+            return "break"
         if not self.serial_client:
             self.connect_serial()
         if not self.serial_client:
@@ -4633,6 +4851,10 @@ class ProbeApp(tk.Tk):
 
     def _update_admin_mode_controls(self) -> None:
         state = "normal" if self.admin_mode_enabled else "disabled"
+        switch = self.__dict__.get("wire_bond_mode_switch")
+        if switch is not None:
+            busy = self.autotest_running or self.motion_busy or self.__dict__.get("_mapping_corner_busy", False)
+            switch.configure(state="disabled" if busy else state)
         for button_name in ("set_xyz_zero_button", "set_autofocus_z_zero_button", "go_home_button"):
             button = self.__dict__.get(button_name)
             if button is not None:
@@ -4750,6 +4972,9 @@ class ProbeApp(tk.Tk):
                 self.autofocus_z_var.set(str(value))
 
     def _on_motor_speed_profile_selected(self, _event: tk.Event | None = None) -> None:
+        if self.__dict__.get("mapping_running", False):
+            self.motor_speed_profile_var.set(self._motor_speed_profile_label(self.probe_config.active_motor_speed_profile))
+            return
         profile = self._motor_speed_profile_from_label(self.motor_speed_profile_var.get())
         self.probe_config.active_motor_speed_profile = profile
         self.motor_speed_profile_var.set(self._motor_speed_profile_label(profile))
@@ -4766,6 +4991,9 @@ class ProbeApp(tk.Tk):
         self.config_status_var.set(f"Saved {self.config_path.name}")
 
     def read_controller_motion_parameters(self) -> None:
+        if self.__dict__.get("mapping_running", False):
+            self.status_var.set("Controller parameters are locked during mapping.")
+            return
         if self.current_page != "Config":
             self.controller_motion_status_var.set("D5 read is only available in Settings.")
             return
@@ -4803,6 +5031,9 @@ class ProbeApp(tk.Tk):
         return parameters
 
     def write_controller_motion_parameters(self, *, persist: bool) -> None:
+        if self.__dict__.get("mapping_running", False):
+            self.status_var.set("Controller parameters are locked during mapping.")
+            return
         if self.current_page != "Config":
             self.controller_motion_status_var.set("Controller speed writes are only available in Settings.")
             return
@@ -4891,6 +5122,8 @@ class ProbeApp(tk.Tk):
         return "break"
 
     def _on_key_press(self, event: tk.Event) -> str | None:
+        if event.keysym == "F1":
+            return self._open_context_help(event)
         if event.keysym in ("Shift_L", "Shift_R"):
             if self.current_page == "Main" and self.vision_panel:
                 self.vision_panel.set_shift_down(True)
@@ -4914,6 +5147,28 @@ class ProbeApp(tk.Tk):
             "job": None,
         }
         self._keyboard_move(key)
+        return "break"
+
+    def _open_context_help(self, event: tk.Event | None = None) -> str:
+        topic = (
+            "WireBondMapping"
+            if self.current_page == "AutoTest" and self.probe_config.wire_bond_enabled
+            else self.current_page
+        )
+        if event is not None:
+            try:
+                top_level = event.widget.winfo_toplevel()
+                topic = getattr(top_level, "help_topic", topic)
+            except (AttributeError, tk.TclError):
+                pass
+        try:
+            parent_handle = int(self.winfo_id())
+        except (TypeError, ValueError, tk.TclError):
+            parent_handle = 0
+        result = open_help(topic, parent_handle=parent_handle)
+        self.status_var.set(result.message)
+        if not result.opened:
+            messagebox.showerror("Help", result.message, parent=self)
         return "break"
 
     def _on_key_release(self, event: tk.Event) -> str | None:
@@ -5144,8 +5399,12 @@ class ProbeApp(tk.Tk):
         return f"P6 {out_width} {out_height} 255\n".encode("ascii") + rgb.tobytes()
 
     def apply_config(self, save: bool = True) -> bool:
+        if self.__dict__.get("mapping_running", False):
+            self.status_var.set("Configuration is locked during Wire-bond Mapping.")
+            return False
         try:
             updated = ProbeConfig(
+                wire_bond_enabled=self.probe_config.wire_bond_enabled,
                 objective=int(self.objective_var.get()),
                 eyepiece=float(self.eyepiece_var.get()),
                 microstep=int(self.microstep_var.get()),
@@ -5210,6 +5469,8 @@ class ProbeApp(tk.Tk):
             return False
 
         previous_polarity = {axis: self._axis_polarity(axis) for axis in JOG_STEP_AXES}
+        if coordinate_basis(self.probe_config) != coordinate_basis(updated):
+            self._invalidate_display_basis("Motor polarity or pulse scale changed")
         self.probe_config = updated
         derive_missing_calibrations(self.probe_config)
         self._remap_current_positions_for_polarity_change(previous_polarity)
@@ -6191,7 +6452,11 @@ class ProbeApp(tk.Tk):
     def _autofocus_worker(self, metric: str, initial_step: int, min_step: int, search_range: int) -> None:
         assert self.serial_client is not None
         try:
-            self._run_autofocus_sequence(metric, initial_step, min_step, search_range, source="autofocus", status_event="autofocus_status")
+            generation = self.__dict__.get("_display_basis_generation", 0)
+            basis = coordinate_basis(self.probe_config)
+            result = self._run_autofocus_sequence(metric, initial_step, min_step, search_range, source="autofocus", status_event="autofocus_status")
+            if result and result.get("usable") and not result.get("stopped"):
+                self.result_queue.put(("display_focus_reference", result["result_z"], basis, generation))
         except Exception as exc:
             self.result_queue.put(("autofocus_error", exc))
         finally:
@@ -7810,9 +8075,16 @@ class ProbeApp(tk.Tk):
         self.status_var.set(message)
 
     def _on_probe_down_toggle(self) -> None:
+        if self.__dict__.get("mapping_running", False):
+            self.probe_down_var.set(False)
+            self.status_var.set("Probe state is locked during Wire-bond Mapping.")
+            return
         self._set_probe_guard_state(bool(self.probe_down_var.get()))
 
     def _set_probe_guard_state(self, enabled: bool, *, announce: bool = True) -> None:
+        if self.__dict__.get("mapping_running", False):
+            self.probe_down_var.set(False)
+            return
         self.probe_down_var.set(bool(enabled))
         if enabled:
             self.probe_down_state_var.set("Contact")
@@ -8065,7 +8337,14 @@ class ProbeApp(tk.Tk):
             parts.append(f"P2 X={self.imgstitch_point2[0]} Y={self.imgstitch_point2[1]}")
         self.imgstitch_point_status_var.set(" | ".join(parts) if parts else "No rectangle points")
 
+    def _update_imgstitch_correction_limit_highlight(self, edges: list[StitchEdgeQuality]) -> None:
+        widget = self.__dict__.get("imgstitch_max_correction_spinbox")
+        if widget is not None:
+            limited = any(edge.correction_limited for edge in edges)
+            widget.configure(style="CorrectionLimit.TSpinbox" if limited else "TSpinbox")
+
     def _mark_imgstitch_recompose_dirty(self) -> None:
+        self._update_imgstitch_correction_limit_highlight([])
         if self.imgstitch_session is not None and not self.imgstitch_recompose_running:
             self.imgstitch_status_var.set("Parameters changed. Click Apply and Recalculate.")
 
@@ -8658,7 +8937,468 @@ class ProbeApp(tk.Tk):
             details = f"{details}; running axes: {', '.join(sorted(last_running))}"
         raise RuntimeError(f"{move_label} did not reach target before continuing: {details}")
 
-    def start_autotest(self, settings: AutoTestSettings, points_override: tuple[AutoTestPoint, ...] | None = None) -> None:
+    def _mapping_scales(self) -> tuple[float, float, float]:
+        return tuple(self.probe_config.um_per_pulse(axis) for axis in "XYZ")
+
+    def _wait_mapping_pollers(self) -> None:
+        for name in ("realtime_thread", "home_signal_thread"):
+            worker = self.__dict__.get(name)
+            if worker is not None and worker is not threading.current_thread():
+                worker.join(timeout=2.0)
+                if worker.is_alive():
+                    raise RuntimeError("Stage polling has not stopped; mapping acquisition was not started.")
+
+    def _lock_mapping_controls(self, locked: bool) -> None:
+        if not locked:
+            for widget, state in self.__dict__.pop("_mapping_widget_states", []):
+                try:
+                    widget.configure(state=state)
+                except tk.TclError:
+                    pass
+            return
+        saved = []
+        stack = list(self.winfo_children())
+        while stack:
+            widget = stack.pop()
+            stack.extend(widget.winfo_children())
+            if isinstance(widget, (ttk.Button, tk.Button, ttk.Entry, tk.Entry, ttk.Combobox,
+                                   ttk.Checkbutton, tk.Checkbutton, ttk.Radiobutton, tk.Radiobutton,
+                                   ttk.Scale, tk.Scale, ttk.Spinbox, tk.Spinbox)):
+                if widget is self.mapping_panel.stop_button or str(widget.cget("text") if "text" in widget.keys() else "") == "EMERGENCY STOP":
+                    continue
+                saved.append((widget, str(widget.cget("state"))))
+                widget.configure(state="disabled")
+        self._mapping_widget_states = saved
+
+    def _record_mapping_corner(self, corner: str) -> None:
+        if self.motion_busy or self.keyboard_motion_busy or self.autotest_running or self.position_read_pending:
+            self.mapping_panel.status.set("Motion/position read is busy; corner not recorded.")
+            return
+        if not self.serial_client:
+            self.connect_serial()
+        if not self.serial_client:
+            self.mapping_panel.status.set("Connect the stage before recording a corner.")
+            return
+        self._mapping_corner_restore = (self.realtime_enabled, self.home_signal_enabled)
+        if self.realtime_enabled:
+            self.disable_realtime_position()
+            if self.realtime_enabled:
+                self.mapping_panel.status.set("Cannot suspend realtime stage reporting; corner read skipped.")
+                return
+        if self.home_signal_enabled:
+            self.disable_home_signal_polling()
+        self.motion_busy = True
+        self._mapping_corner_busy = True
+        self.mapping_panel.set_running(True)
+        self._lock_mapping_controls(True)
+        scales = self._mapping_scales()
+
+        def read_corner():
+            try:
+                self._wait_mapping_pollers()
+                entries = self.serial_client.read_stable_xyz_positions()
+                position = self._read_logical_xyz_from_entries(entries)
+                self.result_queue.put(("mapping_corner", corner, position["X"] * scales[0], position["Y"] * scales[1], ""))
+            except Exception as exc:
+                self.result_queue.put(("mapping_corner", corner, 0, 0, str(exc)))
+        threading.Thread(target=read_corner, daemon=True).start()
+
+    def _start_mapping(self, settings: MappingSettings) -> None:
+        if self._device_scan_in_progress():
+            messagebox.showinfo("Device scan", "Wait for the device connection scan to finish before starting measurement.")
+            return
+        if not self.probe_config.wire_bond_enabled:
+            self.mapping_panel.status.set("Wire-bond mode must be enabled by an admin in Config.")
+            return
+        if self.autotest_running or self.motion_busy or self.keyboard_motion_busy or self.position_read_pending:
+            self.mapping_panel.status.set("Motion/position read is busy; mapping skipped.")
+            return
+        if self._probe_down_guard_enabled():
+            self.mapping_panel.status.set("Mapping requires probe state Separate. Retract the probes and select Separate before starting.")
+            return
+        try:
+            # Ignore obsolete independent instrument settings: always use the shared editor.
+            settings = replace(settings, measurement_flow=self.autotest_panel.measurement_flow()).normalized()
+            self._validate_mapping_workflow(settings)
+            if any(step.type_id == "photo" for step in settings.measurement_flow):
+                with self.camera_lock:
+                    if self.latest_stitch_frame is None:
+                        raise ValueError("This workflow includes Photo; start the camera before scanning.")
+        except Exception as exc:
+            self.mapping_panel.status.set(f"Invalid measurement workflow: {exc}")
+            return
+        if not self.serial_client:
+            self.connect_serial()
+        if not self.serial_client:
+            self.mapping_panel.status.set("Serial is not connected; mapping skipped.")
+            return
+        try:
+            plan = generate_mapping_plan(settings, self._mapping_scales())
+            session_dir = self._prepare_autotest_session_dir()
+            # Snapshot all motion parameters before handing control to a worker.
+            speed = self._motion_speed_percent()
+            polarities = {axis: self._axis_polarity(axis) for axis in "XYZ"}
+        except Exception as exc:
+            self.mapping_panel.status.set(f"Mapping setup failed: {exc}")
+            return
+        self.autotest_restore_realtime = self.realtime_enabled
+        self.autotest_restore_home_signal = self.home_signal_enabled
+        if self.realtime_enabled:
+            self.disable_realtime_position()
+            if self.realtime_enabled:
+                self.mapping_panel.status.set("Cannot suspend realtime stage reporting; mapping skipped.")
+                return
+        if self.home_signal_enabled:
+            self.disable_home_signal_polling()
+        self.mapping_running = True
+        self.autotest_running = True
+        self.motion_busy = True
+        self.autotest_stop_event.clear()
+        self.autotest_progress_current = 0
+        self.autotest_progress_total = len(plan.points)
+        self.autotest_grid_rows, self.autotest_grid_cols = len(plan.ys), len(plan.xs)
+        self.last_iv_sample_status_at = 0.0
+        self.autotest_started_at = time.monotonic()
+        dialog = getattr(self.autotest_panel, "_measurement_dialog", None)
+        if dialog is not None and dialog.winfo_exists():
+            dialog.withdraw()
+        self.mapping_panel.set_plan(plan, session_dir)
+        self.mapping_panel.set_running(True)
+        self._lock_mapping_controls(True)
+        self.mapping_panel.status.set("Preparing fixed-Z scan; shared workflow runs at each settled position.")
+        self.autotest_thread = threading.Thread(
+            target=self._mapping_worker, args=(plan, session_dir, speed, polarities), daemon=True,
+        )
+        self.autotest_thread.start()
+
+    @staticmethod
+    def _validate_mapping_workflow(settings: MappingSettings) -> None:
+        from .flow_graph import validate_flow_graph
+        flow = settings.measurement_flow or ()
+        if not flow:
+            raise ValueError("Configure a measurement workflow with Config Measure Flow first.")
+        supported = {"workflow_start", "workflow_end", "wait", "photo", "iv", "constant_current", "virtual_mask",
+                     "hp6614c_transfer", "hp6614c_output", "b1500_transfer", "b1500_output",
+                     "photo_iv", "photo_transient", "laser_output", "laser_pulse", "laser_iv_calibration",
+                     "photo_power_steps", "photo_width_steps", "mapping_heatmap",
+                     "math_formula", "boolean_compare", "boolean_logic",
+                     "condition_boolean", "condition_metric", "condition_device_state", "condition_compliance"}
+        supported.update(DATA_ONLY_TYPES)
+        unsupported = sorted({step.type_id for step in flow} - supported)
+        if unsupported:
+            raise ValueError("These workflow nodes are not executable in fixed-Z mapping: " + ", ".join(unsupported))
+        if is_graph_workflow(flow):
+            errors = validate_flow_graph(flow)
+            if errors:
+                raise ValueError("; ".join(errors))
+        for step in flow:
+            if step.type_id == "virtual_mask":
+                ProbeApp._validate_virtual_mask_node(step, settings)
+            elif step.type_id in {"iv", "photo_iv"}:
+                iv_sweep_configs_from_params(step.params)
+            elif step.type_id == "constant_current":
+                ProbeApp._constant_current_node_config(step.params)
+            elif step.type_id == "laser_output":
+                settle = float(step.params.get("settle_s", "0"))
+                if not math.isfinite(settle) or settle < 0:
+                    raise ValueError("Laser settle time must be finite and nonnegative.")
+                parse_bool(step.params.get("mapping_once", "false"))
+            elif step.type_id == "laser_iv_calibration":
+                values = [
+                    float(step.params.get("calibration_voltage_v", "3.3")),
+                    float(step.params.get("calibration_current_min_a", ".001")),
+                    float(step.params.get("calibration_current_max_a", ".025")),
+                    float(step.params.get("calibration_current_step_a", ".001")),
+                    float(step.params.get("calibration_settle_ms", "100")),
+                    float(step.params.get("readback_timeout_s", "2.0")),
+                    float(step.params.get("readback_interval_ms", "100")),
+                    float(step.params.get("ovp_v", "3.3")),
+                    float(step.params.get("ocp_a", ".028")),
+                ]
+                if not all(math.isfinite(value) for value in values):
+                    raise ValueError("Laser calibration parameters must be finite.")
+                ceiling, low, high, step_a, settle_ms, timeout_s, retry_ms, ovp, ocp = values
+                if low <= 0 or high < low or step_a <= 0 or settle_ms < 0 or timeout_s <= 0 or retry_ms <= 0:
+                    raise ValueError("Laser calibration range, timeout and retry interval are invalid.")
+                if high > ocp or ceiling > ovp:
+                    raise ValueError("Laser calibration maximum must not exceed DP100 OCP/OVP.")
+            elif step.type_id == "laser_pulse" and step.params.get("program") == "calibrated_response_suite":
+                low = float(step.params.get("intensity_min_a", ".001"))
+                high = float(step.params.get("intensity_max_a", ".025"))
+                ceiling = float(step.params.get("calibration_voltage_v", "3.3"))
+                ocp = float(step.params.get("ocp_a", ".028"))
+                ovp = float(step.params.get("ovp_v", "3.3"))
+                settle_ms = float(step.params.get("calibration_settle_ms", "100"))
+                if not all(math.isfinite(value) for value in (low, high, ceiling, ocp, ovp, settle_ms)) or settle_ms < 0:
+                    raise ValueError("Calibrated laser-suite limits and settle time must be finite and nonnegative.")
+                if high > ocp or ceiling > ovp:
+                    raise ValueError("Laser calibration maximum must not exceed DP100 OCP/OVP.")
+                calibrated_response_program(step.params, [(low, min(ceiling, 2.0)), (high, ceiling)])
+            elif step.type_id in {"photo_transient", "photo_power_steps", "photo_width_steps"}:
+                if step.type_id in {"photo_power_steps", "photo_width_steps"}:
+                    phase_params = dict(step.params)
+                    phase_params["response_phase"] = "power" if step.type_id == "photo_power_steps" else "width"
+                    calibrated_response_program(phase_params, [(.001, 2.0), (.025, 2.5)])
+                duration_text = str(step.params.get("duration_s", "5")).strip().lower()
+                if duration_text != "auto" and (not math.isfinite(float(duration_text)) or float(duration_text) <= 0):
+                    raise ValueError("Photo transient duration must be positive or 'auto'.")
+                for key in ("sample_interval_ms", "nplc"):
+                    value = float(step.params.get(key, "10" if key == "sample_interval_ms" else ".01"))
+                    if not math.isfinite(value) or value <= 0:
+                        raise ValueError(f"Photo transient {key} must be finite and positive.")
+                transient_config = dict(step.params)
+                transient_config.update(voltage_v=step.params.get("bias_v", ".1"), sample_count="1")
+                constant_voltage_current_config_from_params(transient_config)
+                parse_bool(step.params.get("hold_during_mapping", "true"))
+                parse_bool(step.params.get("verify_bias", "true"))
+        # A held voltage session must not be reset by another node using that SMU.
+        held = [step for step in flow if (
+            step.type_id == "constant_current" and parse_bool(step.params.get("hold_during_mapping", "false"))
+        ) or (
+            step.type_id in {"photo_transient", "photo_power_steps", "photo_width_steps"} and
+            parse_bool(step.params.get("hold_during_mapping", "true"))
+        )]
+        for owner in held:
+            if owner.type_id == "constant_current":
+                resource = ProbeApp._constant_current_node_config(owner.params)[0].resource_name.strip().upper()
+            else:
+                resource = str(owner.params.get("resource_name", "GPIB0::18::INSTR")).strip().upper()
+            for other in flow:
+                if other is owner:
+                    continue
+                if other.type_id == "constant_current":
+                    resources = [ProbeApp._constant_current_node_config(other.params)[0].resource_name]
+                elif other.type_id in {"photo_transient", "photo_power_steps", "photo_width_steps"}:
+                    if owner.type_id in {"photo_power_steps", "photo_width_steps"} and other.type_id in {"photo_power_steps", "photo_width_steps"}:
+                        continue
+                    resources = [other.params.get("resource_name", "GPIB0::18::INSTR")]
+                elif other.type_id in {"iv", "photo_iv"}:
+                    resources = [config.resource_name for config in iv_sweep_configs_from_params(other.params)]
+                elif other.type_id in {"hp6614c_transfer", "hp6614c_output"}:
+                    resources = [other.params.get("keithley_resource", "GPIB0::18::INSTR")]
+                else:
+                    resources = []
+                if resource in {value.strip().upper() for value in resources}:
+                    raise ValueError("Hold bias during mapping requires exclusive use of its 2450 VISA resource. Remove the conflicting node or disable bias holding.")
+        laser_nodes = [step for step in flow if step.type_id in {"laser_output", "laser_pulse", "virtual_mask"}]
+        if any(step.type_id == "virtual_mask" for step in laser_nodes) and len(laser_nodes) > 1:
+            raise ValueError("Virtual Mask Illumination requires exclusive DP100 control; remove other DP100 laser nodes.")
+        if len(laser_nodes) > 1 and any(parse_bool(step.params.get("mapping_once", "false")) for step in laser_nodes):
+            raise ValueError("A laser set once per mapping scan cannot be combined with other DP100 nodes; use a single constant laser node or disable set-once.")
+
+    @staticmethod
+    def _validate_virtual_mask_node(step, settings):
+        from .virtual_mask import load_grayscale, parse_binding_points
+
+        params = step.params
+        load_grayscale(params.get("image_path", ""))
+        parse_binding_points(params.get("bindings", ""))
+        frame = str(params.get("coordinate_frame", "auto")).lower()
+        if frame == "uv" and not settings.gds_mapper:
+            raise ValueError("Virtual-mask UV binding requires a fitted LayoutMap mapping.")
+        values = [
+            float(params.get("black_power_mw", params.get("power_min_mw", "0"))),
+            float(params.get("white_power_mw", params.get("power_max_mw", "5"))),
+            float(params.get("settle_s", ".05")),
+        ]
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("Virtual-mask black/white power and settle time must be finite.")
+        power_min, power_max, settle = values
+        if min(power_min, settle) < 0 or power_max < power_min:
+            raise ValueError("Virtual-mask black/white powers must be nonnegative and increasing.")
+        parse_bool(params.get("invert_intensity", "false"))
+        # Calibration is bounded by the installed laser's 3.3 V / 25 mA
+        # protection envelope; the measured curve usually covers less.
+        if power_max > 3.3 * 0.025 * 1000.0:
+            raise ValueError("Virtual-mask white power exceeds the 3.3 V / 25 mA DP100 safety envelope (82.5 mW).")
+
+    def _mapping_move_xy(self, point, fixed_z: int, speed: int, polarities: dict[str, int], *,
+                         fast: bool = False, position_cache: dict[str, int] | None = None):
+        """Move only X/Y. Never correct a Z discrepancy by moving Z."""
+        def read_position(*, stable=True):
+            entries = (self.serial_client.read_stable_xyz_positions() if stable else
+                       self.serial_client.read_xyz_positions())
+            xyz = {position.axis_name: polarities[position.axis_name] * position.position for _, _, position in entries}
+            if xyz["Z"] != fixed_z:
+                raise RuntimeError("Z changed during fixed-Z mapping; scan stopped without correcting Z.")
+            self._read_positions_event(entries, "autotest")
+            return xyz
+
+        current = dict(position_cache) if fast and position_cache is not None else read_position()
+        for axis, target in ((Axis.X, point.x_pulses), (Axis.Y, point.y_pulses)):
+            if self.autotest_stop_event.is_set():
+                return tuple(current[name] for name in "XYZ")
+            delta = (target - current[axis.name]) * polarities[axis.name]
+            if delta:
+                self.serial_client.move_relative(axis=axis, reverse=delta < 0, pulses=abs(delta), speed_percent=speed)
+                self.serial_client.wait_axis_reached(axis, timeout=self._axis_move_timeout(abs(delta), speed))
+                if fast:
+                    current[axis.name] = target
+                else:
+                    current = read_position()
+                if not fast and not self.autotest_stop_event.is_set() and current[axis.name] != target:
+                    raise RuntimeError(f"Mapping {axis.name} did not reach target {target}: read {current[axis.name]}.")
+        if fast and not self.autotest_stop_event.is_set():
+            # Reached-position frames already confirm that motion stopped. One XYZ
+            # read verifies the final target without the 100 ms stable-read debounce.
+            current = read_position(stable=False)
+            for axis, target in ((Axis.X, point.x_pulses), (Axis.Y, point.y_pulses)):
+                if current[axis.name] != target:
+                    raise RuntimeError(f"Mapping {axis.name} did not reach target {target}: read {current[axis.name]}.")
+            if position_cache is not None:
+                position_cache.update(current)
+        return tuple(current[name] for name in "XYZ")
+
+    def _read_mapping_start_positions(self):
+        """Read the fixed-Z snapshot, recovering one stale serial transport."""
+        try:
+            return self.serial_client.read_stable_xyz_positions()
+        except Exception as first_error:
+            client = self.serial_client
+            port = str(getattr(client, "port", "connected port"))
+            logger.warning(
+                "Mapping startup position read failed on %s; reconnecting once: %s",
+                port,
+                first_error,
+            )
+            try:
+                client.close()
+                client.open()
+            except Exception as reconnect_error:
+                raise RuntimeError(
+                    f"Stage controller startup read failed on {port}: {first_error}. "
+                    f"Automatic reconnect failed: {reconnect_error}"
+                ) from reconnect_error
+            try:
+                return client.read_stable_xyz_positions()
+            except Exception as retry_error:
+                raise RuntimeError(
+                    f"Stage controller startup read failed on {port} after one reconnect: "
+                    f"{retry_error} (initial error: {first_error})"
+                ) from retry_error
+
+    def _mapping_worker(self, plan, session_dir: Path, speed: int, polarities: dict[str, int]) -> None:
+        self.__dict__.pop("_workflow_run_id", None)
+        status, error = "failed", ""
+        session = None
+        delegated = False
+        try:
+            fast_mode = plan.settings.settle_s == 0
+            session = MappingSession(
+                session_dir, plan, None,
+                motion={"speed_percent": speed, "axis_polarity": polarities, "zero_settle_fast_path": fast_mode},
+                buffer_point_io=fast_mode,
+            )
+            self._mapping_fast_mode = fast_mode
+            self._wait_mapping_pollers()
+            entries = self._read_mapping_start_positions()
+            fixed_z = self._axis_from_position_entries(entries, Axis.Z)
+            position_cache = self._read_logical_xyz_from_entries(entries)
+            session.metadata.update(fixed_z_pulses=fixed_z, fixed_z_um=fixed_z * plan.um_per_pulse[2])
+            session.save_metadata()
+            self.result_queue.put(("mapping_fixed_z", fixed_z, fixed_z * plan.um_per_pulse[2]))
+            self._mapping_laser_used = False
+            self._mapping_bias_runners = {}
+            self._mapping_held_current = {}
+            self._mapping_once_nodes = set()
+            self._mapping_laser_calibrations = {}
+            self._mapping_virtual_mask_dp100_configured = False
+            self._mapping_virtual_mask_last_output = None
+            self._mapping_session_dir = session_dir
+
+            def measure_point(point, readback, on_sample, workflow_data):
+                directory = session_dir / "points" / point.name
+                directory.mkdir(parents=True)
+                self._mapping_sample_sink = on_sample
+                try:
+                    cv2_module = None
+                    if any(step.type_id == "photo" for step in plan.settings.measurement_flow):
+                        import cv2 as cv2_module
+                    self._execute_autotest_measurement_flow(point, plan.settings, directory, cv2_module)
+                finally:
+                    self._mapping_sample_sink = None
+                    collect_workflow_data(directory, session_dir, workflow_data)
+
+            def cleanup():
+                errors = []
+                for resource, (_config, runner) in self._mapping_held_current.items():
+                    try:
+                        runner.end_constant_voltage_current(strict=True)
+                    except Exception as exc:
+                        errors.append(f"{resource}: {exc}")
+                self._mapping_held_current.clear()
+                self._mapping_laser_calibrations.clear()
+                for resource, runner in self._mapping_bias_runners.items():
+                    try:
+                        runner.ensure_output_off(resource)
+                    except Exception as exc:
+                        errors.append(f"{resource}: {exc}")
+                if self._mapping_laser_used:
+                    driver = self.__dict__.get("_dp100_driver")
+                    if driver is not None:
+                        try:
+                            driver.shutdown()
+                        except Exception as exc:
+                            errors.append(f"DP100: {exc}")
+                        finally:
+                            self._dp100_driver = None
+                if errors:
+                    raise RuntimeError("; ".join(errors))
+
+            for mask_step in (step for step in plan.settings.measurement_flow or () if step.type_id == "virtual_mask"):
+                calibration_params = self._virtual_mask_calibration_params(plan.settings, mask_step)
+                self.result_queue.put(("autotest_status", "Calibrating DP100 laser power-voltage curve before mapping..."))
+                calibration, _records = self._get_or_run_laser_calibration(calibration_params, session_dir)
+                powers = [current * voltage * 1000.0 for current, voltage in calibration]
+                self.result_queue.put((
+                    "autotest_status",
+                    f"DP100 laser calibration ready: {len(calibration)} points, {powers[0]:g}-{powers[-1]:g} mW electrical power.",
+                ))
+
+            delegated = True
+            status, error = run_mapping(
+                plan, session, move_xy=lambda point: self._mapping_move_xy(
+                    point, fixed_z, speed, polarities, fast=plan.settings.settle_s == 0,
+                    position_cache=position_cache,
+                ),
+                stop_event=self.autotest_stop_event, emit=lambda *event: self.result_queue.put(event),
+                measure_point=measure_point, cleanup=cleanup,
+            )
+        except Exception as exc:
+            error = str(exc)
+            if session is not None and not delegated:
+                if self.__dict__.get("_mapping_laser_used", False):
+                    try:
+                        cleanup()
+                    except Exception as cleanup_exc:
+                        error += f"; cleanup failed: {cleanup_exc}"
+                try:
+                    session.finish(status, error)
+                except Exception as save_exc:
+                    error += f"; metadata save failed: {save_exc}"
+                finally:
+                    try:
+                        session.close()
+                    except Exception as close_exc:
+                        error += f"; file close failed: {close_exc}"
+        finally:
+            self._mapping_fast_mode = False
+            self.__dict__.pop("_mapping_session_dir", None)
+            self.result_queue.put(("mapping_finished", status, error, session_dir))
+
+    def start_autotest(self, settings: AutoTestSettings | MappingSettings, points_override: tuple[AutoTestPoint, ...] | None = None) -> None:
+        if self._device_scan_in_progress():
+            messagebox.showinfo("Device scan", "Wait for the device connection scan to finish before starting measurement.")
+            return
+        if isinstance(settings, MappingSettings):
+            self._start_mapping(settings)
+            return
+        if self.probe_config.wire_bond_enabled:
+            try:
+                self._start_mapping(self.mapping_panel.settings())
+            except Exception as exc:
+                self.mapping_panel.status.set(f"Invalid mapping settings: {exc}")
+            return
         if self.autotest_running or self.motion_busy:
             if self.autotest_panel is not None:
                 self.autotest_panel.set_status("Motion is busy; AutoTest skipped.")
@@ -8679,6 +9419,11 @@ class ProbeApp(tk.Tk):
             return
         try:
             normalized_settings = settings.normalized()
+            if normalized_settings.measurement_flow and is_graph_workflow(normalized_settings.measurement_flow):
+                from .flow_graph import validate_flow_graph
+                errors = validate_flow_graph(normalized_settings.measurement_flow)
+                if errors:
+                    raise ValueError("; ".join(errors))
             points = (
                 tuple(points_override)
                 if points_override is not None
@@ -8724,6 +9469,12 @@ class ProbeApp(tk.Tk):
             self.autotest_panel.set_running(True)
             self.autotest_panel.set_status(f"AutoTest running: {len(points)} point(s).")
             self.autotest_panel.set_progress(0, len(points), "Preparing AutoTest", estimate_text="ETA: waiting for first completed device")
+        for workflow_button in self.workflow_buttons:
+            workflow_button.configure(state="disabled")
+        self._update_admin_mode_controls()
+        dialog = getattr(self.autotest_panel, "_measurement_dialog", None)
+        if dialog is not None and dialog.winfo_exists():
+            dialog.withdraw()
         self.status_var.set(f"AutoTest running: {len(points)} point(s).")
         self.autotest_thread = threading.Thread(
             target=self._autotest_worker,
@@ -8735,7 +9486,7 @@ class ProbeApp(tk.Tk):
     @staticmethod
     def _autotest_requires_session_dir(settings: AutoTestSettings) -> bool:
         flow_types = {step.type_id for step in settings.measurement_flow}
-        return "photo" in settings.measurement_steps or bool({"photo", "iv", "wobb_test", "hp6614c_transfer", "hp6614c_output", "b1500_transfer", "b1500_output"} & flow_types)
+        return "photo" in settings.measurement_steps or bool({"plot_panel", "photo_transient", "laser_iv_calibration", "photo", "iv", "photo_iv", "constant_current", "wobb_test", "hp6614c_transfer", "hp6614c_output", "b1500_transfer", "b1500_output"} & flow_types)
 
     @staticmethod
     def _autotest_grid_shape(points: tuple[AutoTestPoint, ...], settings: AutoTestSettings) -> tuple[int, int]:
@@ -8748,6 +9499,8 @@ class ProbeApp(tk.Tk):
 
     def stop_autotest(self) -> None:
         self.autotest_stop_event.set()
+        if self.__dict__.get("mapping_running", False):
+            self.mapping_panel.status.set("Stopping after the current motion/read returns; saving partial workflow results and closing outputs.")
         if self.autotest_panel is not None:
             self.autotest_panel.set_status("Stopping AutoTest.")
 
@@ -8769,6 +9522,7 @@ class ProbeApp(tk.Tk):
         return session_dir
 
     def _autotest_worker(self, settings: AutoTestSettings, points: tuple[AutoTestPoint, ...], session_dir: Path | None) -> None:
+        self.__dict__.pop("_workflow_run_id", None)
         assert self.serial_client is not None
         try:
             import cv2
@@ -8935,12 +9689,487 @@ class ProbeApp(tk.Tk):
 
     def _execute_autotest_measurement_flow(self, point: AutoTestPoint, settings: AutoTestSettings, session_dir: Path | None, cv2_module) -> None:
         if settings.measurement_flow:
+            if is_graph_workflow(settings.measurement_flow):
+                self._execute_autotest_measurement_graph(point, settings, session_dir, cv2_module)
+                return
             for step in settings.measurement_flow:
                 if self.autotest_stop_event.is_set():
                     return
-                self._execute_autotest_flow_step(point, settings, step, session_dir, cv2_module)
+                if step.type_id not in DATA_ONLY_TYPES:
+                    self._execute_autotest_flow_step(point, settings, step, session_dir, cv2_module)
             return
         self._execute_autotest_measurement_steps(point, settings.measurement_steps, session_dir, cv2_module)
+
+    def _execute_autotest_measurement_graph(self, point, settings, session_dir, cv2_module):
+        from .flow_graph import validate_flow_graph
+        errors = validate_flow_graph(settings.measurement_flow)
+        if errors:
+            raise ValueError("; ".join(errors))
+        panel = next((node for node in settings.measurement_flow if node.type_id == "plot_panel"), None)
+        if panel is not None:
+            from .workflow_ports import output_type, metric_unit
+            by_id = {step_node_id(node, i): node for i, node in enumerate(settings.measurement_flow)}
+            params = dict(panel.params)
+            for i in range(1, 7):
+                source = by_id.get(params.get(f"_input_slot{i}_source"))
+                output = params.get(f"_input_slot{i}_output", "")
+                if source is not None:
+                    params[f"_input_slot{i}_type"] = output_type(source, output)
+                    if not params.get(f"slot{i}_title"):
+                        params[f"slot{i}_title"] = f"{params.get(f'_input_slot{i}_source')}: {output.rsplit('.', 1)[-1]}"
+                    params[f"_input_slot{i}_unit"] = source.params.get("output_unit", "") if output == "result" else metric_unit(output)
+            panel = replace(panel, params=params)
+        if point.order == 1 or "_workflow_run_id" not in self.__dict__:
+            self._workflow_run_id = uuid.uuid4().hex
+            if panel is not None:
+                self.result_queue.put(("workflow_plot_start", self._workflow_run_id, panel,
+                    (self.autotest_grid_rows, self.autotest_grid_cols)))
+        run_id = self._workflow_run_id
+        if panel is not None:
+            self.result_queue.put(("workflow_point_start", run_id, point.row, point.col))
+        results = {}
+        status = "done"
+        try:
+            self._execute_autotest_measurement_graph_impl(point, settings, session_dir, cv2_module, results)
+            status = "incomplete" if self.autotest_stop_event.is_set() else "done"
+        except Exception:
+            status = "failed"
+            local = self.__dict__.get("_workflow_local")
+            failed_result = getattr(local, "failed_result", None) if local else None
+            if failed_result:
+                results[failed_result["node_id"]] = failed_result
+            raise
+        finally:
+            if panel is not None:
+                values, details = {}, {}
+                completion_error = None
+                had_error = status == "failed"
+                for i in range(1, 7):
+                    if panel.params.get(f"_input_slot{i}_type") == "number":
+                        try:
+                            value = resolve_data_input(panel, f"slot{i}", settings.measurement_flow, results) if status == "done" else InvalidValue(f"Point {status}")
+                        except (ValueError, RuntimeError) as exc:
+                            value = InvalidValue(str(exc))
+                            completion_error = exc
+                            status = "failed"
+                        values[str(i)] = value if isinstance(value, (float, int)) and math.isfinite(value) else None
+                        details[str(i)] = {"reason": value.reason if isinstance(value, InvalidValue) else "No feature value" if value is None else None,
+                            "skipped": isinstance(value, InvalidValue) and "source not executed" in value.reason}
+                curves = {node_id: {key.replace("curve", "live", 1): family for key, family in result.items() if key.startswith("curve") and isinstance(family, dict)} for node_id, result in results.items()}
+                history_path = None
+                try:
+                    if session_dir is not None:
+                        plot_root = self.__dict__.get("_mapping_session_dir", session_dir) if isinstance(settings, MappingSettings) else session_dir
+                        folder = plot_root / "workflow_plots"
+                        folder.mkdir(parents=True, exist_ok=True)
+                        history_path = folder / f"{point.row}_{point.col}.json"
+                        history_path.write_text(json.dumps(json_value({"run_id": run_id, "point": {"row": point.row, "col": point.col}, "status": status, "values": values, "details": details, "curves": curves}), allow_nan=False), encoding="utf-8")
+                except (OSError, ValueError, TypeError) as exc:
+                    status = "failed"
+                    completion_error = completion_error or exc
+                    history_path = None
+                finally:
+                    self.result_queue.put(("workflow_point_done", run_id, point.row, point.col, values, status, history_path, details))
+                if completion_error and not had_error:
+                    raise completion_error
+
+    def _execute_autotest_measurement_graph_impl(self, point, settings, session_dir, cv2_module, results):
+        steps = settings.measurement_flow
+        by_id = {step_node_id(step, index): step for index, step in enumerate(steps)}
+        current_id = graph_start_node(steps)
+        previous_id: str | None = None
+        visits = 0
+        while current_id and current_id in by_id and not self.autotest_stop_event.is_set():
+            visits += 1
+            if visits > max(1000, len(steps) * 20):
+                raise RuntimeError("Measurement graph exceeded its execution limit; check for an unbounded cycle.")
+            step = by_id[current_id]
+            if step.type_id in DATA_ONLY_TYPES:
+                raise ValueError(f"Data-only node {current_id} cannot be on a control path")
+            if step.params.get("_input_calibration_source") and not resolve_data_input(step, "calibration", steps, results):
+                raise ValueError(f"{current_id}: calibration source has not executed on this path")
+            if step.type_id.startswith("condition_"):
+                decision = evaluate_condition(step, results, previous_id, steps)
+                self.result_queue.put(("autotest_status", f"Condition {current_id} at {point.name}: {'True' if decision else 'False'}"))
+                next_id = str(step.params.get("_true" if decision else "_false", "")).strip()
+            else:
+                light_source_id = str(step.params.get("_light_source", "")).strip()
+                light_step = by_id.get(light_source_id) if light_source_id else None
+                if light_step is not None:
+                    node_result = self._execute_autotest_step_with_light(point, settings, step, light_step, session_dir, cv2_module)
+                else:
+                    node_result = self._execute_autotest_flow_step(point, settings, step, session_dir, cv2_module)
+                results[current_id] = node_result if isinstance(node_result, dict) else {}
+                previous_id = current_id
+                next_id = str(step.params.get("_next", "")).strip()
+            current_id = next_id or None
+        if isinstance(settings, MappingSettings) and session_dir is not None:
+            self._write_mapping_heatmap_nodes(point, steps, results, session_dir)
+
+    def _write_mapping_heatmap_nodes(self, point, steps, results, session_dir):
+        for index, step in enumerate(steps):
+            if step.type_id != "mapping_heatmap":
+                continue
+            primary = resolve_data_input(step, "primary", steps, results) if not self.autotest_stop_event.is_set() else InvalidValue("Point incomplete")
+            secondary = resolve_data_input(step, "secondary", steps, results) if not self.autotest_stop_event.is_set() else InvalidValue("Point incomplete")
+            node_id = self._safe_autotest_name(step_node_id(step, index))
+            folder = session_dir / "nodes" / node_id / "heatmap"
+            folder.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "device": {"name": point.name, "row": point.row, "col": point.col, "order": point.order},
+                "status": "done",
+                "statistics": {"primary_value": primary if isinstance(primary, (int, float)) and math.isfinite(primary) else None, "secondary_value": secondary if isinstance(secondary, (int, float)) and math.isfinite(secondary) else None},
+                "invalid_reasons": {"primary": primary.reason if isinstance(primary, InvalidValue) else None, "secondary": secondary.reason if isinstance(secondary, InvalidValue) else None},
+                "labels": {
+                    "primary": step.params.get("primary_label", "Primary mapping feature"),
+                    "secondary": step.params.get("secondary_label", "Secondary mapping feature"),
+                },
+                "sources": {
+                    "primary": {
+                        "node": step.params.get("_input_primary_source", ""),
+                        "output": step.params.get("_input_primary_output", ""),
+                    },
+                    "secondary": {
+                        "node": step.params.get("_input_secondary_source", ""),
+                        "output": step.params.get("_input_secondary_output", ""),
+                    },
+                },
+            }
+            (folder / f"{self._safe_autotest_name(point.name)}.json").write_text(
+                json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8"
+            )
+
+    def _execute_autotest_step_with_light(self, point: AutoTestPoint, settings: AutoTestSettings, step: AutoTestFlowStep, light_step: AutoTestFlowStep, session_dir: Path | None, cv2_module) -> None:
+        calibrated_suite = str(light_step.params.get("program", "custom")) == "calibrated_response_suite"
+        if calibrated_suite:
+            light_step, step = self._prepare_calibrated_laser_suite(light_step, step, session_dir)
+            self._mapping_light_start_gate = threading.Event()
+        light_error: list[Exception] = []
+
+        def run_light() -> None:
+            try:
+                self._execute_autotest_flow_step(point, settings, light_step, session_dir, cv2_module)
+            except Exception as exc:
+                light_error.append(exc)
+
+        worker = threading.Thread(target=run_light, name="autotest-light-waveform", daemon=True)
+        worker.start()
+        try:
+            result = self._execute_autotest_flow_step(point, settings, step, session_dir, cv2_module)
+        finally:
+            if calibrated_suite:
+                self._mapping_light_start_gate.set()
+            worker.join()
+            if calibrated_suite:
+                self.__dict__.pop("_mapping_light_start_gate", None)
+        if light_error:
+            raise RuntimeError(f"Light waveform failed: {light_error[0]}") from light_error[0]
+        return result
+
+    def _get_or_run_laser_calibration(self, params, session_dir):
+        node_id = str(params.get("_node_id", "laser_iv_calibration"))
+        cache = self.__dict__.setdefault("_mapping_laser_calibrations", {})
+        calibration = cache.get(node_id)
+        if calibration is not None:
+            records = [
+                {"target_current_a": current, "measured_current_a": current, "measured_voltage_v": voltage}
+                for current, voltage in calibration
+            ]
+            return calibration, records
+
+        driver = self._get_dp100_driver()
+        if isinstance(self.__dict__.get("_active_mapping_settings"), MappingSettings) or self.__dict__.get("mapping_running", False):
+            self._mapping_laser_used = True
+        low = float(params.get("calibration_current_min_a", params.get("intensity_min_a", ".001")))
+        high = float(params.get("calibration_current_max_a", params.get("intensity_max_a", ".025")))
+        step_a = float(params.get("calibration_current_step_a", params.get("intensity_step_a", ".001")))
+        ceiling = float(params.get("calibration_voltage_v", "3.3"))
+        settle = float(params.get("calibration_settle_ms", "100")) / 1000
+        timeout = float(params.get("readback_timeout_s", "2.0"))
+        retry = float(params.get("readback_interval_ms", "100")) / 1000
+        count = int(math.floor((high - low) / step_a + 1e-9)) + 1
+        targets = [low + index * step_a for index in range(count)]
+        if targets[-1] < high - step_a * 1e-6:
+            targets.append(high)
+        peak = DP100Setpoint(ceiling, max(targets), int(float(params.get("preset_index", "1"))))
+        driver.configure_limits(
+            peak, ovp_v=float(params.get("ovp_v", "3.3")), ocp_a=float(params.get("ocp_a", ".028"))
+        )
+        records = []
+        try:
+            for target in targets:
+                if self.autotest_stop_event.is_set():
+                    raise RuntimeError("Laser I-V calibration stopped.")
+                driver.set_output(DP100Setpoint(ceiling, target, peak.preset_index), True)
+                if self.autotest_stop_event.wait(settle):
+                    raise RuntimeError("Laser I-V calibration stopped.")
+                deadline = time.monotonic() + timeout
+                attempts = 0
+                last_reading = None
+                last_error = None
+                voltage_limit_margin_v = .005
+                while not self.autotest_stop_event.is_set():
+                    attempts += 1
+                    remaining = deadline - time.monotonic()
+                    try:
+                        last_reading = driver.read_output(timeout=max(.05, min(1.0, remaining)))
+                        if last_reading.voltage_v > 0:
+                            current_limited = last_reading.voltage_v < ceiling - voltage_limit_margin_v
+                            # Below the voltage ceiling, the programmed current
+                            # limit defines the operating current even when the
+                            # UInt16-mA callback quantizes one count low.
+                            if current_limited or last_reading.current_a > 0:
+                                break
+                    except Exception as exc:
+                        last_error = exc
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or self.autotest_stop_event.wait(min(retry, remaining)):
+                        break
+                if self.autotest_stop_event.is_set():
+                    raise RuntimeError("Laser I-V calibration stopped.")
+                if (last_reading is None or last_reading.voltage_v <= 0 or
+                        (last_reading.voltage_v >= ceiling - voltage_limit_margin_v and
+                         last_reading.current_a <= 0)):
+                    read_text = (
+                        f"{last_reading.current_a * 1000:g} mA at {last_reading.voltage_v:g} V"
+                        if last_reading is not None else f"no valid callback ({last_error})"
+                    )
+                    hint = (
+                        " DP100 continued to report output OFF; check its output/load connection and DLL callback."
+                        if last_reading is not None and last_reading.current_a == 0 and last_reading.voltage_v == 0 else ""
+                    )
+                    raise RuntimeError(
+                        f"Laser I-V calibration could not reach {target * 1000:g} mA after "
+                        f"{attempts} readbacks in {timeout:g} s: DP100 read {read_text}.{hint}"
+                    )
+                current_limited = last_reading.voltage_v < ceiling - voltage_limit_margin_v
+                records.append({
+                    "target_current_a": target,
+                    "measured_current_a": last_reading.current_a,
+                    "effective_current_a": target if current_limited else last_reading.current_a,
+                    "measured_voltage_v": last_reading.voltage_v,
+                    "regulation_mode": "current_limit" if current_limited else "voltage_limit",
+                    "readback_attempts": attempts,
+                })
+        finally:
+            driver.set_output(DP100Setpoint(0, 0, peak.preset_index), False)
+
+        # Prefer exact current-limit points. Voltage-limit current readings are
+        # integer-mA measurements and only extend the curve when they add a new
+        # current coordinate. Enforce a monotonic voltage curve before linear
+        # interpolation so pulse voltages cannot reverse because of read noise.
+        curve_by_current = {}
+        for record in records:
+            current = float(record["effective_current_a"])
+            if current <= 0:
+                continue
+            key = round(current, 9)
+            candidate = (float(record["measured_voltage_v"]), record["regulation_mode"])
+            existing = curve_by_current.get(key)
+            if existing is None or (candidate[1] == "current_limit" and existing[1] != "current_limit"):
+                curve_by_current[key] = candidate
+        calibration = []
+        previous_voltage = 0.0
+        for current, (voltage, _mode) in sorted(curve_by_current.items()):
+            previous_voltage = max(previous_voltage, voltage)
+            calibration.append((current, previous_voltage))
+        cache[node_id] = calibration
+        artifact_dir = self.__dict__.get("_mapping_session_dir") or session_dir
+        if artifact_dir is not None:
+            with (artifact_dir / "laser_iv_calibration.csv").open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=records[0].keys())
+                writer.writeheader()
+                writer.writerows(records)
+            (artifact_dir / "laser_iv_calibration.json").write_text(json.dumps({
+                "node_id": node_id, "status": "done", "points": records,
+                "calibration_curve": [
+                    {"current_a": current, "voltage_v": voltage}
+                    for current, voltage in calibration
+                ],
+                "method": "DP100 current-limit/voltage-limit classified sweep with monotonic I-to-V interpolation",
+                "current_readback_resolution_a": .001,
+                "voltage_limit_margin_v": .005,
+                "readback_timeout_s": timeout, "readback_interval_s": retry,
+            }, indent=2), encoding="utf-8")
+        if artifact_dir is not None:
+            from matplotlib.figure import Figure
+            from .mapping_plot import draw_laser_calibration_figure
+            calibration_figure = Figure(figsize=(9, 4.2), dpi=120)
+            draw_laser_calibration_figure(calibration_figure, records, calibration)
+            calibration_figure.savefig(artifact_dir / "laser_iv_pv_calibration.png", dpi=160)
+        result_queue = self.__dict__.get("result_queue")
+        if result_queue is not None:
+            result_queue.put(("mapping_laser_calibration", records, calibration))
+        return calibration, records
+
+    @staticmethod
+    def _virtual_mask_calibration_params(settings, step):
+        source_id = str(step.params.get("_input_calibration_source", "")).strip()
+        source_step = next((
+            candidate for index, candidate in enumerate(settings.measurement_flow or ())
+            if step_node_id(candidate, index) == source_id
+        ), None) if source_id else None
+        if source_step is not None and source_step.type_id != "laser_iv_calibration":
+            raise ValueError("Virtual Mask calibration input must come from a DP100 Laser I-V Calibration node.")
+        params = dict(source_step.params) if source_step is not None else {}
+        mask_id = str(step.params.get("_node_id", "virtual_mask"))
+        params.setdefault("_node_id", source_id or f"{mask_id}_power_calibration")
+        for key, value in {
+            "calibration_voltage_v": "3.3",
+            "calibration_current_min_a": "0.001",
+            "calibration_current_max_a": "0.025",
+            "calibration_current_step_a": "0.001",
+            "calibration_settle_ms": "100",
+            "readback_timeout_s": "2.0",
+            "readback_interval_ms": "100",
+            "ovp_v": "3.3",
+            "ocp_a": "0.025",
+            "preset_index": "1",
+        }.items():
+            params.setdefault(key, value)
+        return params
+
+    def _run_laser_iv_calibration(self, point, params, session_dir):
+        calibration, records = self._get_or_run_laser_calibration(params, session_dir)
+        payload = {
+            "device": {"name": point.name, "row": point.row, "col": point.col, "order": point.order},
+            "status": "done", "calibration": [
+                {"current_a": current, "voltage_v": voltage} for current, voltage in calibration
+            ],
+            "statistics": {
+                "calibration_points": len(calibration),
+                "minimum_current_a": calibration[0][0],
+                "maximum_current_a": calibration[-1][0],
+            },
+            "readbacks": records,
+        }
+        (session_dir / "laser_iv_calibration_result.json").write_text(
+            json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8"
+        )
+        return payload
+
+    def _prepare_calibrated_laser_suite(self, light_step, measurement_step, session_dir):
+        params = dict(light_step.params)
+        calibration, _records = self._get_or_run_laser_calibration(params, session_dir)
+        points, events = calibrated_response_program(params, calibration)
+        params["waveform_points"] = serialize_waveform_points(points)
+        params["count"] = "1"
+        artifact_dir = self.__dict__.get("_mapping_session_dir") or session_dir
+        if artifact_dir is not None:
+            (artifact_dir / "laser_response_program.json").write_text(json.dumps({
+                "node_id": params.get("_node_id", "calibrated_laser_suite"),
+                "duration_s": points[-1].time_ms / 1000, "events": events,
+            }, indent=2), encoding="utf-8")
+        measurement_params = dict(measurement_step.params)
+        if str(measurement_params.get("duration_s", "auto")).strip().lower() == "auto":
+            measurement_params["duration_s"] = f"{points[-1].time_ms / 1000 + .05:g}"
+        return replace(light_step, params=params), replace(measurement_step, params=measurement_params)
+
+    @staticmethod
+    def _pulse_feature_metrics(samples, events, phase):
+        responses = []
+        event_results = []
+        for event in events:
+            start = float(event["start_ms"]) / 1000
+            end = start + float(event["width_ms"]) / 1000
+            on = [sample.current_a for sample in samples if start <= sample.elapsed_s <= end]
+            baseline_start = max(0.0, start - min(.2, start))
+            baseline = [sample.current_a for sample in samples if baseline_start <= sample.elapsed_s < start]
+            if not on or not baseline:
+                continue
+            on_mean = statistics.fmean(on)
+            baseline_mean = statistics.fmean(baseline)
+            response = on_mean - baseline_mean
+            responses.append(abs(response))
+            event_results.append({**event, "baseline_current_a": baseline_mean,
+                                  "pulse_current_a": on_mean, "response_a": response})
+        metrics = {
+            "max_pulse_response_a": max(responses) if responses else None,
+            "mean_pulse_response_a": statistics.fmean(responses) if responses else None,
+            "analyzed_pulse_count": len(responses),
+        }
+        if len(event_results) >= 2:
+            x = [
+                float(item["target_power_mw"]) if phase == "power" else float(item["width_ms"]) / 1000
+                for item in event_results
+            ]
+            y = [abs(float(item["response_a"])) for item in event_results]
+            x_mean, y_mean = statistics.fmean(x), statistics.fmean(y)
+            denominator = sum((value - x_mean) ** 2 for value in x)
+            slope = sum((a - x_mean) * (b - y_mean) for a, b in zip(x, y)) / denominator if denominator else None
+            metrics["power_sensitivity_a_per_mw" if phase == "power" else "width_sensitivity_a_per_s"] = slope
+        return metrics, event_results
+
+    def _run_calibrated_pulse_test(self, point, settings, params, session_dir, phase):
+        source_id = str(params.get("_input_calibration_source", "")).strip()
+        calibration = self.__dict__.get("_mapping_laser_calibrations", {}).get(source_id)
+        if calibration is None:
+            raise RuntimeError("Calibration input is unavailable; connect and execute a Laser I-V Calibration node first.")
+        source_step = next(
+            (step for index, step in enumerate(settings.measurement_flow)
+             if step_node_id(step, index) == source_id), None
+        )
+        source_params = dict(source_step.params) if source_step is not None else {}
+        program_params = {**source_params, **params, "response_phase": phase}
+        points, events = calibrated_response_program(program_params, calibration)
+        artifact_dir = self.__dict__.get("_mapping_session_dir") or session_dir
+        program_name = f"laser_response_program_{phase}.json"
+        if artifact_dir is not None:
+            (artifact_dir / program_name).write_text(json.dumps({
+                "node_id": params.get("_node_id", f"{phase}_gradient_response"),
+                "phase": phase, "duration_s": points[-1].time_ms / 1000, "events": events,
+            }, indent=2), encoding="utf-8")
+        light_params = {
+            **program_params, "waveform_points": serialize_waveform_points(points), "count": "1",
+            "peak_voltage_v": f"{max(item.voltage_v for item in points):g}",
+            "peak_current_a": f"{max(item.current_a for item in points):g}",
+            "ovp_v": source_params.get("ovp_v", "3.3"), "ocp_a": source_params.get("ocp_a", ".028"),
+            "final_state": "off", "preset_index": source_params.get("preset_index", "1"),
+        }
+        measurement_params = {
+            **params, "duration_s": f"{points[-1].time_ms / 1000 + .05:g}",
+            "trigger_delay_ms": "0",
+        }
+        gate = threading.Event()
+        light_started = threading.Event()
+        light_timing = {}
+        self._mapping_light_start_gate = gate
+        self._mapping_light_started_event = light_started
+        self._mapping_light_timing = light_timing
+        light_errors = []
+        driver = self._get_dp100_driver()
+        self._mapping_laser_used = True
+
+        def run_light():
+            try:
+                gate.wait()
+                light_timing["epoch"] = time.monotonic()
+                light_started.set()
+                run_dp100_waveform(driver, light_params, stop_event=self.autotest_stop_event)
+            except Exception as exc:
+                light_errors.append(exc)
+                light_started.set()
+
+        worker = threading.Thread(target=run_light, name=f"autotest-{phase}-pulse", daemon=True)
+        worker.start()
+        try:
+            payload, samples, result_path = self._run_autotest_photo_transient(
+                point, measurement_params, session_dir,
+                hold_during_mapping=parse_bool(params.get("hold_during_mapping", "true")),
+            )
+        finally:
+            gate.set()
+            worker.join()
+            self.__dict__.pop("_mapping_light_start_gate", None)
+            self.__dict__.pop("_mapping_light_started_event", None)
+            self.__dict__.pop("_mapping_light_timing", None)
+        if light_errors:
+            raise RuntimeError(f"Laser {phase} waveform failed: {light_errors[0]}") from light_errors[0]
+        metrics, event_results = self._pulse_feature_metrics(samples, events, phase)
+        payload["statistics"].update(metrics)
+        payload.update(response_phase=phase, pulse_events=event_results, laser_program_file=program_name)
+        result_path.write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
+        return payload
 
     @staticmethod
     def _autotest_uses_combined_hp6614c_plot(settings: AutoTestSettings) -> bool:
@@ -8965,8 +10194,79 @@ class ProbeApp(tk.Tk):
         )
         return first_hp_step is step
 
-    def _execute_autotest_flow_step(self, point: AutoTestPoint, settings: AutoTestSettings, step: AutoTestFlowStep, session_dir: Path | None, cv2_module) -> None:
+    def _workflow_capture(self):
+        local = self.__dict__.get("_workflow_local")
+        return getattr(local, "capture", None) if local is not None else None
+
+    def _workflow_sample(self, sample):
+        capture = self._workflow_capture()
+        if capture is not None:
+            capture.sample(sample)
+
+    def _execute_autotest_flow_step(self, point, settings, step, session_dir, cv2_module):
+        if point is None or settings is None:
+            return self._execute_autotest_flow_step_scoped(point, settings, step, session_dir, cv2_module)
+        local = self.__dict__.setdefault("_workflow_local", threading.local())
+        previous = getattr(local, "capture", None)
+        index = next((i for i, candidate in enumerate(settings.measurement_flow) if candidate is step), 0)
+        capture = NodeCapture(step_node_id(step, index), step.type_id,
+            self.__dict__.get("_workflow_run_id", str(session_dir or "manual")), point, self.result_queue,
+            any(node.type_id == "plot_panel" for node in settings.measurement_flow),
+            sweep_mode=step.params.get("sweep_mode", "voltage"))
+        local.capture = capture
+        local.failed_result = None
+        try:
+            payload = self._execute_autotest_flow_step_scoped(point, settings, step, session_dir, cv2_module)
+            if not isinstance(payload, dict):
+                payload = getattr(capture, "analysis", {})
+            return capture.result(payload, "incomplete" if self.autotest_stop_event.is_set() else "done")
+        except Exception as exc:
+            local.failed_result = capture.result({"errors": [str(exc)]}, "failed")
+            raise
+        finally:
+            capture.publish(force=True)
+            local.capture = previous
+
+    def _execute_autotest_flow_step_scoped(self, point: AutoTestPoint, settings: AutoTestSettings, step: AutoTestFlowStep, session_dir: Path | None, cv2_module) -> None:
+        if not isinstance(settings, MappingSettings):
+            return self._execute_autotest_flow_step_impl(point, settings, step, session_dir, cv2_module)
+        if (step.type_id == "laser_output" and parse_bool(step.params.get("mapping_once", "false")) and
+                step.params.get("_node_id", "laser_output") in self._mapping_once_nodes):
+            return None
+        if step.type_id == "wobb_test":
+            raise ValueError("WobbTest cannot move probes during fixed-Z Wire-bond Test.")
+        if session_dir is None:
+            raise RuntimeError("Mapping workflow needs a result directory.")
+        index = next((i for i, candidate in enumerate(settings.measurement_flow) if candidate is step), 0)
+        node_id = self._safe_autotest_name(step_node_id(step, index))
+        base = session_dir / "nodes" / node_id
+        node_dir = base
+        visit = 1
+        while node_dir.exists():
+            visit += 1
+            node_dir = base.with_name(f"{node_id}_visit_{visit}")
+        node_dir.mkdir(parents=True)
+        for kind in ("iv", "images", "hp6614c", "b1500", "current"):
+            (node_dir / kind).mkdir()
+        record = {"node_id": node_id, "type_id": step.type_id, "params": dict(step.params),
+                  "status": "running", "point": point.name, "coordinate_frame": "logical_stage_xy_um",
+                  "stage_x_um": point.stage_x_um, "stage_y_um": point.stage_y_um}
+        record_path = node_dir / "execution.json"
+        record_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+        try:
+            payload = self._execute_autotest_flow_step_impl(point, settings, step, node_dir, cv2_module)
+            record["status"] = "incomplete" if self.autotest_stop_event.is_set() else "done"
+        except Exception as exc:
+            record.update(status="failed", error=str(exc))
+            raise
+        finally:
+            record_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+        return payload
+
+    def _execute_autotest_flow_step_impl(self, point, settings, step, session_dir, cv2_module):
         params = dict(step.params)
+        if step.type_id in {"workflow_start", "workflow_end"}:
+            return
         if step.type_id == "wait":
             duration = max(0.0, float(params.get("duration_s", "0")))
             reason = params.get("reason", "Settle")
@@ -8979,15 +10279,32 @@ class ProbeApp(tk.Tk):
             return
         if step.type_id == "iv":
             configs = iv_sweep_configs_from_params(params)
-            self._run_autotest_iv_sweep(point, settings, configs, session_dir, params)
+            return self._run_autotest_iv_sweep(point, settings, configs, session_dir, params)
+            return
+        if step.type_id == "constant_current":
+            hold = isinstance(settings, MappingSettings) and parse_bool(params.get("hold_during_mapping", "false"))
+            return self._run_autotest_constant_current(point, params, session_dir, hold_during_mapping=hold)
+            return
+        if step.type_id == "laser_iv_calibration":
+            return self._run_laser_iv_calibration(point, params, session_dir)
+            return
+        if step.type_id in {"photo_power_steps", "photo_width_steps"}:
+            if not isinstance(settings, MappingSettings):
+                raise ValueError("Calibrated gradient pulse tests currently require Wire-bond Mapping.")
+            phase = "power" if step.type_id == "photo_power_steps" else "width"
+            return self._run_calibrated_pulse_test(point, settings, params, session_dir, phase)
+            return
+        if step.type_id == "photo_transient":
+            hold = isinstance(settings, MappingSettings) and parse_bool(params.get("hold_during_mapping", "true"))
+            return self._run_autotest_photo_transient(point, params, session_dir, hold_during_mapping=hold)[0]
             return
         if step.type_id == "wobb_test":
-            self._run_autotest_wobb_test(point, settings, params, session_dir)
+            return self._run_autotest_wobb_test(point, settings, params, session_dir)
             return
         if step.type_id == "hp6614c_transfer":
             config = hp6614c_sweep_config_from_params(params, test_type=HP6614C_TEST_TRANSFER)
             heatmap_metric, heatmap_values = self._autotest_combined_hp6614c_heatmap(settings)
-            self._run_autotest_hp6614c_sweep(
+            return self._run_autotest_hp6614c_sweep(
                 point,
                 config,
                 session_dir,
@@ -9000,7 +10317,7 @@ class ProbeApp(tk.Tk):
         if step.type_id == "hp6614c_output":
             config = hp6614c_sweep_config_from_params(params, test_type=HP6614C_TEST_OUTPUT)
             heatmap_metric, heatmap_values = self._autotest_combined_hp6614c_heatmap(settings)
-            self._run_autotest_hp6614c_sweep(
+            return self._run_autotest_hp6614c_sweep(
                 point,
                 config,
                 session_dir,
@@ -9012,13 +10329,321 @@ class ProbeApp(tk.Tk):
             return
         if step.type_id == "b1500_transfer":
             config = b1500_config_from_params(params, test_type=B1500_TEST_TRANSFER)
-            self._run_autotest_b1500_sweep(point, settings, config, session_dir)
+            return self._run_autotest_b1500_sweep(point, settings, config, session_dir)
             return
         if step.type_id == "b1500_output":
             config = b1500_config_from_params(params, test_type=B1500_TEST_OUTPUT)
-            self._run_autotest_b1500_sweep(point, settings, config, session_dir)
+            return self._run_autotest_b1500_sweep(point, settings, config, session_dir)
+            return
+        if step.type_id == "photo_iv":
+            configs = iv_sweep_configs_from_params(params)
+            return self._run_autotest_iv_sweep(point, settings, configs, session_dir, params)
+            return
+        if step.type_id == "laser_output":
+            once = isinstance(settings, MappingSettings) and parse_bool(params.get("mapping_once", "false"))
+            node_key = params.get("_node_id", "laser_output")
+            if once and node_key in self._mapping_once_nodes:
+                self.result_queue.put(("autotest_status", "DP100 constant drive retained from the first mapping point."))
+                return
+            driver = self._get_dp100_driver()
+            if isinstance(settings, MappingSettings):
+                self._mapping_laser_used = True
+            setpoint = DP100Setpoint(
+                float(params.get("peak_voltage_v", DEFAULT_LASER_PARAMS["peak_voltage_v"])),
+                float(params.get("peak_current_a", DEFAULT_LASER_PARAMS["peak_current_a"])),
+                int(float(params.get("preset_index", "1"))),
+            )
+            enabled = str(params.get("output_state", "on")).lower() == "on"
+            driver.configure_limits(setpoint, ovp_v=float(params.get("ovp_v", DEFAULT_LASER_PARAMS["ovp_v"])), ocp_a=float(params.get("ocp_a", DEFAULT_LASER_PARAMS["ocp_a"])))
+            driver.set_output(setpoint, enabled)
+            if once:
+                self._mapping_once_nodes.add(node_key)
+            settle = float(params.get("settle_s", "0"))
+            if settle > 0:
+                self.autotest_stop_event.wait(settle)
+            self.result_queue.put(("autotest_status", f"DP100 {'ON' if enabled else 'OFF'}: {setpoint.voltage_v:g} V / {setpoint.current_a:g} A"))
+            return
+        if step.type_id == "virtual_mask":
+            if not isinstance(settings, MappingSettings):
+                raise ValueError("Virtual Mask Illumination is only available in Wire-bond Mapping.")
+            intensity = point.normalized_intensity
+            target_power = point.target_power_mw
+            if intensity is None or target_power is None:
+                raise RuntimeError("This mapping point has no virtual-mask intensity.")
+            calibration_params = self._virtual_mask_calibration_params(settings, step)
+            calibration, _records = self._get_or_run_laser_calibration(calibration_params, session_dir)
+            setpoint = calibrated_power_setpoint(
+                float(target_power), calibration,
+                preset_index=int(float(calibration_params.get("preset_index", "1"))),
+            )
+            driver = self._get_dp100_driver()
+            self._mapping_laser_used = True
+            output_enabled = setpoint.voltage_mv > 0 and setpoint.current_ma > 0 and target_power > 0
+            if output_enabled and not self.__dict__.get("_mapping_virtual_mask_dp100_configured", False):
+                driver.configure_limits(
+                    setpoint,
+                    ovp_v=float(calibration_params.get("ovp_v", "3.3")),
+                    ocp_a=float(calibration_params.get("ocp_a", "0.025")),
+                )
+                self._mapping_virtual_mask_dp100_configured = True
+            output_key = (setpoint.voltage_mv, setpoint.current_ma, output_enabled)
+            command_sent = output_key != self.__dict__.get("_mapping_virtual_mask_last_output")
+            if command_sent:
+                driver.set_output(setpoint, output_enabled)
+                self._mapping_virtual_mask_last_output = output_key
+            settle = float(params.get("settle_s", ".05"))
+            if settle > 0:
+                self.autotest_stop_event.wait(settle)
+            applied_power = float(target_power) if output_enabled else 0.0
+            payload = {
+                "device": {"name": point.name},
+                "target_power_mw": target_power, "applied_power_mw": applied_power,
+                "normalized_intensity": intensity,
+                "drive_voltage_v": setpoint.voltage_v,
+                "drive_current_limit_a": setpoint.current_a, "output_enabled": output_enabled,
+                "dp100_command_sent": command_sent,
+                "power_model": "measured DP100 electrical P-V calibration; no optical-power calibration",
+                "calibration_node": calibration_params.get("_node_id"),
+                "mask_pixel": {"x": point.mask_pixel_x, "y": point.mask_pixel_y},
+                "coordinates": {
+                    "stage_um": {"x": point.stage_x_um, "y": point.stage_y_um},
+                    "gds": None if point.layout_u is None else {"u": point.layout_u, "v": point.layout_v},
+                },
+            }
+            if session_dir is not None:
+                folder = session_dir / "virtual_mask"
+                folder.mkdir(parents=True, exist_ok=True)
+                (folder / "point.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            minimum_power = calibration[0][0] * calibration[0][1] * 1000.0
+            output_text = (
+                f"{setpoint.voltage_v:g} V with {setpoint.current_a * 1000:g} mA limit"
+                if output_enabled else f"OFF (target below calibrated minimum {minimum_power:g} mW)"
+            )
+            self.result_queue.put(("autotest_status", f"Virtual mask: {intensity * 100:.1f}% gray, target {target_power:g} mW, DP100 {output_text}"))
+            return payload
+        if step.type_id == "laser_pulse":
+            driver = self._get_dp100_driver()
+            if isinstance(settings, MappingSettings):
+                self._mapping_laser_used = True
+            if params.get("program") == "calibrated_response_suite":
+                gate = self.__dict__.get("_mapping_light_start_gate")
+                if gate is not None:
+                    gate.wait()
+            run_dp100_waveform(driver, params, stop_event=self.autotest_stop_event)
             return
         self.result_queue.put(("autotest_status", f"{step.type_id} step placeholder at {point.name}."))
+
+    @staticmethod
+    def _constant_current_node_config(params):
+        from .temt6000 import TEMT6000Response, is_temt6000
+        if is_temt6000(params):
+            TEMT6000Response.from_params(params)
+        count = float(params.get("sample_count", "5"))
+        settle = float(params.get("settle_s", "0.2"))
+        if not math.isfinite(count) or not count.is_integer():
+            raise ValueError("Fixed-bias sample count must be an integer.")
+        if not math.isfinite(settle) or settle < 0:
+            raise ValueError("Bias settle time must be finite and nonnegative.")
+        parse_bool(params.get("hold_during_mapping", "false"))
+        parse_bool(params.get("verify_bias", "false"))
+        return replace(constant_voltage_current_config_from_params(params), output_off_after=True), settle
+
+    def _run_autotest_constant_current(self, point, params, session_dir, *, hold_during_mapping=False):
+        from .mapping import make_point_result
+        from .temt6000 import TEMT6000Response, is_temt6000
+        config, settle = self._constant_current_node_config(params)
+        optical = TEMT6000Response.from_params(params) if is_temt6000(params) else None
+        if session_dir is None:
+            raise RuntimeError("Fixed-bias measurement needs a result directory.")
+        folder = session_dir / "current"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{self._safe_autotest_name(point.name)}.csv"
+        suffix = 1
+        while path.exists():
+            suffix += 1
+            path = folder / f"{self._safe_autotest_name(point.name)}_{suffix}.csv"
+        cached = self._mapping_held_current.get(config.resource_name) if hold_during_mapping else None
+        if cached is not None and cached[0] != config:
+            raise ValueError("Cannot change 2450 settings while its mapping bias is held.")
+        runner = cached[1] if cached is not None else Keithley2450IVRunner()
+        samples = []
+        errors = []
+        try:
+            with path.open("x", newline="", encoding="utf-8") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(["index", "elapsed_s", "voltage_v", "current_a", "raw"])
+                stream.flush()
+                def on_sample(sample):
+                    samples.append(sample)
+                    self._workflow_sample(sample)
+                    writer.writerow([sample.index, sample.elapsed_s, sample.voltage_v, sample.current_a, sample.raw])
+                    if not self.__dict__.get("_mapping_fast_mode", False):
+                        stream.flush()
+                    if not math.isfinite(sample.current_a) or abs(sample.current_a) >= 9e36:
+                        raise ValueError("Invalid/overrange current reading.")
+                    sink = self.__dict__.get("_mapping_sample_sink")
+                    if sink is not None:
+                        sink(sample, params.get("_node_id", "constant_current"))
+                    if parse_bool(params.get("verify_bias", "false")) and (
+                        not math.isfinite(sample.voltage_v) or
+                        abs(sample.voltage_v - config.voltage_v) > max(0.05, abs(config.voltage_v) * 0.05)
+                    ):
+                        raise RuntimeError(f"Fixed bias not maintained: requested {config.voltage_v:g} V, measured {sample.voltage_v:g} V. Check current compliance and wiring; this point is not a valid fixed-bias response.")
+                if not self.autotest_stop_event.is_set():
+                    if cached is None:
+                        if hold_during_mapping:
+                            self._mapping_held_current[config.resource_name] = (config, runner)
+                        runner.begin_constant_voltage_current(config)
+                    if not self.autotest_stop_event.wait(settle if cached is None else 0):
+                        runner.sample_constant_voltage_current(stop_requested=self.autotest_stop_event.is_set, on_sample=on_sample)
+                    if not self.autotest_stop_event.is_set() and len(samples) != config.sample_count:
+                        raise RuntimeError("Instrument returned an incomplete sample batch.")
+        except Exception as exc:
+            errors.append(str(exc))
+        finally:
+            try:
+                if not hold_during_mapping:
+                    runner.end_constant_voltage_current(strict=True)
+            except Exception as exc:
+                errors.append(f"Output cleanup failed: {exc}")
+            result = make_point_result(point, None, samples, "failed" if errors else "incomplete" if self.autotest_stop_event.is_set() else "done")
+            statistics = {"mean_current_a": result.mean_current_a, "std_current_a": result.std_current_a}
+            optical_data = {}
+            if optical is not None:
+                irradiance = optical.irradiance(result.mean_current_a) if result.status == "done" else None
+                statistics["estimated_irradiance_w_m2"] = irradiance
+                optical_data = {"optical_response": {**optical.metadata(),
+                    "status": "estimated" if irradiance is not None else "unavailable: incomplete or negative net current"}}
+            path.with_suffix(".json").write_text(json.dumps({
+                "device": {"name": point.name, "row": point.row, "col": point.col, "order": point.order},
+                "measurement": dict(config.__dict__), "status": result.status, "errors": errors,
+                "bias_lifetime": "mapping" if hold_during_mapping else "node",
+                "statistics": statistics, **optical_data,
+                "sample_count": len(samples), "csv_file": path.name,
+            }, indent=2, allow_nan=False), encoding="utf-8")
+        if errors:
+            raise RuntimeError("; ".join(errors))
+        return {"statistics": statistics, "status": result.status, "errors": errors, **optical_data}
+
+    def _run_autotest_photo_transient(self, point, params, session_dir, *, hold_during_mapping=False):
+        if session_dir is None:
+            raise RuntimeError("Photo transient measurement needs a result directory.")
+        duration = float(params.get("duration_s", "5"))
+        interval = float(params.get("sample_interval_ms", "10")) / 1000
+        trigger_delay = float(params.get("trigger_delay_ms", "0")) / 1000
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError("Photo transient duration must be finite and positive.")
+        if not math.isfinite(interval) or interval <= 0:
+            raise ValueError("Photo transient sample interval must be finite and positive.")
+        if not math.isfinite(trigger_delay) or trigger_delay < 0:
+            raise ValueError("Photo transient trigger delay must be finite and nonnegative.")
+        config_params = dict(params)
+        config_params.update(voltage_v=params.get("bias_v", ".1"), sample_count="1")
+        config = replace(constant_voltage_current_config_from_params(config_params), output_off_after=True)
+        cached = self._mapping_held_current.get(config.resource_name) if hold_during_mapping else None
+        if cached is not None and cached[0] != config:
+            raise ValueError("Cannot change 2450 settings while its mapping bias is held.")
+        runner = cached[1] if cached is not None else Keithley2450IVRunner()
+        folder = session_dir / "photo_transient"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{self._safe_autotest_name(point.name)}.csv"
+        samples: list[IVSweepSample] = []
+        errors: list[str] = []
+        started = time.monotonic()
+        gate = self.__dict__.get("_mapping_light_start_gate")
+        warmup_discarded = False
+        try:
+            if cached is None:
+                if hold_during_mapping:
+                    self._mapping_held_current[config.resource_name] = (config, runner)
+                runner.begin_constant_voltage_current(config)
+            if trigger_delay:
+                self.autotest_stop_event.wait(trigger_delay)
+            if gate is not None:
+                # Prime the 2450 before releasing the laser. The first VISA read
+                # can take over a second after configuration and would otherwise
+                # consume the beginning of the pulse program.
+                warmup = runner.sample_constant_voltage_current(stop_requested=self.autotest_stop_event.is_set)
+                if not warmup:
+                    raise RuntimeError("2450 warm-up read returned no sample before laser synchronization.")
+                warmup_discarded = True
+                gate.set()
+                light_started = self.__dict__.get("_mapping_light_started_event")
+                if light_started is not None and not light_started.wait(1.0):
+                    raise RuntimeError("Laser waveform did not acknowledge the synchronized start gate.")
+                timing = self.__dict__.get("_mapping_light_timing", {})
+                started = float(timing.get("epoch", time.monotonic()))
+            else:
+                started = time.monotonic()
+            deadline = started + duration
+            next_sample = started
+            with path.open("x", newline="", encoding="utf-8") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(["index", "elapsed_s", "voltage_v", "current_a", "raw"])
+                while not self.autotest_stop_event.is_set() and time.monotonic() < deadline:
+                    wait_s = next_sample - time.monotonic()
+                    if wait_s > 0 and self.autotest_stop_event.wait(wait_s):
+                        break
+                    batch = runner.sample_constant_voltage_current(stop_requested=self.autotest_stop_event.is_set)
+                    if not batch:
+                        break
+                    sample = replace(batch[0], index=len(samples) + 1, elapsed_s=time.monotonic() - started)
+                    if not math.isfinite(sample.current_a) or abs(sample.current_a) >= 9e36:
+                        raise ValueError("Invalid/overrange transient current reading.")
+                    if parse_bool(params.get("verify_bias", "true")) and (
+                            not math.isfinite(sample.voltage_v) or
+                            abs(sample.voltage_v - config.voltage_v) > max(.05, abs(config.voltage_v) * .05)):
+                        raise RuntimeError(f"Transient bias not maintained: requested {config.voltage_v:g} V, measured {sample.voltage_v:g} V.")
+                    samples.append(sample)
+                    self._workflow_sample(sample)
+                    writer.writerow([sample.index, sample.elapsed_s, sample.voltage_v, sample.current_a, sample.raw])
+                    sink = self.__dict__.get("_mapping_sample_sink")
+                    if sink is not None:
+                        sink(sample, params.get("_node_id", "photo_transient"))
+                    next_sample += interval
+                stream.flush()
+        except Exception as exc:
+            errors.append(str(exc))
+        finally:
+            if not hold_during_mapping:
+                try:
+                    runner.end_constant_voltage_current(strict=True)
+                except Exception as exc:
+                    errors.append(f"Output cleanup failed: {exc}")
+        currents = [sample.current_a for sample in samples]
+        statistics_payload = {
+            "response_amplitude_a": max(currents) - min(currents) if currents else None,
+            "peak_current_a": max(currents) if currents else None,
+            "baseline_current_a": min(currents) if currents else None,
+            "mean_current_a": (sum(currents) / len(currents)) if currents else None,
+            "sample_count": len(currents),
+        }
+        status = "failed" if errors else "incomplete" if self.autotest_stop_event.is_set() else "done"
+        payload = {
+            "device": {"name": point.name, "row": point.row, "col": point.col, "order": point.order},
+            "measurement": {**dict(config.__dict__), "duration_s": duration, "sample_interval_ms": interval * 1000},
+            "status": status, "errors": errors, "statistics": statistics_payload,
+            "csv_file": path.name, "bias_lifetime": "mapping" if hold_during_mapping else "node",
+            "time_alignment": {
+                "reference": "laser waveform start gate" if gate is not None else "acquisition start",
+                "keithley_warmup_sample_discarded": warmup_discarded,
+                "first_sample_latency_s": samples[0].elapsed_s if samples else None,
+            },
+        }
+        result_path = path.with_suffix(".json")
+        result_path.write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
+        if errors:
+            raise RuntimeError("; ".join(errors))
+        return payload, samples, result_path
+
+    def _get_dp100_driver(self) -> DP100Driver:
+        driver = getattr(self, "_dp100_driver", None)
+        if driver is None:
+            driver = DP100Driver()
+            if not driver.connect():
+                raise RuntimeError("ATK-DP100 connection failed.")
+            self._dp100_driver = driver
+        return driver
 
     def _execute_autotest_measurement_steps(self, point: AutoTestPoint, steps: tuple[str, ...], session_dir: Path | None, cv2_module) -> None:
         for step in steps:
@@ -9081,6 +10706,7 @@ class ProbeApp(tk.Tk):
             message = f"WobbTest completed at {point.name}: {len(records)} sample(s){suffix}."
         self.result_queue.put(("wobb_test_done", point.name, message))
         self.result_queue.put(("autotest_status", message))
+        return {"statistics": {"best_current_a": best.get("score_current_a") if best else None}}
 
     def _run_autotest_z_wobb_scan(
         self,
@@ -9236,7 +10862,9 @@ class ProbeApp(tk.Tk):
             if target_y is not None:
                 payload["target_y_pulses"] = int(target_y)
             records.append(payload)
-            self.result_queue.put(("wobb_test_sample", point.name, payload))
+            self._workflow_sample(payload)
+            if self._workflow_capture() is None or not self._workflow_capture().plot:
+                self.result_queue.put(("wobb_test_sample", point.name, payload))
 
         runner.run_constant_voltage_current(
             bias_config,
@@ -9313,7 +10941,7 @@ class ProbeApp(tk.Tk):
                     "csv_file": output_path.name,
                     "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                     "device": {"name": point.name, "order": point.order, "row": point.row, "col": point.col},
-                    "coordinates": {"gds": {"u": point.u, "v": point.v}, "stage_um": {"x": point.stage_x_um, "y": point.stage_y_um}},
+                    "coordinates": {"gds": None if isinstance(point, MappingPoint) else {"u": point.u, "v": point.v}, "stage_um": {"x": point.stage_x_um, "y": point.stage_y_um}},
                     "parameters": dict(params),
                     "sample_count": len(records),
                 },
@@ -9359,34 +10987,43 @@ class ProbeApp(tk.Tk):
             if self.autotest_stop_event.is_set():
                 break
             runner = Keithley2450IVRunner()
+            if isinstance(settings, MappingSettings) and not config.output_off_after:
+                self._mapping_bias_runners[config.resource_name] = runner
             curve_label = f"Vtop={config.stop:g}" if len(configs) > 1 else config.scan_type
+            samples = []
 
             def handle_sample(sample: IVSweepSample, label: str = curve_label, index: int = curve_index) -> None:
+                samples.append(sample)
+                sink = self.__dict__.get("_mapping_sample_sink")
+                if sink is not None:
+                    sink(sample, params.get("_node_id", "iv"))
                 payload = sample.to_dict()
                 payload["point_name"] = point.name
                 payload["curve_label"] = label
                 payload["curve_index"] = index
                 payload["curve_total"] = len(configs)
-                self.result_queue.put(("iv_sample", point.name, payload))
+                self._workflow_sample(payload)
+                if self._workflow_capture() is None or not self._workflow_capture().plot:
+                    self.result_queue.put(("iv_sample", point.name, payload))
 
             self.result_queue.put(("autotest_status", f"IV sweep {curve_index}/{len(configs)} at {point.name}: {config.summary()}"))
-            samples = runner.run_sweep(
-                config,
-                stop_requested=self.autotest_stop_event.is_set,
-                on_sample=handle_sample,
-            )
-            statistics = calculate_iv_statistics(samples, config)
-            latest_statistics = statistics
-            total_samples += len(samples)
-            if session_dir is not None:
-                output_path = self._autotest_iv_output_path(session_dir, point, config, multi_vtop=len(configs) > 1)
-                self._write_iv_samples_csv(output_path, point, config, samples, statistics)
-                output_paths.append(output_path)
+            try:
+                options = {"strict_cleanup": True} if isinstance(settings, MappingSettings) else {}
+                samples = runner.run_sweep(config, stop_requested=self.autotest_stop_event.is_set, on_sample=handle_sample, **options)
+            finally:
+                statistics = calculate_iv_statistics(samples, config)
+                latest_statistics = statistics
+                total_samples += len(samples)
+                if session_dir is not None:
+                    output_path = self._autotest_iv_output_path(session_dir, point, config, multi_vtop=len(configs) > 1)
+                    self._write_iv_samples_csv(output_path, point, config, samples, statistics)
+                    output_paths.append(output_path)
         output_payload: Path | tuple[Path, ...] | None = None
         if output_paths:
             output_payload = tuple(output_paths) if len(output_paths) > 1 else output_paths[0]
         statistics_payload = latest_statistics.to_dict() if latest_statistics is not None else None
         self.result_queue.put(("iv_done", point.name, total_samples, output_payload, statistics_payload, point.row, point.col, self.autotest_grid_rows, self.autotest_grid_cols))
+        return {"statistics": statistics_payload or {}}
 
     def _run_autotest_hp6614c_sweep(
         self,
@@ -9429,7 +11066,8 @@ class ProbeApp(tk.Tk):
             if not stopped and config.test_type == HP6614C_TEST_OUTPUT:
                 iv_config = self._hp6614c_output_iv_config(config)
                 drain_runner = Keithley2450IVRunner()
-                drain_runner.begin_sweep(iv_config)
+                options = {"strict_cleanup": True} if isinstance(point, MappingPoint) else {}
+                drain_runner.begin_sweep(iv_config, **options)
                 for curve_index, vg in enumerate(config.bias_values_v, start=1):
                     if self.autotest_stop_event.is_set():
                         break
@@ -9451,7 +11089,9 @@ class ProbeApp(tk.Tk):
                             programmed_gate_voltage_v=programmed_vg,
                         )
                         records.append(record)
-                        self.result_queue.put(("hp6614c_sweep_sample", point.name, record))
+                        self._workflow_sample(record)
+                        if self._workflow_capture() is None or not self._workflow_capture().plot:
+                            self.result_queue.put(("hp6614c_sweep_sample", point.name, record))
 
                     samples = drain_runner.sample_sweep(
                         samples_per_point=config.sample_count,
@@ -9507,7 +11147,9 @@ class ProbeApp(tk.Tk):
                                 gate_total=len(gate_values),
                             )
                             records.append(record)
-                            self.result_queue.put(("hp6614c_sweep_sample", point.name, record))
+                            self._workflow_sample(record)
+                            if self._workflow_capture() is None or not self._workflow_capture().plot:
+                                self.result_queue.put(("hp6614c_sweep_sample", point.name, record))
 
                         drain_runner.sample_constant_voltage_current(
                             stop_requested=self.autotest_stop_event.is_set,
@@ -9517,16 +11159,37 @@ class ProbeApp(tk.Tk):
             if config.post_sweep_pause_s > 0:
                 self.autotest_stop_event.wait(config.post_sweep_pause_s)
         finally:
-            if drain_runner is not None:
-                drain_runner.end_sweep()
-                drain_runner.end_constant_voltage_current()
-            self._turn_hp6614c_output_off(hp_runner, config)
+            if isinstance(point, MappingPoint):
+                cleanup_errors = []
+                if drain_runner is not None:
+                    for close in (drain_runner.end_sweep, drain_runner.end_constant_voltage_current):
+                        try:
+                            close(strict=True)
+                        except Exception as exc:
+                            cleanup_errors.append(str(exc))
+                try:
+                    self._turn_hp6614c_output_off(hp_runner, config, strict=True)
+                except Exception as exc:
+                    cleanup_errors.append(str(exc))
+                # Preserve measurements even when a later read or output shutdown fails.
+                partial_path = session_dir / "hp6614c" / f"{self._safe_autotest_name(point.name)}_6614c_{config.test_type}.csv"
+                self._write_hp6614c_sweep_csv(partial_path, point, config, records)
+                if cleanup_errors:
+                    raise RuntimeError("Output cleanup failed: " + "; ".join(cleanup_errors))
+            else:
+                if drain_runner is not None:
+                    drain_runner.end_sweep()
+                    drain_runner.end_constant_voltage_current()
+                self._turn_hp6614c_output_off(hp_runner, config)
         output_path = session_dir / "hp6614c" / f"{self._safe_autotest_name(point.name)}_6614c_{config.test_type}.csv"
         transfer_analysis = analyze_hp6614c_transfer_records(records, config.heatmap_metric) if config.test_type == HP6614C_TEST_TRANSFER else None
         self._write_hp6614c_sweep_csv(output_path, point, config, records, transfer_analysis=transfer_analysis)
         message = f"{label} completed at {point.name}: {len(records)} sample(s); saved {output_path.name}."
         self.result_queue.put(("hp6614c_done", point.name, message, transfer_analysis.to_dict() if transfer_analysis is not None else None))
         self.result_queue.put(("autotest_status", message))
+        capture = self._workflow_capture()
+        if capture is not None:
+            capture.analysis = transfer_analysis.to_dict() if transfer_analysis is not None else {}
         return records
 
     @staticmethod
@@ -9563,7 +11226,7 @@ class ProbeApp(tk.Tk):
             skip_open_clear=config.skip_open_clear,
         ).normalized()
 
-    def _turn_hp6614c_output_off(self, hp_runner: HP6614CRunner, config: HP6614CSweepConfig) -> None:
+    def _turn_hp6614c_output_off(self, hp_runner: HP6614CRunner, config: HP6614CSweepConfig, *, strict: bool = False) -> None:
         try:
             hp_runner.apply_voltage(
                 HP6614CVoltageConfig(
@@ -9579,6 +11242,8 @@ class ProbeApp(tk.Tk):
                 ).normalized()
             )
         except Exception as exc:
+            if strict:
+                raise RuntimeError(f"HP 6614C output OFF failed: {exc}") from exc
             self.result_queue.put(("autotest_status", f"Warning: failed to turn HP 6614C output off at 0 V: {exc}"))
 
     @staticmethod
@@ -9656,7 +11321,7 @@ class ProbeApp(tk.Tk):
                     "json_file": output_path.with_suffix(".json").name,
                     "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                     "device": {"name": point.name, "order": point.order, "row": point.row, "col": point.col},
-                    "coordinates": {"gds": {"u": point.u, "v": point.v}, "stage_um": {"x": point.stage_x_um, "y": point.stage_y_um}},
+                    "coordinates": {"gds": None if isinstance(point, MappingPoint) else {"u": point.u, "v": point.v}, "stage_um": {"x": point.stage_x_um, "y": point.stage_y_um}},
                     "measurement": {
                         "test_type": config.test_type,
                         "hp_resource": config.hp_resource_name,
@@ -9731,7 +11396,16 @@ class ProbeApp(tk.Tk):
         runner = KeysightB1500Runner()
 
         def handle_curve(payload: dict[str, object]) -> None:
-            self.result_queue.put(("b1500_curve", point.name, dict(payload)))
+            for x, current in zip(payload.get("x", ()), payload.get("id", ())):
+                self._workflow_sample({"source_value": x, "gate_voltage_v": x,
+                    "voltage_v": payload.get("bias_v", x) if "transfer" in config.test_type else x,
+                    "current_a": current, "curve_label": f"Bias={payload.get('bias_v')} V"})
+            if isinstance(settings, MappingSettings):
+                output_dir.mkdir(parents=True, exist_ok=True)
+                with (output_dir / "acquired_curves.jsonl").open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(payload) + "\n")
+            if self._workflow_capture() is None or not self._workflow_capture().plot:
+                self.result_queue.put(("b1500_curve", point.name, dict(payload)))
             self.result_queue.put(
                 (
                     "autotest_status",
@@ -9740,11 +11414,13 @@ class ProbeApp(tk.Tk):
             )
 
         output_dir = session_dir / "b1500" / self._safe_autotest_name(point.name)
+        options = {"strict_cleanup": True} if isinstance(settings, MappingSettings) else {}
         result = runner.run(
             config,
             output_dir,
             stop_requested=self.autotest_stop_event.is_set,
             on_curve=handle_curve,
+            **options,
         )
         metadata_path = output_dir / f"{self._safe_autotest_name(device_name)}_{config.test_type}.json"
         metadata_path.write_text(
@@ -9755,7 +11431,7 @@ class ProbeApp(tk.Tk):
                     "result_type": f"b1500_{config.test_type}",
                     "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                     "device": {"name": point.name, "order": point.order, "row": point.row, "col": point.col},
-                    "coordinates": {"gds": {"u": point.u, "v": point.v}, "stage_um": {"x": point.stage_x_um, "y": point.stage_y_um}},
+                    "coordinates": {"gds": None if isinstance(point, MappingPoint) else {"u": point.u, "v": point.v}, "stage_um": {"x": point.stage_x_um, "y": point.stage_y_um}},
                     "measurement": {
                         "resource": config.resource_name,
                         "device_name": config.device_name,
@@ -9798,6 +11474,7 @@ class ProbeApp(tk.Tk):
         message += "."
         self.result_queue.put(("b1500_done", point.name, message))
         self.result_queue.put(("autotest_status", message))
+        return {"result": result.to_dict()}
 
     @staticmethod
     def _autotest_iv_output_path(session_dir: Path, point: AutoTestPoint, config: IVSweepConfig, *, multi_vtop: bool) -> Path:
@@ -9866,9 +11543,9 @@ class ProbeApp(tk.Tk):
                 "col": point.col,
             },
             "coordinates": {
-                "gds": {"u": point.u, "v": point.v},
+                "gds": None if isinstance(point, MappingPoint) else {"u": point.u, "v": point.v},
                 "stage_um": {"x": point.stage_x_um, "y": point.stage_y_um},
-                "fov_polygon_gds": [{"u": u, "v": v} for u, v in point.fov_polygon_gds],
+                "fov_polygon_gds": [{"u": u, "v": v} for u, v in getattr(point, "fov_polygon_gds", ())],
             },
             "measurement": {
                 "resource": config.resource_name,
@@ -9904,9 +11581,12 @@ class ProbeApp(tk.Tk):
         diagnostics = stitch_displacement_diagnostics(edges)
         counts = diagnostics["counts"]
         corrected = diagnostics["corrected"]
+        limited = sum(edge.correction_limited for edge in edges)
+        limit_note = (f" | Max correction reached on {limited} seam(s); consider increasing it."
+                      if limited else "")
         return (
             f"Seams {len(edges)} | G/Y/R {counts['good']}/{counts['warning']}/{counts['bad']} | "
-            f"response {avg_response:.3f} | max {max_correction:.2f} um | corrected {corrected}"
+            f"response {avg_response:.3f} | max {max_correction:.2f} um | corrected {corrected}{limit_note}"
         )
 
     def _update_imgstitch_progress_from_status(self, message: str) -> None:
@@ -10008,6 +11688,9 @@ class ProbeApp(tk.Tk):
         self.status_var.set(f"ImgStitch saved: {output_path}")
 
     def recompose_imgstitch_session(self) -> None:
+        if self.imgstitch_running:
+            self.imgstitch_status_var.set("Capture in progress; final registration runs after capture.")
+            return
         if self.imgstitch_session is None:
             self.imgstitch_status_var.set("No captured session to recompose.")
             return
@@ -10250,6 +11933,7 @@ class ProbeApp(tk.Tk):
         self.imgstitch_tile_images = {}
         self.imgstitch_latest_positions = {}
         self.imgstitch_latest_edges = []
+        self._update_imgstitch_correction_limit_highlight([])
         self.imgstitch_quality_var.set("No seam data")
         self.imgstitch_full_image_bgr = None
         self.imgstitch_last_output_path = None
@@ -10380,6 +12064,7 @@ class ProbeApp(tk.Tk):
             tiles: dict[tuple[int, int], object] = {}
             records: list[TileRecord] = []
             session: StitchSession | None = None
+            preview: IncrementalStitchPreview | None = None
             for index, key in enumerate(serpentine_indices(rows, cols), start=1):
                 if self.imgstitch_stop_event.is_set():
                     break
@@ -10444,19 +12129,23 @@ class ProbeApp(tk.Tk):
                     camera_fov_rotation_deg=self._camera_fov_rotation_deg(),
                 )
                 session.save(self.imgstitch_session_dir / "session.json")
+                if preview is None:
+                    preview = IncrementalStitchPreview(session)
+                display = preview.add(records[-1], corrected)
+                self.result_queue.put(("imgstitch_acquisition_preview", display, session, dict(tiles)))
+                self.result_queue.put(("imgstitch_status", f"Tile {index}/{rows * cols}, step X {step_x_um:g} um/{step_x} pulse Y {step_y_um:g} um/{step_y} pulse"))
+            if tiles:
+                assert session is not None
+                self.result_queue.put(("imgstitch_status", "Finalizing captured tiles: full-resolution registration"))
                 mosaic, positions, edges = recompose_session(session, settings, tiles)
                 display = build_seam_quality_overlay(mosaic, positions, edges, (session.tile_width, session.tile_height)) if settings.show_seams else mosaic
                 self.result_queue.put(("imgstitch_preview", display, session, dict(tiles), positions, edges, mosaic))
-                self.result_queue.put(("imgstitch_status", f"Tile {index}/{rows * cols}, step X {step_x_um:g} um/{step_x} pulse Y {step_y_um:g} um/{step_y} pulse"))
-            if tiles and not self.imgstitch_stop_event.is_set():
-                assert session is not None
-                mosaic, positions, edges = recompose_session(session, settings, tiles)
                 output_path = Path.cwd() / "last_imgstitch.png"
 
                 cv2.imwrite(str(output_path), mosaic)
                 cv2.imwrite(str(self.imgstitch_session_dir / "last_imgstitch.png"), mosaic)
-                self.result_queue.put(("imgstitch_done", output_path, mosaic))
-            elif self.imgstitch_stop_event.is_set():
+                self.result_queue.put(("imgstitch_done", output_path))
+            if self.imgstitch_stop_event.is_set():
                 self.result_queue.put(("imgstitch_status", "Stopped"))
         except Exception as exc:
             self.result_queue.put(("imgstitch_error", exc))
@@ -10908,6 +12597,8 @@ class ProbeApp(tk.Tk):
             self.result_queue.put(("motor_done",))
 
     def toggle_realtime_position(self) -> None:
+        if self.__dict__.get("mapping_running", False) or self.__dict__.get("_mapping_corner_busy", False):
+            return
         if self.realtime_enabled:
             self.disable_realtime_position()
             return
@@ -10954,6 +12645,8 @@ class ProbeApp(tk.Tk):
         logger.info("Realtime position display disabled.")
 
     def toggle_home_signal_polling(self) -> None:
+        if self.__dict__.get("mapping_running", False) or self.__dict__.get("_mapping_corner_busy", False):
+            return
         if self.home_signal_enabled:
             self.disable_home_signal_polling()
             return
@@ -11393,7 +13086,7 @@ class ProbeApp(tk.Tk):
         except Exception as exc:
             self.result_queue.put(("motor_error", "MOVE", exc))
         finally:
-            self.result_queue.put(("motor_done",))
+            self.result_queue.put(("motor_done", source))
 
     def _move_xyz_cc_worker(self, steps: dict[str, int], expected_targets: dict[str, int]) -> None:
         assert self.serial_client is not None
@@ -11482,6 +13175,9 @@ class ProbeApp(tk.Tk):
         return bool(mode_var and mode_var.get() == SERIAL_MODE_REMOTE_SSH)
 
     def _on_connection_mode_changed(self, _event=None) -> None:
+        if _event is not None:
+            self._startup_connection_pending = False
+            self._startup_remote_generation = None
         if self.serial_client or self.ssh_serial_tunnel:
             self.disconnect_serial()
         self._apply_connection_mode_ui()
@@ -11529,6 +13225,9 @@ class ProbeApp(tk.Tk):
         self.remote_bridge_check_pending = False
         self.remote_bridge_status = None
         self.remote_bridge_status_checked_at = time.monotonic()
+        if self.__dict__.get("_startup_connection_pending", False) and generation == self.__dict__.get("_startup_remote_generation"):
+            self._finish_startup_connection_error("SSH availability check timed out")
+            return
         if self._using_remote_ssh() and not self.serial_client:
             self.status_var.set("Raspberry Pi remote controller check timed out; click Refresh to retry.")
 
@@ -11543,7 +13242,84 @@ class ProbeApp(tk.Tk):
         port_suffix = f" on {status.serial_port}" if status.serial_port else ""
         return f"Raspberry Pi remote controller is available{port_suffix}."
 
+    def _accept_display_focus_reference(self, z, basis, generation):
+        if generation != self.__dict__.get("_display_basis_generation", 0):
+            return
+        if basis != coordinate_basis(self.probe_config) or not math.isfinite(float(z)):
+            return
+        self._display_focus_reference = DisplayFocusReference(c=float(z))
+
+    def _start_display_calibration(self, tunnel):
+        # This optional display service never changes serial connection success.
+        if self.__dict__.get("probe_config") is None:
+            return
+        self.__dict__.setdefault("_display_calibration_gate", CalibrationGate())
+        try:
+            transport = SshCalibrationHTTP(tunnel.ssh_target)
+            self._display_calibration_publisher = CalibrationPublisher(transport,
+                lambda message: self.result_queue.put(("display_calibration_status", message)))
+            self._poll_display_calibration()
+        except Exception:
+            logger.warning("Display calibration synchronization unavailable; serial remains connected.")
+
+    def _poll_display_calibration(self):
+        publisher = self.__dict__.get("_display_calibration_publisher")
+        if publisher is None:
+            return
+        try:
+            gate = self.__dict__["_display_calibration_gate"]
+            panel = self.__dict__.get("gds_stage_mapper_panel")
+            mapper = panel.mapper if panel is not None else None
+            if mapper is self.__dict__.get("_display_startup_mapper"):
+                mapper = None
+            plane = get_sample_plane_model()
+            if plane is self.__dict__.get("_display_startup_plane"):
+                plane = None
+            if plane is None:
+                plane = self.__dict__.get("_display_focus_reference")
+            payload, basis_changed = gate.observe(mapper, plane, self.probe_config)
+            if basis_changed:
+                self._invalidate_display_basis("Motor polarity or pulse scale changed")
+                payload = None
+            publisher.submit(payload)
+        except (ValueError, TypeError, ArithmeticError):
+            publisher.submit(None)
+        self._display_calibration_job = self.after(500, self._poll_display_calibration)
+
+    def _clear_display_basis_models(self, reason):
+        # Run only on Tk's thread; clearing these computational models prevents
+        # old transforms being reused by either the display or automated motion.
+        clear_sample_plane_model()
+        self.sample_plane_model = None
+        panel = self.__dict__.get("gds_stage_mapper_panel")
+        if panel is not None:
+            panel.mapper = None
+        self.status_var.set(reason + "; recalibrate LayoutMap and FocusMap before using UV/F.")
+
+    def _invalidate_display_basis(self, reason, *, wait=False):
+        self._display_basis_generation = self.__dict__.get("_display_basis_generation", 0) + 1
+        self._display_focus_reference = None
+        gate = self.__dict__.setdefault("_display_calibration_gate", CalibrationGate())
+        gate.invalidate()
+        # Disable the shared plane immediately, including when invoked in a
+        # serial worker. Tk-owned display state is cleared by the queued event.
+        clear_sample_plane_model()
+        publisher = self.__dict__.get("_display_calibration_publisher")
+        if publisher is not None:
+            publisher.invalidate(wait=wait)
+        if threading.current_thread() is threading.main_thread():
+            self._clear_display_basis_models(reason)
+        else:
+            self.result_queue.put(("display_basis_invalid", reason))
+
+    def _before_display_coordinate_reset(self):
+        # Serial writes hold the transport lock. Never wait for display HTTP:
+        # the Pi also revokes on the completing D0/D3 frame before forwarding.
+        self._invalidate_display_basis("Coordinate origin changed", wait=False)
+
     def connect_serial(self) -> bool:
+        if self.__dict__.get("mapping_running", False) or self.__dict__.get("_mapping_corner_busy", False):
+            return self.serial_client is not None
         remote = self._using_remote_ssh()
         port = self.port_var.get().strip()
         if not remote and not port:
@@ -11586,13 +13362,16 @@ class ProbeApp(tk.Tk):
             prefix = "Remote SSH connection failed" if remote else "Serial connection failed"
             self.status_var.set(f"{prefix}: {exc}")
             logger.error("%s for %s: %s", prefix, REMOTE_SSH_TARGET if remote else port, exc)
-            if not remote:
+            if not remote and not self.__dict__.get("_startup_connection_pending", False):
                 threading.Thread(target=self._refresh_ports_after_connect_failure, daemon=True).start()
             self._update_serial_port_style()
             return False
 
         self.serial_client = client
         self.ssh_serial_tunnel = tunnel
+        client.before_coordinate_reset = self._before_display_coordinate_reset
+        if remote:
+            self._start_display_calibration(tunnel)
         if remote:
             self.status_var.set(f"SSH tunnel connected to {REMOTE_SSH_TARGET}; checking controller availability.")
             logger.info("Connected through SSH %s using %s.", REMOTE_SSH_TARGET, client.port)
@@ -11604,14 +13383,86 @@ class ProbeApp(tk.Tk):
         return True
 
     def connect_and_test_serial(self) -> None:
+        if not self.__dict__.get("_startup_connection_attempted", False):
+            self._startup_connection_attempted = True
+            self._start_startup_connection()
+            return
         if self.connect_serial():
             self.run_comm_test()
+
+    def _start_startup_connection(self) -> None:
+        """Prefer a discovered local COM port, then try the configured SSH bridge once."""
+        self._startup_connection_pending = True
+        self._startup_remote_generation = None
+        self._startup_connection_errors = []
+        self._startup_local_candidates = []
+        self.connection_mode_var.set(SERIAL_MODE_LOCAL)
+        self._apply_connection_mode_ui(announce=False)
+        self.status_var.set("Startup: scanning local COM ports...")
+        try:
+            ports = list_serial_ports()
+        except Exception as exc:
+            ports = []
+            self._startup_connection_errors.append(f"COM scan failed: {exc}")
+        self._apply_serial_ports(ports)
+        if ports:
+            preferred = self._local_port_selection
+            self._startup_local_candidates = sorted(ports, key=lambda port: port != preferred)
+            self._try_next_startup_local_port()
+            return
+
+        if not self._startup_connection_errors:
+            self._startup_connection_errors.append("no local COM ports detected")
+        self._begin_startup_remote_fallback()
+
+    def _try_next_startup_local_port(self) -> None:
+        while self._startup_local_candidates:
+            port = self._startup_local_candidates.pop(0)
+            self.connection_mode_var.set(SERIAL_MODE_LOCAL)
+            self.port_var.set(port)
+            self.status_var.set(f"Startup: checking controller on {port}...")
+            if self.connect_serial():
+                self.run_comm_test()
+                return
+            self._startup_connection_errors.append(f"{port}: {self.status_var.get()}")
+        self._begin_startup_remote_fallback()
+
+    def _handle_startup_local_failure(self, reason: str) -> None:
+        port = self.port_var.get().strip() or "local COM"
+        self._startup_connection_errors.append(f"{port}: {reason}")
+        self._close_serial_transport()
+        self._update_serial_port_style()
+        self._try_next_startup_local_port()
+
+    def _begin_startup_remote_fallback(self) -> None:
+        self.connection_mode_var.set(SERIAL_MODE_REMOTE_SSH)
+        self._apply_connection_mode_ui(announce=False)
+        self.status_var.set(f"Startup: no working COM controller; checking SSH {REMOTE_SSH_TARGET}...")
+        self._start_remote_bridge_status_check()
+        self._startup_remote_generation = self.remote_bridge_check_generation
+
+    def _finish_startup_connection_error(self, remote_error: str) -> None:
+        self._startup_connection_pending = False
+        self._startup_remote_generation = None
+        self._close_serial_transport()
+        self.connection_mode_var.set(SERIAL_MODE_LOCAL)
+        self._local_port_selection = ""
+        self._apply_connection_mode_ui(announce=False)
+        self.port_var.set("")
+        details = "; ".join((*self._startup_connection_errors, remote_error))
+        message = f"Startup connection ERROR — {details}. Returned to Local COM mode."
+        self.status_var.set(message)
+        logger.error(message)
+        self._update_serial_port_style()
 
     def _refresh_ports_after_connect_failure(self) -> None:
         logger.info("Scanning available serial ports after default connection failed...")
         self.result_queue.put(("ports_refreshed", list_serial_ports()))
 
     def disconnect_serial(self) -> None:
+        if self.__dict__.get("mapping_running", False) or self.__dict__.get("_mapping_corner_busy", False):
+            self.status_var.set("Stop mapping before disconnecting the stage.")
+            return
         self.home_signal_stop_event.set()
         self.home_signal_enabled = False
         self.home_signal_button_var.set("Home Signals")
@@ -11621,6 +13472,15 @@ class ProbeApp(tk.Tk):
         self._update_serial_port_style()
 
     def _close_serial_transport(self) -> None:
+        publisher = self.__dict__.pop("_display_calibration_publisher", None)
+        if publisher is not None:
+            publisher.close()
+        job = self.__dict__.pop("_display_calibration_job", None)
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except tk.TclError:
+                pass
         if self.serial_client:
             logger.info("Disconnecting serial port %s.", self.serial_client.port)
             self.serial_client.close()
@@ -11630,6 +13490,8 @@ class ProbeApp(tk.Tk):
         self.ssh_serial_tunnel = None
 
     def run_comm_test(self) -> None:
+        if self.__dict__.get("mapping_running", False) or self.__dict__.get("_mapping_corner_busy", False):
+            return
         if not self.serial_client:
             self.connect_serial()
         if not self.serial_client:
@@ -11714,6 +13576,12 @@ class ProbeApp(tk.Tk):
                 result = self.result_queue.get_nowait()
                 processed += 1
                 if isinstance(result, Exception):
+                    if self.__dict__.get("_startup_connection_pending", False):
+                        if self._using_remote_ssh():
+                            self._finish_startup_connection_error(f"SSH communication failed: {result}")
+                        else:
+                            self._handle_startup_local_failure(f"communication failed: {result}")
+                        continue
                     self.status_var.set(f"Communication test failed: {result}")
                     logger.error("Communication test failed: %s", result)
                     if self.serial_client and self.serial_client.port.startswith("socket://"):
@@ -11729,12 +13597,22 @@ class ProbeApp(tk.Tk):
                 self._append_hex_history("TX", result.request_hex)
                 self._append_hex_history("RX", result.response_hex or "-")
                 if result.ok:
+                    if self.__dict__.get("_startup_connection_pending", False):
+                        self._startup_connection_pending = False
+                        self._startup_remote_generation = None
+                        self._startup_local_candidates = []
                     logger.info("Communication test passed. %s %s", colorize_hex_frame(result.request_hex, "TX"), colorize_hex_frame(result.response_hex, "RX"))
                     self.clear_position_edits()
                     self.status_var.set("Communication test passed. Reading current X/Y/Z positions...")
                     threading.Thread(target=self._read_current_position_worker, args=("comm_test", False), daemon=True).start()
                 else:
                     logger.warning("Communication test did not pass. %s %s Detail=%s", colorize_hex_frame(result.request_hex, "TX"), colorize_hex_frame(result.response_hex or "-", "RX"), result.message)
+                    if self.__dict__.get("_startup_connection_pending", False):
+                        if self._using_remote_ssh():
+                            self._finish_startup_connection_error(f"SSH communication test failed: {result.message}")
+                        else:
+                            self._handle_startup_local_failure(f"communication test failed: {result.message}")
+                        continue
                     if self.serial_client and self.serial_client.port.startswith("socket://"):
                         self._close_serial_transport()
                         self._update_serial_port_style()
@@ -11754,7 +13632,105 @@ class ProbeApp(tk.Tk):
             agent_panel.set_status(message)
 
     def _handle_worker_event(self, event: tuple) -> None:
+        self._handle_worker_event_impl(event)
+        runtime = self.__dict__.get("agent_runtime")
+        if runtime is not None:
+            result = runtime.observe(event)
+            if result is not None and self.agent_panel is not None:
+                self.agent_panel.apply_execution_result(result)
+
+    def _handle_worker_event_impl(self, event: tuple) -> None:
         event_type = event[0]
+        if event_type == "display_basis_invalid":
+            self._clear_display_basis_models(str(event[1]))
+            return
+        if event_type == "display_calibration_status":
+            logger.info("%s", event[1])
+            return
+        if event_type == "workflow_plot_start":
+            from .workflow_plot import WorkflowPlotPanel
+            old = self.__dict__.get("_workflow_plot")
+            if old is not None:
+                old.close()
+            self._workflow_plot_run = event[1]
+            self._workflow_plot = WorkflowPlotPanel(self, event[2], event[3])
+            self._workflow_plot_active = True
+            return
+        plot = self.__dict__.get("_workflow_plot")
+        if event_type == "workflow_display":
+            snapshot = event[1].take()
+            if snapshot and plot is not None and snapshot[0] == self.__dict__.get("_workflow_plot_run"):
+                for output, curves in snapshot[2].items():
+                    plot.curves_updated(snapshot[1], output, curves)
+            return
+        if event_type in {"workflow_point_start", "workflow_point_done"}:
+            if plot is not None and event[1] == self.__dict__.get("_workflow_plot_run"):
+                if event_type == "workflow_point_start":
+                    plot.point_started(*event[2:])
+                else:
+                    plot.point_finished(*event[2:])
+            return
+        if event_type in {"mapping_finished", "autotest_finished"} and plot is not None:
+            plot.finish()
+            self._workflow_plot_active = False
+        if self.__dict__.get("_workflow_plot_active", False) and event_type in {
+            "iv_started", "iv_sample", "iv_done", "hp6614c_sweep_started", "hp6614c_sweep_sample", "hp6614c_done",
+            "b1500_started", "b1500_curve", "b1500_done", "wobb_test_started", "wobb_test_position", "wobb_test_sample", "wobb_test_done"}:
+            return
+        if event_type == "mapping_corner":
+            _, corner, x, y, error = event
+            self._mapping_corner_busy = False
+            self.motion_busy = False
+            self._lock_mapping_controls(False)
+            self.mapping_panel.set_running(False)
+            restore_realtime, restore_home = self._mapping_corner_restore
+            if restore_realtime and not self.realtime_enabled:
+                self.toggle_realtime_position()
+            if restore_home and not self.home_signal_enabled:
+                self.toggle_home_signal_polling()
+            if error:
+                self.mapping_panel.status.set(f"Corner read failed: {error}")
+            else:
+                self.mapping_panel.set_corner(corner, x, y)
+            return
+        if event_type == "mapping_fixed_z":
+            _, pulses, z_um = event
+            self.mapping_panel.detail.set(f"Fixed Z: {z_um:g} µm ({pulses} pulses). No Z commands during this scan.")
+            return
+        if event_type == "mapping_current":
+            self.mapping_panel.refresh_system_status()
+            point = event[1]
+            self.mapping_panel.set_current(point)
+            mask_status = (
+                f" · mask ({point.mask_pixel_x},{point.mask_pixel_y}) · {point.target_power_mw:g} mW"
+                if point.target_power_mw is not None else ""
+            )
+            self.mapping_panel.status.set(
+                f"Point {point.order}/{self.autotest_progress_total}: X={point.stage_x_um:g}, Y={point.stage_y_um:g} µm{mask_status}"
+            )
+            return
+        if event_type == "mapping_laser_calibration":
+            _, records, calibration = event
+            self.mapping_panel.set_laser_calibration(records, calibration)
+            return
+        if event_type == "mapping_result":
+            _, result, elapsed = event
+            self.mapping_panel.on_result(result, elapsed)
+            self.autotest_progress_current = self.mapping_panel._completed
+            return
+        if event_type == "mapping_finished":
+            _, status, error, directory = event
+            try:
+                status, error = self.mapping_panel.finish(status, error, directory)
+            finally:
+                self.mapping_running = False
+                self._lock_mapping_controls(False)
+                self.mapping_panel.set_running(False)
+                self._handle_worker_event(("autotest_finished",))
+            self.status_var.set(f"Mapping {status}" + (f": {error}" if error else f": {directory}"))
+            if error:
+                logger.error("Mapping %s: %s", status, error)
+            return
         if event_type == "read_positions":
             _, entries, source, *rest = event
             expected_targets = rest[0] if rest else None
@@ -11883,11 +13859,25 @@ class ProbeApp(tk.Tk):
             self.remote_bridge_status_checked_at = time.monotonic()
             if not self._using_remote_ssh() or self.serial_client:
                 return
+            startup_fallback = self.__dict__.get("_startup_connection_pending", False) and generation == self.__dict__.get("_startup_remote_generation")
             if error:
+                if startup_fallback:
+                    self._finish_startup_connection_error(f"SSH check failed: {error}")
+                    return
                 self.status_var.set(f"Raspberry Pi remote controller check failed: {error}")
                 logger.warning("Raspberry Pi remote controller check failed: %s", error)
             else:
                 self.status_var.set(self._remote_bridge_status_message(status))
+                if startup_fallback:
+                    if not status.available or not status.controller_connected or status.bridge_active:
+                        self._finish_startup_connection_error(
+                            f"SSH unavailable: {self._remote_bridge_status_message(status)}"
+                        )
+                        return
+                    if self.connect_serial():
+                        self.run_comm_test()
+                    else:
+                        self._finish_startup_connection_error(f"SSH connection failed: {self.status_var.get()}")
             return
 
         if event_type == "zero_z_command":
@@ -12216,6 +14206,11 @@ class ProbeApp(tk.Tk):
             logger.error("AutoFocus failed: %s", exc)
             return
 
+        if event_type == "display_focus_reference":
+            _, z, basis, generation = event
+            self._accept_display_focus_reference(z, basis, generation)
+            return
+
         if event_type == "autofocus_done":
             self.autofocus_running = False
             self.motion_busy = False
@@ -12242,6 +14237,14 @@ class ProbeApp(tk.Tk):
             logger.info("ImgStitch: %s", message)
             return
 
+        if event_type == "imgstitch_acquisition_preview":
+            _, preview, session, tiles = event
+            self.imgstitch_session = session
+            self.imgstitch_tile_images = tiles
+            self.imgstitch_quality_var.set("Live stage preview; final registration after capture")
+            self._show_imgstitch_preview(preview)
+            return
+
         if event_type == "imgstitch_preview":
             mosaic = event[1]
             if len(event) >= 6:
@@ -12249,6 +14252,7 @@ class ProbeApp(tk.Tk):
                 self.imgstitch_tile_images = event[3]
                 self.imgstitch_latest_positions = event[4]
                 self.imgstitch_latest_edges = event[5]
+                self._update_imgstitch_correction_limit_highlight(self.imgstitch_latest_edges)
                 self.imgstitch_quality_var.set(self._imgstitch_quality_summary(self.imgstitch_latest_edges))
                 self.imgstitch_status_var.set(self._imgstitch_displacement_status(self.imgstitch_latest_edges))
             if len(event) >= 7:
@@ -12265,6 +14269,7 @@ class ProbeApp(tk.Tk):
                 self.imgstitch_recompose_button.configure(state="normal", text="Apply and Recalculate")
             self.imgstitch_latest_positions = positions
             self.imgstitch_latest_edges = edges
+            self._update_imgstitch_correction_limit_highlight(edges)
             self._set_imgstitch_full_image(full_image)
             self.imgstitch_quality_var.set(self._imgstitch_quality_summary(edges))
             self.imgstitch_status_var.set(str(status))
@@ -12605,6 +14610,8 @@ class ProbeApp(tk.Tk):
         if event_type == "autotest_status":
             _, message = event
             message_text = str(message)
+            if self.__dict__.get("mapping_running", False):
+                self.mapping_panel.status.set(message_text)
             if message_text.startswith("AutoTest Z wobble"):
                 now = time.monotonic()
                 if now - self.last_autotest_wobble_status_at < 0.12:
@@ -12613,7 +14620,10 @@ class ProbeApp(tk.Tk):
             if self.autotest_panel is not None:
                 self.autotest_panel.set_status(message_text)
             self.status_var.set(message_text)
-            logger.info("AutoTest: %s", message_text)
+            if is_high_frequency_dp100_status(message_text):
+                logger.debug("AutoTest light: %s", message_text)
+            else:
+                logger.info("AutoTest: %s", message_text)
             return
 
         if event_type == "motor_guard_status":
@@ -12665,6 +14675,10 @@ class ProbeApp(tk.Tk):
             self.autotest_completed_point_times = []
             if self.autotest_panel is not None:
                 self.autotest_panel.set_running(False)
+            if "workflow_buttons" in self.__dict__:
+                for workflow_button in self.workflow_buttons:
+                    workflow_button.configure(state="normal")
+                self._update_admin_mode_controls()
             if self.autotest_restore_realtime and not self.realtime_enabled and self.serial_client:
                 self.autotest_restore_realtime = False
                 self.toggle_realtime_position()
@@ -12739,6 +14753,16 @@ class ProbeApp(tk.Tk):
             return
 
         if event_type == "motor_done":
+            runtime = self.__dict__.get("agent_runtime")
+            if runtime is not None and runtime.active is not None and runtime.active.action_id in {AGENT_ACTION_STAGE_MOVE, AGENT_ACTION_MOVE_GDS}:
+                source = "agent_stage" if runtime.active.action_id == AGENT_ACTION_STAGE_MOVE else "gds_mapper"
+                if len(event) < 2 or event[1] != source:
+                    # Stop acknowledgement is not the move worker's cleanup.
+                    return
+            # Emergency-stop feedback does not mean the mapping worker has
+            # finished saving samples and closing its instrument session.
+            if self.__dict__.get("mapping_running", False) or self.__dict__.get("_mapping_corner_busy", False):
+                return
             self.motion_busy = False
             self.keyboard_motion_busy = False
 
@@ -12876,6 +14900,13 @@ class ProbeApp(tk.Tk):
         self.after(15, self._update_camera_frame)
 
     def destroy(self) -> None:
+        if self.__dict__.get("mapping_running", False):
+            self.autotest_stop_event.set()
+            self.mapping_panel.status.set("Closing: waiting for mapping to save results and turn bias off.")
+            # Keep the Tk event loop and serial transport alive until cleanup
+            # finishes. Avoid killing the daemon worker with the bias enabled.
+            self.after(100, self.destroy)
+            return
         self.autofocus_stop_event.set()
         self.af_plane_stop_event.set()
         self.imgstitch_stop_event.set()
@@ -12883,6 +14914,12 @@ class ProbeApp(tk.Tk):
         self.autotest_stop_event.set()
         self.realtime_stop_event.set()
         self.home_signal_stop_event.set()
+        dp100_driver = getattr(self, "_dp100_driver", None)
+        if dp100_driver is not None:
+            try:
+                dp100_driver.shutdown()
+            except Exception:
+                logger.exception("Failed to shut down ATK-DP100 output.")
         if self.realtime_enabled and self.serial_client:
             try:
                 self.serial_client.disable_realtime_position()
@@ -12903,11 +14940,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="restore_last",
         help=f"restore {FOCUSMAP_AUTOSAVE_FILENAME} and {LAYOUTBOND_AUTOSAVE_FILENAME} at startup",
     )
+    parser.add_argument("--measure-debug", action="store_true", help="launch the standalone measurement workflow bench")
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_arg_parser().parse_args(argv)
+    if args.measure_debug:
+        from .measure_debug import main as measure_debug_main
+
+        measure_debug_main()
+        return
     print_startup_banner()
     logger.info("Application starting.")
     app = ProbeApp(restore_last=args.restore_last)

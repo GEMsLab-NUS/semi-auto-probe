@@ -1,0 +1,62 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="generator" content="Semi Auto Probe Help"><title>文件、会话与导出</title><link rel="stylesheet" type="text/css" href="../assets/help.css"></head><body><div class="topic-header"><div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div><h1>文件、会话与导出</h1><p class="summary">理解工作目录、自动恢复文件、各工作流 session 和完成证据。</p></div>
+<div class="callout note"><strong>共同规则。</strong>除显式选择路径外，默认相对路径都基于应用启动工作目录。复制实验数据时保留整个 session 目录，不要只复制截图或单个 CSV。</div>
+<h2>配置与可恢复上下文</h2>
+<table class="feature-table">
+<tr><th>路径</th><th>内容</th></tr>
+<tr><td><code>probe_config.local.json</code></td><td>光学、相机、电机、AutoFocus、Agent 与 Wire-bond mode；可能含明文 API key。</td></tr>
+<tr><td><code>last_autofocus_history.csv</code></td><td>最近 AutoFocus 的运动、三种 score、采样、时间与终止帧。</td></tr>
+<tr><td><code>last_focusmap_mapping.json</code></td><td>自动保存/启动恢复使用的 FocusMap。</td></tr>
+<tr><td><code>last_af_plane_mapping.json</code></td><td>FocusMap 手动 Save Results 的默认名。</td></tr>
+<tr><td><code>last_layoutbond_mapping.json</code></td><td>GDS path/top cell、P1-P4、affine transform、FOV 与 residual。</td></tr>
+<tr><td><code>workflow_library/&lt;folder&gt;/*.json</code></td><td>Measurement Workflow，format 为 <code>semi_auto_probe.measurement_workflow</code>、version 2。</td></tr>
+</table>
+<h2>ImgStitch</h2>
+<pre>imgstitch_session/
+  session.json
+  tiles/tile_rNNN_cNNN.png
+  raw_stack/...
+  recomposed_imgstitch.png
+  stack_result.png
+  last_imgstitch.png
+  agent_single_frame_YYYYMMDD_HHMMSSffffff.png</pre>
+<p>这是固定、会重建的工作目录。Save Full Image 可另存 PNG/JPEG；Agent 单帧使用带时间戳文件，保留已有 session。</p>
+<h2>ImgMatrix</h2>
+<pre>imgmatrix_session/YYYYMMDD_HHMMSS[_NN]/
+  manifest.json
+  images/rNNN_cNNN_u..._v....png</pre>
+<p>manifest 记录版本、时间、设置、完成状态与每张图像坐标。每次 session 唯一，不覆盖同目录下旧运行。</p>
+<h2>AutoTest 与节点输出</h2>
+<pre>autotest_session/YYYYMMDD_HHMMSS[_NN]/
+  images/
+  iv/
+  wobb/
+  hp6614c/
+  b1500/
+  workflow_plots/
+  ... node execution JSON</pre>
+<ul>
+<li>Keithley IV 通常为 <code>&lt;device&gt;_iv[_vtop_value][_N].csv</code> 和同名 JSON。</li>
+<li>WobbTest 为 <code>&lt;device&gt;_wobb.csv/json</code>。</li>
+<li>HP 6614C 为 <code>&lt;device&gt;_6614c_&lt;test_type&gt;.csv/json</code>。</li>
+<li>B1500 按 device 建子目录，可含 per-curve、ALL long/wide CSV、result JSON 与 Mapping 的 <code>acquired_curves.jsonl</code>。</li>
+<li>Plot Panel 点历史位于 <code>workflow_plots/&lt;row&gt;_&lt;col&gt;.json</code>。</li>
+</ul>
+<h2>Wire-bond Mapping</h2>
+<pre>autotest_session/YYYYMMDD_HHMMSS[_NN]/
+  mapping.json
+  samples.csv
+  mapping.csv
+  mapping.png
+  mapping_artifacts.sqlite3
+  points/...       (失败/中断时可能保留)</pre>
+<p>成功点的临时节点文件可压缩写入 SQLite 后删除 <code>points/</code>；失败/中断保留 loose tree。读取 Mapping 时同时检查 <code>completed_points</code>、点状态、SQLite/loose artifacts 与 workflow execution 信息。</p>
+<h2>Web 与本地运行日志</h2>
+<p>Web PID 和 tray logs 默认在 <code>.runtime/</code>。应用多数运行错误显示在当前页状态并写 Python logger；收集支持信息时记录启动命令、工作目录、配置副本（移除 secrets）、相关 session 与完整日志。</p>
+<h2>归档建议</h2>
+<ul>
+<li>完成实验后把整个 timestamp session 复制到只读归档并计算 hash。</li>
+<li>记录软件 commit/version、config、GDS、FocusMap/LayoutMap、workflow JSON、仪器 resource 和样品 ID。</li>
+<li>不要把未完成 session 重命名成 completed；保留 Stop/failed 状态和 loose artifacts。</li>
+</ul>
+<p class="related"><strong>相关主题：</strong><a href="web-dashboard.htm">Web 浏览</a> · <a href="troubleshooting.htm">数据不完整</a></p>
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div></body></html>

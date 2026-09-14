@@ -1,47 +1,58 @@
-# AI Agent Capability And Output Contract
+# AI Agent function contract — v2
 
-This document is the static template supplied to the external LLM planner. The application also generates a live Markdown capability brief before every LLM call. The live brief is authoritative for current availability, blockers, positions, selected GDS target, API state, and recent outputs.
+Current desktop contract, including Measurement Workflow v2. Bundled
+`agent_knowledge.py` supplies help even outside the repository; this file supplements
+it. Executable capabilities and schemas come from `build_agent_capabilities(context)`.
 
-## Runtime Capability Brief
+## Role and routing
 
-Before each LLM request, the application sends:
+Reply in the user's language. Explain existing features and coordinate high-level
+workflows. Do not turn a how-to question into a hardware action.
 
-- Current stage controller pulses and physical `X/Y/Z` micrometer coordinates.
-- Current mapped GDS `U/V` coordinates when LayoutBond mapping is fitted.
-- Selected GDS `U/V` and selected target stage coordinates when available.
-- Serial, camera, frame, motion, AutoFocus, FocusMap, and ImgStitch state.
-- Current model, API configuration state, current page, and recent image output path.
-- A catalog of supported high-level `action_id` values, each with purpose, owning module, prerequisites, hardware effects, confirmation policy, visualization hint, availability, and current blockers.
+- Help/inspect: answer from supplied knowledge and state, with an empty steps array.
+- Execute: return ordered, explicit, supported actions. Local guards and the user's
+  selected execution mode remain authoritative.
+- Ambiguous/unsupported: ask a focused question, set `needs_clarification=true`.
+  Do not execute just the supported fragment of an ambiguous request.
 
-## Output Contract
+Deterministic commands run before provider routing and require no API key:
 
-The planner must return one JSON object only:
+| Prompt | Behavior |
+| --- | --- |
+| `/help [overview/workflow/mapping/instruments/imaging]` | Current-version help; no execution. |
+| `/status` | Current state and capability availability; no execution. |
+| `/check` | Local measurement graph/geometry report; no device connection or output. |
+| `/open AutoTest` | Plan navigation to an existing page. |
+| `/run measurement` | Review/run the currently configured Probe or Wire-bond workflow. |
+
+## Input
+
+`AgentPlanner.plan(instruction: str, context: AgentContext) -> AgentPlan`
+
+`AgentContext.to_prompt_dict()` includes `contract_version=2`, stage/camera/GDS state,
+active workflows, probe contact, page, image output, measurement mode, summary,
+blockers and fingerprint. It does not contain the API key. Instrument connectivity
+is explicitly **not verified** by graph inspection.
+
+The provider receives `capabilities` with `parameters_schema`, prerequisites,
+effects and availability; a Markdown brief; and current bundled help. Tk state is
+collected on the main thread before network planning. Bounded history includes
+completed tool results; the local fallback interprets only the current request.
+
+## Provider response
+
+Return one JSON object without Markdown fences:
 
 ```json
 {
-  "title": "short plan title",
-  "understanding": "plain-language interpretation",
-  "reply_markdown": "Markdown shown to the user",
+  "title": "Focus and capture",
+  "understanding": "Use current AutoFocus settings, then save one frame.",
+  "reply_markdown": "Review the steps before running them.",
   "needs_clarification": false,
-  "visualization_hint": "summary",
   "plan": {
     "steps": [
-      {
-        "action_id": "autofocus_current_position",
-        "title": "Run autofocus",
-        "module": "AutoFocus",
-        "detail": "Use current AutoFocus settings.",
-        "parameters": {},
-        "requires_confirmation": true,
-        "involves_motion": true,
-        "involves_autofocus": true,
-        "involves_capture": false,
-        "changes_experiment_state": true,
-        "visualization_hint": "autofocus",
-        "risks": ["Moves Z axis."],
-        "blockers": [],
-        "recovery_suggestions": []
-      }
+      {"action_id": "autofocus_current_position", "title": "AutoFocus", "module": "AutoFocus", "detail": "Use current settings.", "parameters": {}},
+      {"action_id": "capture_single_frame", "title": "Save frame", "module": "ImgStitch", "detail": "Capture after autofocus finishes.", "parameters": {}}
     ]
   },
   "blockers": [],
@@ -49,40 +60,68 @@ The planner must return one JSON object only:
 }
 ```
 
-`reply_markdown` may use headings, lists, bold text, code blocks, and simple tables. Program execution is driven only by `plan.steps[*].action_id`, not by prose.
+For help, use `"plan":{"steps":[]}` and put the answer in `reply_markdown`.
+Optional display fields include `visualization_hint`, `risks` and recovery suggestions.
+Local permission/effect flags cannot be lowered by provider output. Unknown actions
+become clarification and prevent execution. Prose is never executed.
 
-User-visible `reply_markdown` should be English by default unless the user explicitly asks for another language.
+## Actions
 
-## Supported High-Level Actions
-
-The live capability brief lists availability for these actions:
-
-| `action_id` | Module | Purpose |
+| action_id | Parameters | Effect |
 | --- | --- | --- |
-| `status_summary` | Agent Panel | Explain current state without changing hardware. |
-| `move_gds_target` | LayoutBond | Move to the currently selected GDS target through fitted mapping. |
-| `stage_move` | Stage Control | Move selected stage axes to zero/origin, absolute pulse targets, or relative pulse deltas without requiring GDS binding. |
-| `autofocus_current_position` | AutoFocus | Run the existing Z autofocus workflow. |
-| `capture_single_frame` | ImgStitch | Capture the current camera frame and save it to existing ImgStitch output locations. |
-| `image_capture_sequence` | ImgStitch | Run current XY stitch, T-stack, or Z-stack settings. |
-| `focusmap_current_settings` | FocusMap | Run FocusMap with the current generated mesh and UI settings. |
-| `layout_image_overlay` | LayoutBond | Associate the latest saved image with LayoutBond context. |
-| `clarify` | Agent Panel | Ask for clarification when a safe mapping is not possible. |
+| `help` | optional `topic` | Bundled help. |
+| `status_summary` | `{}` | Current state. |
+| `check_measurement_workflow` | `{}` | Local inspection. |
+| `open_page` | `{"page":"AutoTest"}` | Existing `show_page`; no hardware change. |
+| `stage_move` | See below | Existing coordinate worker. |
+| `move_gds_target` | `{}` | Existing selected GDS target move. |
+| `autofocus_current_position` | `{}` | Existing AutoFocus. |
+| `capture_single_frame` | `{}` | Save a unique single-frame file and update the latest image without clearing or overwriting the current ImgStitch session, stack result, or tiles. |
+| `image_capture_sequence` | `{}` | Current ImgStitch / T-stack / Z-stack settings. |
+| `focusmap_current_settings` | `{}` | Existing generated mesh/settings. |
+| `layout_image_overlay` | `{}` | Associate latest image path/open LayoutBond; not automatic registration. |
+| `run_current_measurement` | `{"fingerprint":"<current context digest>"}` | `start_autotest`, routing to Probe or Wire-bond. |
+| `clarify` | `{}` | Ask a question; not executable. |
 
-## Safety Boundaries
+Navigation pages: Main, AutoFocus, FocusMap, LayoutBond, ImgStitch, ImgMatrix,
+AutoTest, EdgeTrace, AI Agent, Communication, Config.
 
-- The LLM must never output raw serial/controller commands or protocol frames.
-- The LLM must never bypass confirmation.
-- Hardware or experiment-state-changing steps must set `requires_confirmation` to `true`.
-- The app re-checks blockers locally before enabling confirmation and again before each confirmed step executes.
-- The Agent may call only existing high-level application workflows.
+`open_page` also accepts the user-facing compatibility aliases `MainView`,
+`LayoutMap`, `SerialIO`, and `Settings`; they resolve to `Main`, `LayoutBond`,
+`Communication`, and `Config` before navigation. Responses use the current visible
+page name.
 
-For `stage_move`, use these parameter shapes:
+Canonical stage shapes:
 
 ```json
-{"mode": "zero", "axes": ["X", "Y"]}
-{"mode": "absolute", "targets": {"X": 0, "Y": 0}}
-{"mode": "relative", "deltas": {"X": 100, "Y": -50}}
+{"mode":"zero","axes":["X","Y"]}
+{"mode":"absolute","targets":{"X":100,"Y":0}}
+{"mode":"relative","deltas":{"X":10,"Y":-5}}
 ```
 
-Values are controller pulses unless a future application layer explicitly provides a unit converter.
+Use integer controller **pulses** within signed 32-bit range. Axes/values must match
+when both are supplied. Non-finite, fractional, Boolean, unknown-axis and extra
+parameters are rejected. `zero` moves to coordinate zero; it is not limit-switch
+homing or redefining the origin. Physical-unit conversion is not an Agent action.
+Final controller/motion constraints still apply.
+
+## Current measurement features and limits
+
+Help covers shared Workflow v2, control/data links, formulas, result ports, Plot Panel,
+Probe versus Wire-bond, instrument templates, DP100, TEMT6000 and Virtual Mask.
+Measurement execution uses the current editor's configured nodes/parameters.
+Use the existing editor for template loading and instrument limit changes.
+The Agent does not freely write graphs or independently change instrument limits.
+
+Graph validation rejects invalid connections and unimplemented placeholders.
+Wire-bond additionally applies its existing supported-node/parameter checks.
+Local inspection passing does not guarantee device reachability or acquisition success.
+ImgMatrix, EdgeTrace and manual instrument controls are help/navigation-only unless
+an explicit action is registered.
+
+Never emit raw controller commands, Python, arbitrary file writes or unregistered
+instrument operations. Do not change safety flags to force execution. Stop on failure
+or cancellation; report actual results and recovery options. A provider response or
+progress string is not completion evidence.
+
+See [execution contract](agent-execution-spec.md) and [test templates](agent-test-templates.md).

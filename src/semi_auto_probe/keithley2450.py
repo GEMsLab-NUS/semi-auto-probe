@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Protocol
 
 
@@ -480,14 +480,15 @@ class Keithley2450IVRunner:
         *,
         stop_requested: Callable[[], bool] | None = None,
         on_sample: Callable[[IVSweepSample], None] | None = None,
+        strict_cleanup: bool = False,
     ) -> list[IVSweepSample]:
-        self.begin_sweep(config)
+        self.begin_sweep(config, strict_cleanup=strict_cleanup)
         try:
             return self.sample_sweep(stop_requested=stop_requested, on_sample=on_sample)
         finally:
-            self.end_sweep()
+            self.end_sweep(strict=strict_cleanup)
 
-    def begin_sweep(self, config: IVSweepConfig) -> IVSweepConfig:
+    def begin_sweep(self, config: IVSweepConfig, *, strict_cleanup: bool = False) -> IVSweepConfig:
         if self._sweep_config is not None or self._constant_config is not None:
             raise RuntimeError("Keithley measurement session is already active.")
         normalized = config.normalized()
@@ -497,7 +498,14 @@ class Keithley2450IVRunner:
             self._configure_instrument(instrument, normalized)
             self._set_source_value(instrument, normalized.sweep_mode, normalized.start)
             instrument.write(":OUTP ON")
-        except Exception:
+        except Exception as exc:
+            if strict_cleanup:
+                self._sweep_config = replace(normalized, output_off_after=True)
+                try:
+                    self.end_sweep(strict=True)
+                except Exception as cleanup_exc:
+                    raise RuntimeError(f"{exc}; output cleanup failed: {cleanup_exc}") from exc
+                raise
             if self._owns_instrument:
                 try:
                     instrument.close()
@@ -559,23 +567,26 @@ class Keithley2450IVRunner:
                     on_sample(sample)
         return samples
 
-    def end_sweep(self) -> None:
+    def end_sweep(self, *, strict: bool = False) -> None:
         config = self._sweep_config
         instrument = self.instrument
         self._sweep_config = None
         if config is None or instrument is None:
             return
+        errors = []
         if config.output_off_after:
             try:
                 instrument.write(":OUTP OFF")
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(f"output OFF: {exc}")
         if self._owns_instrument:
             try:
                 instrument.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(f"close: {exc}")
             self.instrument = None
+        if strict and errors:
+            raise RuntimeError("; ".join(errors))
 
     def run_constant_voltage_current(
         self,
@@ -596,16 +607,27 @@ class Keithley2450IVRunner:
         normalized = config.normalized()
         instrument = self.instrument or self._open_resource(normalized.resource_name)
         self.instrument = instrument
+        self._constant_config = normalized
         try:
             self._configure_constant_voltage_current(instrument, normalized)
             instrument.write(":OUTP ON")
-        except Exception:
+        except Exception as exc:
+            # An ON command can reach the instrument even if its transport then
+            # raises. Explicitly attempt OFF before releasing the connection.
+            cleanup_errors: list[str] = []
+            try:
+                instrument.write(":OUTP OFF")
+            except Exception as cleanup_exc:
+                cleanup_errors.append(f"output OFF failed: {cleanup_exc}")
+            self._constant_config = None
             if self._owns_instrument:
                 try:
                     instrument.close()
-                except Exception:
-                    pass
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(f"close failed: {cleanup_exc}")
                 self.instrument = None
+            if cleanup_errors:
+                raise RuntimeError(f"Bias initialization failed: {exc}; {'; '.join(cleanup_errors)}") from exc
             raise
         self._constant_config = normalized
         self._constant_source_value = normalized.voltage_v
@@ -649,23 +671,26 @@ class Keithley2450IVRunner:
                 on_sample(sample)
         return samples
 
-    def end_constant_voltage_current(self) -> None:
+    def end_constant_voltage_current(self, *, strict: bool = False) -> None:
         config = self._constant_config
         instrument = self.instrument
         self._constant_config = None
         if config is None or instrument is None:
             return
+        errors: list[str] = []
         if config.output_off_after:
             try:
                 instrument.write(":OUTP OFF")
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(f"output OFF: {exc}")
         if self._owns_instrument:
             try:
                 instrument.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(f"close: {exc}")
             self.instrument = None
+        if strict and errors:
+            raise RuntimeError("; ".join(errors))
 
     def _open_resource(self, resource_name: str) -> VisaInstrument:
         try:
@@ -676,6 +701,24 @@ class Keithley2450IVRunner:
         instrument = manager.open_resource(resource_name)
         instrument.timeout = 10000
         return instrument
+
+    def ensure_output_off(self, resource_name: str) -> None:
+        """Close a bias deliberately left on by a completed workflow node."""
+        instrument = self.instrument or self._open_resource(resource_name)
+        errors = []
+        try:
+            instrument.write(":OUTP OFF")
+        except Exception as exc:
+            errors.append(f"output OFF: {exc}")
+        finally:
+            if self._owns_instrument:
+                try:
+                    instrument.close()
+                except Exception as exc:
+                    errors.append(f"close: {exc}")
+                self.instrument = None
+        if errors:
+            raise RuntimeError("; ".join(errors))
 
     def _configure_instrument(self, instrument: VisaInstrument, config: IVSweepConfig) -> None:
         instrument.write("*RST")

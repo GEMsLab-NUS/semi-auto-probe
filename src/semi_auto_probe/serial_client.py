@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from .protocol import (
     COMM_TEST_COMMAND,
     FRAME_LENGTH,
+    FRAME_HEAD,
+    FUNCTION_CLEAR_POSITION,
+    FUNCTION_GO_HOME,
     FUNCTION_MOTION_PARAMETERS_RESPONSE,
     FUNCTION_MINIMUM_SPEED_RESPONSE,
     FUNCTION_WORK_SPEED_RESPONSE,
@@ -62,6 +65,8 @@ class ControllerSerialClient:
         self._serial = None
         self._lock = threading.RLock()
         self.admin_mode_enabled = False
+        self.before_coordinate_reset = None
+        self._display_tx_tail = b""
 
     @property
     def is_open(self) -> bool:
@@ -93,6 +98,7 @@ class ControllerSerialClient:
             if self._serial:
                 self._serial.close()
                 self._serial = None
+            self._display_tx_tail = b""
 
     def set_admin_mode_enabled(self, enabled: bool) -> None:
         self.admin_mode_enabled = bool(enabled)
@@ -111,6 +117,31 @@ class ControllerSerialClient:
         if payload_contains_go_home_command(command):
             self._require_admin_mode_for_go_home()
 
+    def _before_write(self, command: bytes) -> None:
+        callback = self.before_coordinate_reset
+        if callback is None:
+            return
+        combined = self._display_tx_tail + command
+        reset = False
+        # Observe complete validated frames, including a frame split across raw
+        # writes. The original bytes are always forwarded without modification.
+        for index in range(max(0, len(combined) - FRAME_LENGTH + 1)):
+            if combined[index] != FRAME_HEAD or combined[index + 1] not in {FUNCTION_CLEAR_POSITION, FUNCTION_GO_HOME}:
+                continue
+            try:
+                parse_frame(combined[index:index + FRAME_LENGTH], expected_head=FRAME_HEAD)
+            except ValueError:
+                continue
+            reset = True
+            break
+        self._display_tx_tail = combined[-(FRAME_LENGTH-1):]
+        if reset:
+            try:
+                callback()
+            except Exception:
+                # A display side-channel failure must not suppress a serial command.
+                pass
+
     def send_and_read_frame(self, command: bytes) -> bytes:
         self._authorize_command(command)
         with self._lock:
@@ -119,6 +150,7 @@ class ControllerSerialClient:
             assert self._serial is not None
 
             self._serial.reset_input_buffer()
+            self._before_write(command)
             self._serial.write(command)
             self._serial.flush()
             return self._serial.read(FRAME_LENGTH)
@@ -132,6 +164,7 @@ class ControllerSerialClient:
 
             if reset_input:
                 self._serial.reset_input_buffer()
+            self._before_write(command)
             self._serial.write(command)
             self._serial.flush()
 
@@ -151,6 +184,7 @@ class ControllerSerialClient:
 
             if reset_input:
                 self._serial.reset_input_buffer()
+            self._before_write(payload)
             self._serial.write(payload)
             self._serial.flush()
             if read_length <= 0:
@@ -205,6 +239,7 @@ class ControllerSerialClient:
             assert self._serial is not None
 
             self._serial.reset_input_buffer()
+            self._before_write(command)
             self._serial.write(command)
             self._serial.flush()
             response = self._read_position_response(axis)
@@ -298,6 +333,7 @@ class ControllerSerialClient:
             assert self._serial is not None
 
             self._serial.reset_input_buffer()
+            self._before_write(command)
             self._serial.write(command)
             self._serial.flush()
             response = self._read_io_status_response()
@@ -311,6 +347,7 @@ class ControllerSerialClient:
             assert self._serial is not None
 
             self._serial.reset_input_buffer()
+            self._before_write(command)
             self._serial.write(command)
             self._serial.flush()
             response = self._read_motion_parameters_response(axis)
@@ -340,8 +377,10 @@ class ControllerSerialClient:
                 self.open()
             assert self._serial is not None
             self._serial.reset_input_buffer()
+            self._before_write(minimum_command)
             self._serial.write(minimum_command)
             self._serial.flush()
+            self._before_write(work_command)
             self._serial.write(work_command)
             self._serial.flush()
         return minimum_command, work_command
@@ -474,6 +513,7 @@ class ControllerSerialClient:
             assert self._serial is not None
 
             self._serial.reset_input_buffer()
+            self._before_write(command)
             self._serial.write(command)
             self._serial.flush()
             completed = self._read_multi_axis_completed_response(timeout, moving_axes)
@@ -559,6 +599,7 @@ class ControllerSerialClient:
                 self.open()
             assert self._serial is not None
             self._serial.reset_input_buffer()
+            self._before_write(command)
             self._serial.write(command)
             self._serial.flush()
             response = self._read_go_home_completed_response(expected_axes, timeout)

@@ -1,0 +1,30 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="generator" content="Semi Auto Probe Help"><title>版本与文档基线</title><link rel="stylesheet" type="text/css" href="../assets/help.css"></head><body><div class="topic-header"><div class="product">SEMI AUTO PROBE · OFFICIAL HELP</div><h1>版本与文档基线</h1><p class="summary">本 CHM 对应的实现范围、命名与已知功能边界。</p></div>
+<h2>文档版本</h2>
+<table class="feature-table">
+<tr><th>项目</th><th>值</th></tr>
+<tr><td>应用 package version</td><td>0.1.0</td></tr>
+<tr><td>手册基线</td><td>2026-09-07 当前工作树</td></tr>
+<tr><td>帮助格式</td><td>Microsoft Compiled HTML Help（CHM），UTF-8 源、简体中文语言 0x804</td></tr>
+<tr><td>上下文入口</td><td>11 个主页面及 Workflow/Agent 等附加 context IDs；F1 打开当前主题</td></tr>
+</table>
+<h2>本版同步内容</h2>
+<ul>
+<li>页面名称以 MainView、LayoutMap、SerialIO、Settings 等当前可见标签为准，并兼容旧内部名。</li>
+<li>AutoTest 文档以类型化 Measurement Workflow v2 为准，删除旧的顺序 cards 说明。</li>
+<li>补入 Wire-bond Rectangle/Circle/Polygon、Mapping SQLite、HP 6614C、2450 Fixed-bias、DP100、TEMT6000、公式/条件和 Plot Panel。</li>
+<li>AI Agent 采用 Conversation Only、Authorized Step、Auto Step，记录 blocker、fingerprint 和 completion evidence；旧 Ask only/Admin full access 说明不再适用。</li>
+<li>Web 明确为 session 数据浏览器；不提供 camera、motion 或 E-stop。只有设置 WEB_TOKEN 后才启用认证。</li>
+<li>所有界面截图由当前应用在离线文档模式重新生成。</li>
+</ul>
+<h2>当前功能边界</h2>
+<ul>
+<li>IT、Light Control、Light Pulse、Switch Wavelength 仍是占位节点，Workflow v2 预检拒绝执行。</li>
+<li>Photo IV 当前复用通用 IV 执行，尚未生成声明的 dark/photocurrent/responsivity 特征。</li>
+<li>WobbTest 当前返回 best current，尚未生成声明的 contact resistance。</li>
+<li>ImgMatrix、EdgeTrace、连接与任意仪器配置由 AI Agent 提供帮助/导航，不由 Agent 直接操作。</li>
+<li>CHM 使用传统 Windows HTML Help viewer；页面采用无 JavaScript 的保守 HTML/CSS，视频不编入。</li><li>当前顶栏急停不设置 ImgStitch/EdgeTrace stop event；EdgeTrace Stop 不自动抬到 safe Z；Probe Test Stop/正常结束也不统一抬针。单轴 Stop 后的位置刷新有已知错误。这些硬件语义在安全章节明确记录。</li>
+</ul>
+<h2>维护规则</h2>
+<p>发布功能、UI label、节点端口、输出路径或安全语义改变时，应同步更新 topics、TOC、index、context map 与截图，运行 source verifier，编译 CHM，并用 <code>hh.exe -decompile</code> 检查容器。已发布 context ID 只新增、不重排。</p>
+<p class="related"><strong>相关主题：</strong><a href="welcome.htm">手册首页</a> · <a href="troubleshooting.htm">故障排查</a></p>
+<div class="topic-footer">Semi Auto Probe Help · 文档基线 2026-09-07 · 按 F1 返回当前页面帮助</div></body></html>

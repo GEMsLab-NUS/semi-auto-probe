@@ -1,0 +1,53 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML//EN">
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+</head>
+<body>
+<object type="text/site properties">
+  <param name="Window Styles" value="0x800025">
+  <param name="ImageType" value="Folder">
+</object>
+<ul>
+  <li><object type="text/sitemap"><param name="Name" value="开始使用"><param name="Local" value="topics\welcome.htm"></object>
+  <ul>
+    <li><object type="text/sitemap"><param name="Name" value="快速开始"><param name="Local" value="topics\quick-start.htm"></object></li>
+    <li><object type="text/sitemap"><param name="Name" value="界面说明"><param name="Local" value="topics\interface.htm"></object></li>
+    <li><object type="text/sitemap"><param name="Name" value="安全与急停"><param name="Local" value="topics\safety.htm"></object></li>
+  </ul></li>
+  <li><object type="text/sitemap"><param name="Name" value="页面指南"></object>
+  <ul>
+    <li><object type="text/sitemap"><param name="Name" value="Main — 手动控制"><param name="Local" value="topics\main.htm"></object></li>
+    <li><object type="text/sitemap"><param name="Name" value="Communication — 通信控制台"><param name="Local" value="topics\communication.htm"></object></li>
+    <li><object type="text/sitemap"><param name="Name" value="AutoFocus — 自动对焦"><param name="Local" value="topics\autofocus.htm"></object></li>
+    <li><object type="text/sitemap"><param name="Name" value="FocusMap — 焦平面映射"><param name="Local" value="topics\focusmap.htm"></object></li>
+    <li><object type="text/sitemap"><param name="Name" value="LayoutBond — 版图绑定"><param name="Local" value="topics\layoutbond.htm"></object></li>
+    <li><object type="text/sitemap"><param name="Name" value="ImgStitch — 图像拼接"><param name="Local" value="topics\imgstitch.htm"></object></li>
+    <li><object type="text/sitemap"><param name="Name" value="ImgMatrix — 图像矩阵"><param name="Local" value="topics\imgmatrix.htm"></object></li>
+    <li><object type="text/sitemap"><param name="Name" value="AutoTest — 自动测试"><param name="Local" value="topics\autotest.htm"></object></li>
+    <li><object type="text/sitemap"><param name="Name" value="EdgeTrace — 边缘追踪"><param name="Local" value="topics\edgetrace.htm"></object></li>
+    <li><object type="text/sitemap"><param name="Name" value="AI Agent — 帮助与执行助手"><param name="Local" value="topics\ai-agent.htm"></object></li>
+    <li><object type="text/sitemap"><param name="Name" value="AI Agent 测试模板"><param name="Local" value="topics\agent-templates.htm"></object></li>
+    <li><object type="text/sitemap"><param name="Name" value="Config — 配置"><param name="Local" value="topics\config.htm"></object></li>
+  </ul></li>
+  <li><object type="text/sitemap"><param name="Name" value="测试与测量"></object>
+  <ul>
+    <li><object type="text/sitemap"><param name="Name" value="Wire-bond Mapping"><param name="Local" value="topics\wirebond-mapping.htm"></object></li>
+    <li><object type="text/sitemap"><param name="Name" value="测量工作流编辑器"><param name="Local" value="topics\workflow-editor.htm"></object></li>
+    <li><object type="text/sitemap"><param name="Name" value="测量节点与仪器"><param name="Local" value="topics\measurement-nodes.htm"></object></li>
+  </ul></li>
+  <li><object type="text/sitemap"><param name="Name" value="远程与数据"></object>
+  <ul>
+    <li><object type="text/sitemap"><param name="Name" value="Web Dashboard"><param name="Local" value="topics\web-dashboard.htm"></object></li>
+    <li><object type="text/sitemap"><param name="Name" value="数据、文件与导出"><param name="Local" value="topics\data-files.htm"></object></li>
+  </ul></li>
+  <li><object type="text/sitemap"><param name="Name" value="参考"></object>
+  <ul>
+    <li><object type="text/sitemap"><param name="Name" value="快捷键与速查"><param name="Local" value="topics\shortcuts.htm"></object></li>
+    <li><object type="text/sitemap"><param name="Name" value="故障排查"><param name="Local" value="topics\troubleshooting.htm"></object></li>
+    <li><object type="text/sitemap"><param name="Name" value="术语表"><param name="Local" value="topics\glossary.htm"></object></li>
+    <li><object type="text/sitemap"><param name="Name" value="版本说明"><param name="Local" value="topics\release-notes.htm"></object></li>
+  </ul></li>
+</ul>
+</body>
+</html>
