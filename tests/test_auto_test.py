@@ -13,6 +13,7 @@ from semi_auto_probe.auto_test import (
     AutoTestPointSpec,
     AutoTestSettings,
     PROBE_ASSIST_PROBES,
+    autotest_preview_indices_in_box,
     autotest_point_specs_from_json_payload,
     autotest_point_specs_payload,
     compile_autotest_point_name,
@@ -25,6 +26,8 @@ from semi_auto_probe.auto_test import (
     index_to_letters,
     legacy_measurement_steps_from_flow,
     measurement_flow_steps_from_cards,
+    nearest_autotest_preview_index,
+    remove_autotest_point_specs,
     summarize_autotest_flow,
     wobbtest_xy_offsets_um,
     wobbtest_z_offsets_um,
@@ -466,6 +469,30 @@ class AutoTestTests(unittest.TestCase):
         self.assertEqual(len(round_trip), 8)
         self.assertEqual(round_trip[0], AutoTestPointSpec("DevA1_A1", 0.0, 0.0, 0, 0))
         self.assertEqual(round_trip[-1].name, "DevB1_B2")
+
+    def test_preview_box_selection_handles_dragging_in_any_direction(self) -> None:
+        positions = {0: (10.0, 10.0), 1: (20.0, 20.0), 2: (30.0, 30.0)}
+
+        selected = autotest_preview_indices_in_box(positions, (25.0, 25.0), (5.0, 5.0))
+
+        self.assertEqual(selected, {0, 1})
+
+    def test_preview_click_selects_only_a_nearby_point(self) -> None:
+        positions = {0: (10.0, 10.0), 1: (20.0, 20.0), 2: (30.0, 30.0)}
+
+        self.assertEqual(nearest_autotest_preview_index(positions, (22.0, 19.0), max_distance_px=5.0), 1)
+        self.assertIsNone(nearest_autotest_preview_index(positions, (100.0, 100.0), max_distance_px=5.0))
+
+    def test_removing_selected_preview_points_preserves_remaining_order(self) -> None:
+        specs = (
+            AutoTestPointSpec("A", 1.0, 2.0, 0, 0),
+            AutoTestPointSpec("B", 3.0, 4.0, 0, 1),
+            AutoTestPointSpec("C", 5.0, 6.0, 0, 2),
+        )
+
+        remaining = remove_autotest_point_specs(specs, {0, 2})
+
+        self.assertEqual(remaining, (AutoTestPointSpec("B", 3.0, 4.0, 0, 1),))
 
     def test_autotest_grid_shape_uses_actual_secondary_array_points(self) -> None:
         settings = AutoTestSettings(0, 0, 1, 0, 0, 1, 1, 1, 10, 10, 100, 50, 50, 2, "Dev{i}{j}")

@@ -150,6 +150,47 @@ class AutoTestPointSpec:
     col: int = 0
 
 
+def autotest_preview_indices_in_box(
+    positions: dict[int, tuple[float, float]],
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> set[int]:
+    min_x, max_x = sorted((float(start[0]), float(end[0])))
+    min_y, max_y = sorted((float(start[1]), float(end[1])))
+    return {
+        index
+        for index, (x, y) in positions.items()
+        if min_x <= float(x) <= max_x and min_y <= float(y) <= max_y
+    }
+
+
+def nearest_autotest_preview_index(
+    positions: dict[int, tuple[float, float]],
+    point: tuple[float, float],
+    *,
+    max_distance_px: float = 10.0,
+) -> int | None:
+    if not positions:
+        return None
+    x, y = float(point[0]), float(point[1])
+    index, distance = min(
+        (
+            (index, math.hypot(float(px) - x, float(py) - y))
+            for index, (px, py) in positions.items()
+        ),
+        key=lambda item: item[1],
+    )
+    return index if distance <= float(max_distance_px) else None
+
+
+def remove_autotest_point_specs(
+    specs: tuple[AutoTestPointSpec, ...] | list[AutoTestPointSpec],
+    selected_indices: set[int],
+) -> tuple[AutoTestPointSpec, ...]:
+    selected = {int(index) for index in selected_indices}
+    return tuple(spec for index, spec in enumerate(specs) if index not in selected)
+
+
 @dataclass(frozen=True)
 class AutoTestFlowParam:
     key: str
@@ -2061,6 +2102,11 @@ class AutoTestPanel:
             form.columnconfigure(column, weight=1 if column in (1, 3) else 0)
         custom_form.columnconfigure(0, weight=1)
         imported_specs: tuple[AutoTestPointSpec, ...] | None = None
+        generated_specs_override: tuple[AutoTestPointSpec, ...] | None = None
+        selected_indices: set[int] = set()
+        canvas_point_positions: dict[int, tuple[float, float]] = {}
+        drag_start: tuple[float, float] | None = None
+        selection_rectangle_id: int | None = None
         imported_path_var = tk.StringVar(value="No custom list loaded.")
         ttk.Label(
             custom_form,
@@ -2129,18 +2175,23 @@ class AutoTestPanel:
                 if imported_specs is None:
                     raise ValueError("Import a custom JSON list to preview it.")
                 return imported_specs
+            if generated_specs_override is not None:
+                return generated_specs_override
             return generated_specs()
 
         def generator_params() -> dict[str, object]:
             return {key: variable.get() for key, variable in variables.items()}
 
         def draw_preview(*_args: object) -> None:
+            nonlocal canvas_point_positions
             preview_canvas.delete("all")
             try:
                 specs = current_specs()
             except Exception as exc:
+                canvas_point_positions = {}
                 status_var.set(f"Preview unavailable: {exc}")
                 return
+            selected_indices.intersection_update(range(len(specs)))
             width = max(preview_canvas.winfo_width(), 1)
             height = max(preview_canvas.winfo_height(), 1)
             min_u = min(spec.u for spec in specs)
@@ -2152,11 +2203,111 @@ class AutoTestPanel:
             scale = min((width - 48) / span_u, (height - 48) / span_v)
             center_u = (min_u + max_u) / 2.0
             center_v = (min_v + max_v) / 2.0
-            for spec in specs:
+            canvas_point_positions = {}
+            for index, spec in enumerate(specs):
                 x = width / 2.0 + (spec.u - center_u) * scale
                 y = height / 2.0 - (spec.v - center_v) * scale
-                preview_canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill="#38bdf8", outline="#bae6fd")
-            status_var.set(f"Preview: {len(specs)} point(s). Tokens: {{bi}}, {{bj}}, {{i}}, {{j}}, {{n}}.")
+                canvas_point_positions[index] = (x, y)
+                is_selected = index in selected_indices
+                radius = 6 if is_selected else 4
+                preview_canvas.create_oval(
+                    x - radius,
+                    y - radius,
+                    x + radius,
+                    y + radius,
+                    fill="#f97316" if is_selected else "#38bdf8",
+                    outline="#fed7aa" if is_selected else "#bae6fd",
+                    width=2 if is_selected else 1,
+                    tags=("preview_point", "preview_point_selected" if is_selected else "preview_point_unselected"),
+                )
+            status_var.set(
+                f"Preview: {len(specs)} point(s); {len(selected_indices)} selected. "
+                "Click or drag to select; press Delete to remove."
+            )
+
+        def begin_point_selection(event: tk.Event[tk.Misc]) -> str:
+            nonlocal drag_start, selection_rectangle_id
+            preview_canvas.focus_set()
+            drag_start = (float(event.x), float(event.y))
+            if selection_rectangle_id is not None:
+                preview_canvas.delete(selection_rectangle_id)
+            selection_rectangle_id = preview_canvas.create_rectangle(
+                event.x,
+                event.y,
+                event.x,
+                event.y,
+                outline="#f59e0b",
+                dash=(4, 2),
+                tags=("preview_selection_box",),
+            )
+            return "break"
+
+        def update_point_selection(event: tk.Event[tk.Misc]) -> str:
+            if drag_start is not None and selection_rectangle_id is not None:
+                preview_canvas.coords(
+                    selection_rectangle_id,
+                    drag_start[0],
+                    drag_start[1],
+                    event.x,
+                    event.y,
+                )
+            return "break"
+
+        def finish_point_selection(event: tk.Event[tk.Misc]) -> str:
+            nonlocal drag_start, selection_rectangle_id
+            if drag_start is None:
+                return "break"
+            start = drag_start
+            end = (float(event.x), float(event.y))
+            dragged = abs(end[0] - start[0]) >= 4 or abs(end[1] - start[1]) >= 4
+            selected_indices.clear()
+            if dragged:
+                selected_indices.update(autotest_preview_indices_in_box(canvas_point_positions, start, end))
+            else:
+                nearest = nearest_autotest_preview_index(canvas_point_positions, end, max_distance_px=10)
+                if nearest is not None:
+                    selected_indices.add(nearest)
+            if selection_rectangle_id is not None:
+                preview_canvas.delete(selection_rectangle_id)
+            selection_rectangle_id = None
+            drag_start = None
+            draw_preview()
+            return "break"
+
+        def delete_selected_points(_event: tk.Event[tk.Misc] | None = None) -> str:
+            nonlocal imported_specs, generated_specs_override
+            if not selected_indices:
+                status_var.set("Select one or more preview points before pressing Delete.")
+                return "break"
+            try:
+                specs = current_specs()
+            except Exception as exc:
+                status_var.set(f"Delete failed: {exc}")
+                return "break"
+            remaining = remove_autotest_point_specs(specs, selected_indices)
+            if not remaining:
+                status_var.set("At least one point must remain in the list.")
+                return "break"
+            removed_count = len(specs) - len(remaining)
+            editing_custom_list = source_notebook.index(source_notebook.select()) == 1
+            if editing_custom_list:
+                imported_specs = remaining
+                imported_path_var.set(f"Edited custom list: {len(remaining)} point(s)")
+                self._set_custom_point_specs(
+                    remaining,
+                    f"Removed {removed_count} custom point(s); {len(remaining)} remain.",
+                )
+            else:
+                generated_specs_override = remaining
+            selected_indices.clear()
+            draw_preview()
+            suffix = (
+                "The imported custom list has been updated."
+                if editing_custom_list
+                else "Change an array setting to regenerate the Advanced Array."
+            )
+            status_var.set(f"Removed {removed_count} point(s); {len(remaining)} remain. {suffix}")
+            return "break"
 
         def import_custom_list() -> None:
             nonlocal imported_specs
@@ -2173,6 +2324,7 @@ class AutoTestPanel:
                 status_var.set(f"Import failed: {exc}")
                 return
             imported_specs = specs
+            selected_indices.clear()
             imported_path_var.set(f"{Path(path).name}: {len(specs)} point(s)")
             self._set_custom_point_specs(specs, f"Imported {len(specs)} point(s) from {Path(path).name}.")
             status_var.set(f"Imported {len(specs)} point(s); preview uses the saved coordinates.")
@@ -2241,9 +2393,23 @@ class AutoTestPanel:
         ttk.Button(footer, text="Save List", command=save_list).grid(row=0, column=1, sticky="ew", padx=(4, 4))
         ttk.Button(footer, text="Direct Import", style="Accent.TButton", command=direct_import_generated).grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
+        def on_generator_changed(*_args: object) -> None:
+            nonlocal generated_specs_override
+            generated_specs_override = None
+            selected_indices.clear()
+            draw_preview()
+
+        def on_source_tab_changed(_event: tk.Event[tk.Misc]) -> None:
+            selected_indices.clear()
+            draw_preview()
+
         for variable in variables.values():
-            variable.trace_add("write", draw_preview)
-        source_notebook.bind("<<NotebookTabChanged>>", draw_preview)
+            variable.trace_add("write", on_generator_changed)
+        source_notebook.bind("<<NotebookTabChanged>>", on_source_tab_changed)
+        preview_canvas.bind("<ButtonPress-1>", begin_point_selection)
+        preview_canvas.bind("<B1-Motion>", update_point_selection)
+        preview_canvas.bind("<ButtonRelease-1>", finish_point_selection)
+        preview_canvas.bind("<Delete>", delete_selected_points)
         preview_canvas.bind("<Configure>", draw_preview)
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
         draw_preview()
