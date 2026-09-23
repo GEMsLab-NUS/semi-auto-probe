@@ -1032,16 +1032,42 @@ class GDSCanvasViewer:
             self.canvas.delete("gds_matrix_overlay")
             for overlay_item in self.matrix_fov_polygons_gds:
                 polygon_gds, label, state = self._normalize_matrix_overlay_item(overlay_item)
-                if len(polygon_gds) < 3:
+                if not polygon_gds:
                     continue
-                coords: list[float] = []
-                canvas_points = []
-                for u, v in polygon_gds:
-                    x, y = self.transform.gds_to_canvas(u, v)
-                    coords.extend((x, y))
-                    canvas_points.append((x, y))
                 outline, fill, dash = self._matrix_overlay_style(state)
                 is_autotest = state.lower().strip().startswith("autotest_")
+                canvas_points = [self.transform.gds_to_canvas(u, v) for u, v in polygon_gds]
+                cx = sum(point[0] for point in canvas_points) / len(canvas_points)
+                cy = sum(point[1] for point in canvas_points) / len(canvas_points)
+                if is_autotest:
+                    radius = 7
+                    self.canvas.create_polygon(
+                        cx,
+                        cy - radius,
+                        cx + radius,
+                        cy,
+                        cx,
+                        cy + radius,
+                        cx - radius,
+                        cy,
+                        fill=fill,
+                        outline=outline,
+                        width=2,
+                        tags="gds_matrix_overlay",
+                    )
+                    if label:
+                        self.canvas.create_text(
+                            cx,
+                            cy + 13,
+                            text=label,
+                            fill=outline,
+                            font=("Segoe UI Semibold", 8),
+                            tags="gds_matrix_overlay",
+                        )
+                    continue
+                if len(polygon_gds) < 3:
+                    continue
+                coords = [coordinate for point in canvas_points for coordinate in point]
                 polygon_options = {
                     "fill": fill,
                     "outline": outline,
@@ -1049,34 +1075,13 @@ class GDSCanvasViewer:
                     "stipple": "gray25",
                     "tags": "gds_matrix_overlay",
                 }
-                if is_autotest:
-                    polygon_options["fill"] = ""
-                    polygon_options["width"] = 1
                 if dash is not None:
                     polygon_options["dash"] = dash
                 self.canvas.create_polygon(coords, **polygon_options)
                 if label:
-                    cx = sum(point[0] for point in canvas_points) / len(canvas_points)
-                    cy = sum(point[1] for point in canvas_points) / len(canvas_points)
-                    if is_autotest:
-                        radius = 7
-                        self.canvas.create_polygon(
-                            cx,
-                            cy - radius,
-                            cx + radius,
-                            cy,
-                            cx,
-                            cy + radius,
-                            cx - radius,
-                            cy,
-                            fill=fill,
-                            outline=outline,
-                            width=2,
-                            tags="gds_matrix_overlay",
-                        )
                     self.canvas.create_text(
                         cx,
-                        cy + (13 if is_autotest else 0),
+                        cy,
                         text=label,
                         fill=outline,
                         font=("Segoe UI Semibold", 8),

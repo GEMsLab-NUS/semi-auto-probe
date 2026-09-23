@@ -1708,7 +1708,7 @@ class AutoTestPanel:
             command=self.open_generate_list_dialog,
         )
         self.generate_list_button.grid(row=4, column=0, columnspan=2, sticky="ew", padx=(0, 4), pady=(10, 0))
-        ttk.Button(section, text="Previous Point", command=self.previous_point).grid(
+        ttk.Button(section, text="Preview Point", command=self.preview_point).grid(
             row=4, column=2, columnspan=2, sticky="ew", padx=4, pady=(10, 0)
         )
         ToggleSwitch(
@@ -1944,19 +1944,10 @@ class AutoTestPanel:
         self.origin_v_var.set(f"{v:.12g}")
         self.status_var.set("Origin set from current mapped stage position.")
 
-    def previous_point(self) -> None:
+    def preview_point(self) -> None:
         self._preview_cache_key = None
         self._preview_cache_points = None
-        try:
-            origin_u, origin_v = self._origin_from_ui()
-            vi_u = float(self.u_vector_u_var.get())
-            vi_v = float(self.u_vector_v_var.get())
-        except ValueError as exc:
-            self.status_var.set(f"Previous point unavailable: {exc}")
-            return
-        self.origin_u_var.set(f"{origin_u - vi_u:.12g}")
-        self.origin_v_var.set(f"{origin_v - vi_v:.12g}")
-        self.status_var.set("Origin shifted to previous vi point.")
+        self.status_var.set("Test point preview refreshed.")
         self.redraw_preview()
 
     def import_point_list(self) -> None:
@@ -2315,7 +2306,7 @@ class AutoTestPanel:
             self.summary_var.set(f"Preview unavailable: {exc}")
             return
         overlays = [
-            (list(point.fov_polygon_gds), point.name, f"autotest_{self.point_overlay_states.get((point.row, point.col), 'pending')}")
+            ([(point.u, point.v)], point.name, f"autotest_{self.point_overlay_states.get((point.row, point.col), 'pending')}")
             for point in points
         ]
         self._set_overlays(overlays)

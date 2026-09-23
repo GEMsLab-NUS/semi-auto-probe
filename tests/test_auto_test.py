@@ -30,7 +30,7 @@ from semi_auto_probe.auto_test import (
     wobbtest_z_offsets_um,
 )
 from semi_auto_probe.app import ProbeApp
-from semi_auto_probe.gds_stage_mapper import AffineCoordinateMapper, CalibrationPoint
+from semi_auto_probe.gds_stage_mapper import AffineCoordinateMapper, CalibrationPoint, GDSCanvasViewer
 from semi_auto_probe.keithley2450 import IVSweepConfig, IVSweepSample, IVSweepStatistics
 from semi_auto_probe.dp100 import DP100Setpoint, SimulatedDP100Driver
 from semi_auto_probe.flow_graph import evaluate_condition, graph_start_node, resolve_data_input, validate_flow_graph
@@ -317,7 +317,7 @@ class AutoTestTests(unittest.TestCase):
         self.assertEqual([point.name for point in basic_points], ["DevA1"])
         self.assertEqual([point.name for point in advanced_points], ["A", "B"])
 
-    def test_previous_point_does_not_change_the_selected_point_source(self) -> None:
+    def test_preview_point_only_refreshes_the_selected_point_source(self) -> None:
         class Variable:
             def __init__(self, value) -> None:
                 self.value = value
@@ -332,8 +332,6 @@ class AutoTestTests(unittest.TestCase):
         panel.basic_array_enabled_var = Variable(False)
         panel.origin_u_var = Variable("10")
         panel.origin_v_var = Variable("20")
-        panel.u_vector_u_var = Variable("2")
-        panel.u_vector_v_var = Variable("3")
         panel._preview_cache_key = "old"
         panel._preview_cache_points = (object(),)
         panel.point_source_var = Variable("")
@@ -342,11 +340,76 @@ class AutoTestTests(unittest.TestCase):
         redraws: list[bool] = []
         panel.redraw_preview = lambda: redraws.append(True)
 
-        panel.previous_point()
+        panel.preview_point()
 
         self.assertFalse(panel.basic_array_enabled_var.get())
-        self.assertEqual((panel.origin_u_var.get(), panel.origin_v_var.get()), ("8", "17"))
+        self.assertEqual((panel.origin_u_var.get(), panel.origin_v_var.get()), ("10", "20"))
         self.assertEqual(redraws, [True])
+
+    def test_autotest_preview_overlays_contain_only_point_centers(self) -> None:
+        class Variable:
+            def __init__(self, value="") -> None:
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value) -> None:
+                self.value = value
+
+        panel = object.__new__(AutoTestPanel)
+        panel.viewer = object()
+        panel.get_mapper = self.mapper
+        panel.settings_from_ui = lambda: AutoTestSettings(
+            0, 0, 1, 0, 0, 1, 1, 1, 10, 10, 100, 50, 50, 2, "Dev{i}{j}"
+        )
+        point = AutoTestPoint(
+            row=0,
+            col=0,
+            order=1,
+            name="A",
+            u=10.0,
+            v=20.0,
+            stage_x_um=100.0,
+            stage_y_um=200.0,
+            fov_polygon_gds=((8.0, 18.0), (12.0, 18.0), (12.0, 22.0), (8.0, 22.0)),
+        )
+        panel._points_for_settings = lambda *_args: (point,)
+        panel.point_overlay_states = {}
+        panel.summary_var = Variable()
+        panel._using_advanced_point_list = lambda: False
+        overlays = []
+        panel._set_overlays = lambda items: overlays.extend(items)
+
+        panel.redraw_preview()
+
+        self.assertEqual(overlays, [([(10.0, 20.0)], "A", "autotest_pending")])
+
+    def test_canvas_renders_single_point_autotest_overlay_as_center_marker(self) -> None:
+        class Canvas:
+            def __init__(self) -> None:
+                self.polygons = []
+                self.text = []
+
+            def delete(self, _tag) -> None:
+                pass
+
+            def create_polygon(self, *coords, **options) -> None:
+                self.polygons.append((coords, options))
+
+            def create_text(self, *coords, **options) -> None:
+                self.text.append((coords, options))
+
+        viewer = object.__new__(GDSCanvasViewer)
+        viewer.canvas = Canvas()
+        viewer.transform = type("Transform", (), {"gds_to_canvas": lambda self, u, v: (u * 2, v * 3)})()
+        viewer.matrix_fov_polygons_gds = [([(10.0, 20.0)], "A", "autotest_pending")]
+
+        viewer._draw_matrix_overlay_items()
+
+        self.assertEqual(len(viewer.canvas.polygons), 1)
+        self.assertEqual(len(viewer.canvas.polygons[0][0]), 8)
+        self.assertEqual(viewer.canvas.text[0][1]["text"], "A")
 
     def test_generated_list_button_is_green_only_when_advanced_source_is_active(self) -> None:
         class Variable:
