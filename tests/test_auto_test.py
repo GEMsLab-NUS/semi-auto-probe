@@ -228,9 +228,15 @@ class AutoTestTests(unittest.TestCase):
             def set(self, value: str) -> None:
                 self.value = value
 
+        class Button:
+            def configure(self, **_kwargs) -> None:
+                pass
+
         panel = object.__new__(AutoTestPanel)
         panel.custom_point_specs = None
-        panel.advanced_point_list_var = Variable()
+        panel.basic_array_enabled_var = Variable()
+        panel.basic_array_enabled_var.set(True)
+        panel.generate_list_button = Button()
         panel._preview_cache_key = "old"
         panel._preview_cache_points = (object(),)
         panel.point_overlay_states = {(0, 1): "done"}
@@ -243,7 +249,7 @@ class AutoTestTests(unittest.TestCase):
         panel._set_custom_point_specs(specs, "Imported")
 
         self.assertEqual(panel.point_overlay_states, {})
-        self.assertTrue(panel.advanced_point_list_var.get())
+        self.assertFalse(panel.basic_array_enabled_var.get())
         self.assertEqual(redraws, [True])
 
     def test_advanced_list_origin_does_not_require_basic_array_origin(self) -> None:
@@ -255,7 +261,7 @@ class AutoTestTests(unittest.TestCase):
                 return self.value
 
         panel = object.__new__(AutoTestPanel)
-        panel.advanced_point_list_var = Variable(True)
+        panel.basic_array_enabled_var = Variable(False)
         panel.custom_point_specs = (AutoTestPointSpec("A", -2680.0, -2780.0, 2, 2),)
         panel.origin_u_var = Variable("")
         panel.origin_v_var = Variable("")
@@ -294,7 +300,7 @@ class AutoTestTests(unittest.TestCase):
                 self.value = value
 
         panel = object.__new__(AutoTestPanel)
-        panel.advanced_point_list_var = Variable(False)
+        panel.basic_array_enabled_var = Variable(True)
         panel.custom_point_specs = (
             AutoTestPointSpec("A", 1.0, 2.0, 0, 0),
             AutoTestPointSpec("B", 3.0, 4.0, 0, 1),
@@ -305,11 +311,73 @@ class AutoTestTests(unittest.TestCase):
         settings = AutoTestSettings(10, 20, 1, 0, 0, 1, 1, 1, 10, 10, 100, 50, 50, 2, "Dev{i}{j}")
 
         basic_points = panel._points_for_settings(settings, self.mapper())
-        panel.advanced_point_list_var.set(True)
+        panel.basic_array_enabled_var.set(False)
         advanced_points = panel._points_for_settings(settings, self.mapper())
 
         self.assertEqual([point.name for point in basic_points], ["DevA1"])
         self.assertEqual([point.name for point in advanced_points], ["A", "B"])
+
+    def test_previous_point_does_not_change_the_selected_point_source(self) -> None:
+        class Variable:
+            def __init__(self, value) -> None:
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value) -> None:
+                self.value = value
+
+        panel = object.__new__(AutoTestPanel)
+        panel.basic_array_enabled_var = Variable(False)
+        panel.origin_u_var = Variable("10")
+        panel.origin_v_var = Variable("20")
+        panel.u_vector_u_var = Variable("2")
+        panel.u_vector_v_var = Variable("3")
+        panel._preview_cache_key = "old"
+        panel._preview_cache_points = (object(),)
+        panel.point_source_var = Variable("")
+        panel.status_var = Variable("")
+        panel.custom_point_specs = (AutoTestPointSpec("A", 1.0, 2.0, 0, 0),)
+        redraws: list[bool] = []
+        panel.redraw_preview = lambda: redraws.append(True)
+
+        panel.previous_point()
+
+        self.assertFalse(panel.basic_array_enabled_var.get())
+        self.assertEqual((panel.origin_u_var.get(), panel.origin_v_var.get()), ("8", "17"))
+        self.assertEqual(redraws, [True])
+
+    def test_generated_list_button_is_green_only_when_advanced_source_is_active(self) -> None:
+        class Variable:
+            def __init__(self, value) -> None:
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value) -> None:
+                self.value = value
+
+        class Button:
+            def __init__(self) -> None:
+                self.style = ""
+
+            def configure(self, *, style: str) -> None:
+                self.style = style
+
+        panel = object.__new__(AutoTestPanel)
+        panel.basic_array_enabled_var = Variable(True)
+        panel.custom_point_specs = (AutoTestPointSpec("A", 1.0, 2.0, 0, 0),)
+        panel.point_source_var = Variable("")
+        panel.generate_list_button = Button()
+
+        panel._update_point_source_controls()
+        self.assertEqual(panel.generate_list_button.style, "TButton")
+
+        panel.basic_array_enabled_var.set(False)
+        panel._update_point_source_controls()
+        self.assertEqual(panel.generate_list_button.style, "Accent.TButton")
 
     def test_nested_point_generator_payload_round_trips(self) -> None:
         specs = generate_nested_autotest_point_specs(
