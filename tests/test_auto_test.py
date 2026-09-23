@@ -211,7 +211,7 @@ class AutoTestTests(unittest.TestCase):
     def test_legacy_coordinate_only_import_uses_base_array_settings(self) -> None:
         panel = object.__new__(AutoTestPanel)
         settings = AutoTestSettings(100, 200, 10, 1, -2, 20, 4, 5, 10, 10, 100, 50, 50, 2, "Dev{i}{j}")
-        panel.settings_from_ui = lambda: settings
+        panel.settings_from_ui = lambda **_kwargs: settings
 
         specs = panel._point_specs_from_import_payload({"coordinate_list": [[2, 3]]})
 
@@ -222,11 +222,15 @@ class AutoTestTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.value = ""
 
+            def get(self):
+                return self.value
+
             def set(self, value: str) -> None:
                 self.value = value
 
         panel = object.__new__(AutoTestPanel)
         panel.custom_point_specs = None
+        panel.advanced_point_list_var = Variable()
         panel._preview_cache_key = "old"
         panel._preview_cache_points = (object(),)
         panel.point_overlay_states = {(0, 1): "done"}
@@ -239,7 +243,73 @@ class AutoTestTests(unittest.TestCase):
         panel._set_custom_point_specs(specs, "Imported")
 
         self.assertEqual(panel.point_overlay_states, {})
+        self.assertTrue(panel.advanced_point_list_var.get())
         self.assertEqual(redraws, [True])
+
+    def test_advanced_list_origin_does_not_require_basic_array_origin(self) -> None:
+        class Variable:
+            def __init__(self, value) -> None:
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        panel = object.__new__(AutoTestPanel)
+        panel.advanced_point_list_var = Variable(True)
+        panel.custom_point_specs = (AutoTestPointSpec("A", -2680.0, -2780.0, 2, 2),)
+        panel.origin_u_var = Variable("")
+        panel.origin_v_var = Variable("")
+        panel.u_vector_u_var = Variable("1000")
+        panel.u_vector_v_var = Variable("0")
+        panel.v_vector_u_var = Variable("0")
+        panel.v_vector_v_var = Variable("1000")
+        panel.rows_var = Variable("3")
+        panel.cols_var = Variable("3")
+        panel.fov_width_var = Variable("100")
+        panel.fov_height_var = Variable("100")
+        panel.z_down_margin_var = Variable("100")
+        panel.z_up_fast_percent_var = Variable("50")
+        panel.z_fast_speed_percent_var = Variable("50")
+        panel.z_slow_speed_percent_var = Variable("2")
+        panel.name_pattern_var = Variable("Dev{i}{j}")
+        panel.z_wobble_um_var = Variable("4")
+        panel.z_wobble_cycles_var = Variable("1")
+        panel.z_offset_um_var = Variable("10")
+        panel.measurement_steps = lambda: ()
+        panel.measurement_flow = lambda: ()
+
+        settings = panel.settings_from_ui()
+
+        self.assertEqual((settings.origin_u, settings.origin_v), (-2680.0, -2780.0))
+
+    def test_point_source_switch_selects_basic_or_advanced_points(self) -> None:
+        class Variable:
+            def __init__(self, value) -> None:
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value) -> None:
+                self.value = value
+
+        panel = object.__new__(AutoTestPanel)
+        panel.advanced_point_list_var = Variable(False)
+        panel.custom_point_specs = (
+            AutoTestPointSpec("A", 1.0, 2.0, 0, 0),
+            AutoTestPointSpec("B", 3.0, 4.0, 0, 1),
+        )
+        panel._preview_cache_key = None
+        panel._preview_cache_points = None
+        panel.get_camera_fov_rotation_deg = lambda: 0.0
+        settings = AutoTestSettings(10, 20, 1, 0, 0, 1, 1, 1, 10, 10, 100, 50, 50, 2, "Dev{i}{j}")
+
+        basic_points = panel._points_for_settings(settings, self.mapper())
+        panel.advanced_point_list_var.set(True)
+        advanced_points = panel._points_for_settings(settings, self.mapper())
+
+        self.assertEqual([point.name for point in basic_points], ["DevA1"])
+        self.assertEqual([point.name for point in advanced_points], ["A", "B"])
 
     def test_nested_point_generator_payload_round_trips(self) -> None:
         specs = generate_nested_autotest_point_specs(

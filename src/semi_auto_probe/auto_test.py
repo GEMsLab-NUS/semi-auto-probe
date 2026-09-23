@@ -1446,6 +1446,7 @@ class AutoTestPanel:
         self.last_overlay_items: list[MatrixOverlay] = []
         self.running = False
         self.custom_point_specs: tuple[AutoTestPointSpec, ...] | None = None
+        self.advanced_point_list_var = tk.BooleanVar(value=False)
 
         self.origin_u_var = tk.StringVar(value="")
         self.origin_v_var = tk.StringVar(value="")
@@ -1701,12 +1702,27 @@ class AutoTestPanel:
                 ttk.Label(section, text="-", style="Muted.TLabel").grid(row=index, column=4, sticky="ew", pady=(6, 0))
             else:
                 ttk.Spinbox(section, from_=1, to=500, increment=1, textvariable=count_var, width=7).grid(row=index, column=4, sticky="ew", pady=(6, 0))
+        source_choice = ttk.Frame(section, style="Panel.TFrame")
+        source_choice.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(10, 0))
+        source_choice.columnconfigure((0, 2), weight=1)
+        ttk.Label(source_choice, text="Basic Array", style="Panel.TLabel", anchor="e").grid(
+            row=0, column=0, sticky="ew", padx=(0, 8)
+        )
+        ToggleSwitch(
+            source_choice,
+            self.advanced_point_list_var,
+            self.colors,
+            command=self._on_point_source_mode_changed,
+        ).grid(row=0, column=1)
+        ttk.Label(source_choice, text="Advanced List", style="Panel.TLabel").grid(
+            row=0, column=2, sticky="ew", padx=(8, 0)
+        )
         actions = ttk.Frame(section, style="Panel.TFrame")
-        actions.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(10, 0))
+        actions.grid(row=5, column=0, columnspan=5, sticky="ew", pady=(8, 0))
         actions.columnconfigure((0, 1), weight=1, uniform="autotest_point_actions")
         ttk.Button(actions, text="Generate List", command=self.open_generate_list_dialog).grid(row=0, column=0, sticky="ew", padx=(0, 4))
         ttk.Button(actions, text="Previous Point", command=self.previous_point).grid(row=0, column=1, sticky="ew", padx=(4, 0))
-        ttk.Label(section, textvariable=self.point_source_var, style="Muted.TLabel").grid(row=5, column=0, columnspan=5, sticky="ew", pady=(6, 0))
+        ttk.Label(section, textvariable=self.point_source_var, style="Muted.TLabel").grid(row=6, column=0, columnspan=5, sticky="ew", pady=(6, 0))
         return row + 1
 
     def _build_approach_section(self, parent: ttk.Frame, row: int) -> int:
@@ -1933,10 +1949,10 @@ class AutoTestPanel:
         self.status_var.set("Origin set from current mapped stage position.")
 
     def previous_point(self) -> None:
-        self.custom_point_specs = None
+        self.advanced_point_list_var.set(False)
         self._preview_cache_key = None
         self._preview_cache_points = None
-        self.point_source_var.set("Point source: Base array")
+        self._update_point_source_label()
         try:
             origin_u, origin_v = self._origin_from_ui()
             vi_u = float(self.u_vector_u_var.get())
@@ -1971,16 +1987,43 @@ class AutoTestPanel:
             and not isinstance(payload.get("points"), list)
             and "coordinate_list" in payload
         ):
-            grid_settings = self.settings_from_ui()
+            grid_settings = self.settings_from_ui(force_basic_array=True)
         return autotest_point_specs_from_json_payload(payload, grid_settings=grid_settings)
 
     def _set_custom_point_specs(self, specs: tuple[AutoTestPointSpec, ...], message: str) -> None:
         self.custom_point_specs = tuple(specs)
+        self.advanced_point_list_var.set(True)
         self._preview_cache_key = None
         self._preview_cache_points = None
         self.point_overlay_states = {}
-        self.point_source_var.set(f"Point source: {len(specs)} imported/generated point(s)")
+        self._update_point_source_label()
         self.status_var.set(message)
+        self.redraw_preview()
+
+    def _using_advanced_point_list(self) -> bool:
+        return bool(self.advanced_point_list_var.get())
+
+    def _update_point_source_label(self) -> None:
+        count = len(self.custom_point_specs) if self.custom_point_specs is not None else 0
+        if self._using_advanced_point_list():
+            if count:
+                self.point_source_var.set(f"Point source: Advanced List ({count} point(s))")
+            else:
+                self.point_source_var.set("Point source: Advanced List (generate or import a list)")
+        elif count:
+            self.point_source_var.set(f"Point source: Basic Array (advanced list available: {count})")
+        else:
+            self.point_source_var.set("Point source: Basic Array")
+
+    def _on_point_source_mode_changed(self) -> None:
+        self._preview_cache_key = None
+        self._preview_cache_points = None
+        self._update_point_source_label()
+        if self._using_advanced_point_list() and self.custom_point_specs is None:
+            self.status_var.set("Advanced List selected. Generate or import a list first.")
+        else:
+            source = "Advanced List" if self._using_advanced_point_list() else "Basic Array"
+            self.status_var.set(f"Point source switched to {source}.")
         self.redraw_preview()
 
     def open_generate_list_dialog(self) -> None:
@@ -2222,11 +2265,20 @@ class AutoTestPanel:
         except ValueError as exc:
             raise ValueError("Set a numeric AutoTest origin first.") from exc
 
-    def settings_from_ui(self) -> AutoTestSettings:
+    def _settings_origin(self, *, force_basic_array: bool = False) -> tuple[float, float]:
+        if not force_basic_array and self._using_advanced_point_list():
+            if not self.custom_point_specs:
+                raise ValueError("Advanced List is selected, but no generated/imported points are available.")
+            first = self.custom_point_specs[0]
+            return float(first.u), float(first.v)
+        return self._origin_from_ui()
+
+    def settings_from_ui(self, *, force_basic_array: bool = False) -> AutoTestSettings:
         try:
+            origin_u, origin_v = self._settings_origin(force_basic_array=force_basic_array)
             return AutoTestSettings(
-                origin_u=float(self.origin_u_var.get()),
-                origin_v=float(self.origin_v_var.get()),
+                origin_u=origin_u,
+                origin_v=origin_v,
                 u_vector_u=float(self.u_vector_u_var.get()),
                 u_vector_v=float(self.u_vector_v_var.get()),
                 v_vector_u=float(self.v_vector_u_var.get()),
@@ -2270,7 +2322,7 @@ class AutoTestPanel:
         ]
         self._set_overlays(overlays)
         last = points[-1]
-        source = "custom list" if self.custom_point_specs is not None else f"{settings.rows} x {settings.cols}"
+        source = "advanced list" if self._using_advanced_point_list() else f"basic array {settings.rows} x {settings.cols}"
         self.summary_var.set(
             f"Preview: {source} = {len(points)} test point(s). "
             f"Last {last.name} UV {last.u:.6g}, {last.v:.6g}; "
@@ -2278,6 +2330,7 @@ class AutoTestPanel:
         )
 
     def _points_for_settings(self, settings: AutoTestSettings, mapper: AffineCoordinateMapper) -> tuple[AutoTestPoint, ...]:
+        use_advanced = self._using_advanced_point_list()
         key = (
             id(mapper),
             settings.origin_u,
@@ -2292,11 +2345,14 @@ class AutoTestPanel:
             settings.fov_height_um,
             round(float(self.get_camera_fov_rotation_deg()), 8),
             settings.name_pattern,
+            use_advanced,
             self.custom_point_specs,
         )
         if self._preview_cache_key == key and self._preview_cache_points is not None:
             return self._preview_cache_points
-        if self.custom_point_specs is not None:
+        if use_advanced:
+            if self.custom_point_specs is None:
+                raise ValueError("Advanced List is selected, but no generated/imported points are available.")
             points = generate_autotest_points_from_specs(self.custom_point_specs, settings, mapper, self.get_camera_fov_rotation_deg())
         else:
             points = generate_autotest_points(settings, mapper, self.get_camera_fov_rotation_deg())
@@ -2382,6 +2438,7 @@ class AutoTestPanel:
         self.fov_height_var.set(f"{settings.fov_height_um:g}")
         self.name_pattern_var.set(settings.name_pattern)
         self.custom_point_specs = tuple(specs) if specs is not None else None
+        self.advanced_point_list_var.set(specs is not None)
         positions = ([(spec.row, spec.col) for spec in specs] if specs is not None else
                      [(row, col) for row in range(settings.rows) for col in range(settings.cols)])
         self.point_overlay_states = {
