@@ -146,6 +146,11 @@ class MeasureDebugApp(tk.Tk):
             self._write_log(f"ERROR {exc}")
 
     def run_graph(self) -> None:
+        self.designer._finish_inline_edit()
+        if self.designer._collect_issues():
+            self.designer._validate()
+            self._write_log("INVALID: resolve the issues shown below the canvas before running.")
+            return
         steps = measurement_flow_steps_from_cards(self.cards)
         errors = validate_flow_graph(steps)
         if errors:
@@ -241,7 +246,7 @@ class MeasureDebugApp(tk.Tk):
         for index, item in enumerate(payload):
             params = {str(key): str(value) for key, value in item.get("params", {}).items()}
             card_id = params.pop("_node_id", f"flow_{index + 1}")
-            card = create_autotest_flow_card(str(item["type_id"]), card_id)
+            card = create_autotest_flow_card(str(item["type_id"]), card_id, saved_params=params)
             card.params.update(params)
             card.x = float(card.params.pop("_x", 100 + index * 270))
             card.y = float(card.params.pop("_y", 100))

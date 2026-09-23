@@ -10,7 +10,7 @@ import numpy as np
 
 from .workflow_formula import Curve, InvalidValue
 
-LAYOUTS = {"1x1": (1, 1), "1x2": (1, 2), "2x2": (2, 2), "2x3": (2, 3)}
+from .workflow_ports import PLOT_LAYOUTS as LAYOUTS
 
 
 def current_position_marker():
@@ -52,30 +52,12 @@ def validate_panel(step):
             limits(p.get(f"slot{i}_{axis}lim", "auto"), scale)
 
 
-def display_sample_indices(y, pixels):
-    """Preserve extrema and their acquisition order in each pixel bucket."""
-    y = np.asarray(y, dtype=float)
-    buckets = max(1, int(pixels))
-    if len(y) <= buckets * 2:
-        return np.arange(len(y))
-    width = math.ceil(len(y) / buckets)
-    count = math.ceil(len(y) / width)
-    padded = np.full(count * width, np.nan)
-    padded[:len(y)] = y
-    blocks = padded.reshape(count, width)
-    valid = np.isfinite(blocks)
-    offsets = np.arange(count) * width
-    low = offsets + np.argmin(np.where(valid, blocks, np.inf), axis=1)
-    high = offsets + np.argmax(np.where(valid, blocks, -np.inf), axis=1)
-    indices = np.unique(np.concatenate(([0], low, high, [len(y)-1])))
-    return indices[indices < len(y)]
-
-
 class PlotSlot:
     """Persistent artists; can be exercised using the Agg canvas without Tk."""
 
     def __init__(self, figure, params, index, shape, mode):
         from matplotlib.colors import Normalize, LogNorm
+        from matplotlib.ticker import EngFormatter
         self.figure, self.params, self.index, self.mode = figure, params, index, mode
         self.axes = figure.add_subplot(111)
         self.lines = {}
@@ -100,7 +82,11 @@ class PlotSlot:
             self.image = self.axes.imshow(np.full(shape, np.nan), origin="lower", norm=norm, interpolation="nearest", aspect="auto")
             self.colorbar = figure.colorbar(self.image, ax=self.axes)
             from .workflow_ports import metric_unit
-            self.colorbar.set_label(params.get(f"_input_slot{index}_unit") or metric_unit(params.get(f"_input_slot{index}_output", "")))
+            unit = params.get(f"_input_slot{index}_unit") or metric_unit(params.get(f"_input_slot{index}_output", ""))
+            colorbar_label = f"Magnitude ({unit})" if unit else "Magnitude"
+            self.colorbar.set_label(colorbar_label if self.get("cscale", "linear") == "log" else unit)
+            self.colorbar.formatter = EngFormatter(unit=unit if unit != "1" else "", sep=" ")
+            self.colorbar.update_ticks()
             self.state_image = self.axes.imshow(np.ma.masked_all(shape), origin="lower", aspect="auto", interpolation="nearest",
                 cmap=ListedColormap(["#d1d5db", "#ef4444", "#f59e0b", "#64748b"]), vmin=0, vmax=3, alpha=.6)
             self.marker, = self.axes.plot(
@@ -110,6 +96,19 @@ class PlotSlot:
             )
             self.axes.set_xlabel("Mapping column (0-based)")
             self.axes.set_ylabel("Mapping row (0-based)")
+        else:
+            self.axes.xaxis.set_major_formatter(EngFormatter(sep=" "))
+            self.axes.yaxis.set_major_formatter(EngFormatter(sep=" "))
+            if mode in {"curve", "trace"}:
+                self.axes.set_axisbelow(True)
+                self.axes.grid(
+                    True,
+                    which="major",
+                    axis="both",
+                    color="#808080",
+                    alpha=0.28,
+                    linewidth=0.6,
+                )
         figure.subplots_adjust(left=.19, right=.94, bottom=.2, top=.85)
         # imshow changes data limits, so apply configured bounds afterwards.
         for axis in "xy":
@@ -130,18 +129,35 @@ class PlotSlot:
             active.add(label)
             if label not in self.lines:
                 self.lines[label], = self.axes.plot([], [], label=label, linewidth=1)
-            x, y = np.asarray(curve.x, dtype=float), np.asarray(curve.y, dtype=float)
+            measured_x = self.get("iv_x_axis", "V set") == "V measure" and curve.x_measured is not None
+            x = np.asarray(curve.x_measured if measured_x else curve.x, dtype=float)
+            y = np.asarray(curve.y, dtype=float)
+            x_log = self.get("xscale", "linear") == "log"
+            y_log = self.get("yscale", "linear") == "log"
+            if x_log:
+                x = np.abs(x)
+            if y_log:
+                y = np.abs(y)
             mask = ~np.isfinite(x) | ~np.isfinite(y)
-            if self.get("xscale", "linear") == "log":
-                mask |= x <= 0
-            if self.get("yscale", "linear") == "log":
-                mask |= y <= 0
+            if x_log:
+                mask |= x == 0
+            if y_log:
+                mask |= y == 0
             self.masked |= bool(mask.any())
-            y = np.where(mask, np.nan, y)
-            indices = display_sample_indices(y, self.axes.bbox.width)
-            self.lines[label].set_data(x[indices], y[indices])
-            self.axes.set_xlabel(f"{ {'s': 'Time', 'V': 'Voltage', 'A': 'Current'}.get(curve.x_unit, 'X')} ({curve.x_unit})")
-            self.axes.set_ylabel(f"{ {'A': 'Current', 'V': 'Voltage', 'Ω': 'Resistance'}.get(curve.y_unit, 'Y')} ({curve.y_unit})")
+            x, y = np.where(mask, np.nan, x), np.where(mask, np.nan, y)
+            self.lines[label].set_data(x, y)
+            x_name = self.params.get(f'_input_slot{self.index}_x_label') or {'s': 'Time', 'V': 'Voltage', 'A': 'Current'}.get(curve.x_unit, 'X')
+            if x_name == "V measure" and not measured_x:
+                x_name = "V set"
+            y_name = {'A': 'Current', 'V': 'Voltage', 'Ω': 'Resistance'}.get(curve.y_unit, 'Y')
+            self.axes.set_xlabel(f"{'|' + x_name + '|' if x_log else x_name} ({curve.x_unit})")
+            self.axes.set_ylabel(f"{'|' + y_name + '|' if y_log else y_name} ({curve.y_unit})")
+            if self.axes.xaxis.get_major_formatter().unit != curve.x_unit:
+                from matplotlib.ticker import EngFormatter
+                self.axes.xaxis.set_major_formatter(EngFormatter(unit=curve.x_unit, sep=" "))
+            if self.axes.yaxis.get_major_formatter().unit != curve.y_unit:
+                from matplotlib.ticker import EngFormatter
+                self.axes.yaxis.set_major_formatter(EngFormatter(unit=curve.y_unit, sep=" "))
         for label in set(self.lines) - active:
             self.lines.pop(label).remove()
         self.axes.relim()
@@ -179,7 +195,8 @@ class PlotSlot:
     def heatmap(self, values, states, current):
         data = np.asarray(values, dtype=float).copy()
         if self.get("cscale", "linear") == "log":
-            data[data <= 0] = np.nan
+            data = np.abs(data)
+            data[data == 0] = np.nan
         self.masked = bool(np.any(np.isfinite(values) & ~np.isfinite(data)))
         self.image.set_data(np.ma.masked_invalid(data))
         finite = data[np.isfinite(data)]
@@ -232,8 +249,9 @@ class WorkflowPlotPanel:
         from matplotlib.figure import Figure
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
         self.window = tk.Toplevel(parent)
-        self.window.title("Measurement Workflow — Plot Panel")
-        self.window.geometry("1200x760")
+        self.panel_id = step.params.get("_node_id", "Plot Panel")
+        self.window.title(f"Measurement Workflow — {self.panel_id}")
+
         self.window.protocol("WM_DELETE_WINDOW", self.window.withdraw)
         self.step, self.shape = step, shape
         self.slots, self.canvases, self.values, self.states = {}, {}, {}, {}
@@ -243,6 +261,7 @@ class WorkflowPlotPanel:
         self.finished = False
         self.job = None
         rows, cols = LAYOUTS[step.params.get("layout", "1x2")]
+        self.window.geometry(f"{max(420, 24 + cols * 340)}x{max(400, 54 + rows * 330)}")
         for i in range(1, rows * cols + 1):
             figure = Figure(figsize=(4, 3), dpi=90)
             mode = step.params.get(f"_input_slot{i}_type", "trace")
@@ -275,18 +294,21 @@ class WorkflowPlotPanel:
 
     def point_started(self, row, col):
         self.current = (row, col)
-        self.live.clear()
-        for slot in self.slots.values():
-            if slot.mode != "number":
+        for i, slot in self.slots.items():
+            if slot.mode != "number" and not self.step.params.get(f"_input_slot{i}_retain_between_points", False):
+                key = (self.step.params.get(f"_input_slot{i}_source"), self.step.params.get(f"_input_slot{i}_output"))
+                self.live.pop(key, None)
                 slot.auto_initialized.clear()
         self.dirty.update(self.slots)
         self.status.set(f"Running row {row}, column {col} · gray: missing · slate: skipped · red: failed · amber: incomplete")
 
     def curves_updated(self, node_id, output, curves):
-        self.live[node_id, output] = curves
-        for i, slot in self.slots.items():
-            if self.step.params.get(f"_input_slot{i}_source") == node_id and self.step.params.get(f"_input_slot{i}_output") == output:
-                self.dirty.add(i)
+        matching = [i for i in self.slots
+                    if self.step.params.get(f"_input_slot{i}_source") == node_id
+                    and self.step.params.get(f"_input_slot{i}_output") == output]
+        if matching:
+            self.live[node_id, output] = curves
+            self.dirty.update(matching)
 
     def point_finished(self, row, col, values, status, history_path, details=None):
         self.history[row, col] = history_path
@@ -315,7 +337,8 @@ class WorkflowPlotPanel:
             for node_id, outputs in payload["curves"].items():
                 for output, family in outputs.items():
                     self.curves_updated(node_id, output, {label: Curve(**curve) for label, curve in family.items()})
-            reasons = [d["reason"] for d in payload.get("details", {}).values() if d.get("reason")]
+            panel_details = payload.get("panels", {}).get(self.panel_id, {}).get("details", payload.get("details", {}))
+            reasons = [d["reason"] for d in panel_details.values() if d.get("reason")]
             self.status.set(f"Saved point: {payload.get('point')} · {payload.get('status')}" + (" · " + "; ".join(reasons) if reasons else ""))
             self.tick(force=True)
         except (OSError, ValueError) as exc:
@@ -340,7 +363,7 @@ class WorkflowPlotPanel:
         if heatmap_due:
             self.last_heatmap = now
         if any(slot.masked for slot in self.slots.values()):
-            self.status.set("Non-finite or non-positive log values are hidden; raw data is unchanged.")
+            self.status.set("Non-finite values and zeros on log axes are hidden; negative log values are shown by magnitude.")
         delay = max(10, 50 - int((time.monotonic() - now) * 1000))
         self.job = None if self.finished else self.window.after(delay, self.tick)
 

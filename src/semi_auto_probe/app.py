@@ -52,15 +52,19 @@ from .auto_test import (
     AutoTestPoint,
     AutoTestSettings,
     generate_autotest_points,
+    generate_autotest_points_from_specs,
     wobbtest_xy_offsets_um,
     wobbtest_z_offsets_um,
 )
+from .autotest_resume import (completed_prefix, create_manifest, mark_completed, point_specs_from_manifest,
+                              read_manifest, settings_from_manifest)
 from .dp100 import DEFAULT_LASER_PARAMS, DP100Driver, DP100Setpoint
 from .mapping import MappingPoint, MappingSettings, MappingSession, generate_mapping_plan, run_mapping, collect_workflow_data
 from .mapping_panel import MappingPanel
-from .flow_graph import evaluate_condition, graph_start_node, resolve_data_input, step_node_id, is_graph_workflow
+from .flow_graph import control_node_runs_on_every_path, evaluate_condition, graph_start_node, resolve_data_input, step_node_id, is_graph_workflow
 from .help_system import open_help
 from .ui.device_status_panel import DeviceStatusWindow
+from .ui.instrument_window import InstrumentWindow
 from .workflow_ports import DATA_ONLY_TYPES, CURVE_NODES
 from .workflow_runtime import NodeCapture, json_value
 from .workflow_formula import InvalidValue
@@ -168,6 +172,12 @@ from .hp6614c import (
     hp6614c_sweep_config_from_params,
 )
 from .logging_utils import colorize_hex_frame, configure_logging, print_startup_banner
+from .ntfy import (
+    NtfyNotifier,
+    format_autotest_completion,
+    format_test_notification,
+    install_ntfy_error_handler,
+)
 from .protocol import COMM_TEST_COMMAND, FUNCTION_READ_POSITION, RESPONSE_HEAD, Axis, AxisPosition, IoStatus, hex_bytes, parse_axis_position_response
 from .protocol import payload_contains_clear_position_command, payload_contains_go_home_command
 from .serial_client import ControllerSerialClient, CommunicationTestResult, list_serial_ports
@@ -1441,6 +1451,8 @@ class ProbeApp(tk.Tk):
         except Exception as exc:
             self.probe_config = ProbeConfig()
             logger.error("Failed to load probe config from %s: %s", self.config_path, exc)
+        self.ntfy_notifier: NtfyNotifier | None = None
+        self._configure_ntfy_notifications()
         self.agent_planner = self._build_agent_planner()
 
         self.connection_mode_var = tk.StringVar(value=SERIAL_MODE_LOCAL)
@@ -1677,6 +1689,11 @@ class ProbeApp(tk.Tk):
         self.agent_base_url_var = tk.StringVar(value=self.probe_config.agent_base_url)
         self.agent_model_var = tk.StringVar(value=self.probe_config.agent_model)
         self.agent_timeout_var = tk.StringVar(value=f"{self.probe_config.agent_timeout_seconds:g}")
+        self.ntfy_enabled_var = tk.BooleanVar(value=self.probe_config.ntfy_enabled)
+        self.ntfy_server_url_var = tk.StringVar(value=self.probe_config.ntfy_server_url)
+        self.ntfy_topic_var = tk.StringVar(value=self.probe_config.ntfy_topic)
+        self.ntfy_notify_errors_var = tk.BooleanVar(value=self.probe_config.ntfy_notify_errors)
+        self.ntfy_notify_completions_var = tk.BooleanVar(value=self.probe_config.ntfy_notify_completions)
         self.set_xyz_zero_button: ttk.Button | None = None
         self.set_autofocus_z_zero_button: ttk.Button | None = None
         self.go_home_button: ttk.Button | None = None
@@ -1755,6 +1772,12 @@ class ProbeApp(tk.Tk):
         style.map("Accent.TButton", background=[("active", "#14543f"), ("pressed", "#0f3b2d")])
         style.configure("Danger.TButton", background="#4c0519", foreground="#ffe4e6", bordercolor="#be123c", padding=(12, 6))
         style.map("Danger.TButton", background=[("active", "#881337"), ("pressed", "#4c0519")])
+        style.configure("Instrument.TButton", background="#1e4f91", foreground="#eff6ff",
+                        bordercolor="#3b82c4", padding=(11, 7))
+        style.map("Instrument.TButton",
+                  background=[("disabled", "#16263b"), ("pressed", "#173e73"), ("active", "#2865ae")],
+                  foreground=[("disabled", "#7186a3"), ("!disabled", "#eff6ff")],
+                  bordercolor=[("focus", "#93c5fd"), ("active", "#60a5fa"), ("!disabled", "#3b82c4")])
         style.configure("Ghost.TButton", background=self.colors["surface"], foreground=self.colors["muted"], bordercolor=self.colors["border"], padding=(8, 6))
         style.map("Ghost.TButton", background=[("active", self.colors["surface_2"])], foreground=[("active", self.colors["text"])])
         style.configure("TEntry", fieldbackground=self.colors["input"], background=self.colors["input"], foreground=self.colors["text"], bordercolor=self.colors["border"], lightcolor=self.colors["border"], darkcolor=self.colors["border"], insertcolor=self.colors["accent"], relief="flat", borderwidth=1, padding=(10, 7))
@@ -2077,6 +2100,12 @@ class ProbeApp(tk.Tk):
         ttk.Button(serial_group, text="Refresh", style="Ghost.TButton", command=self.refresh_ports).grid(row=0, column=3, padx=(0, 6))
         ttk.Button(serial_group, text="Connect", style="Accent.TButton", command=self.connect_and_test_serial).grid(row=0, column=4, padx=(0, 6))
         ttk.Button(serial_group, text="Test", command=self.run_comm_test).grid(row=0, column=5)
+        self.instrument_button_var = tk.StringVar(value="Instrument")
+        self.instrument_button = ttk.Button(
+            serial_group, textvariable=self.instrument_button_var, command=self._show_instrument,
+            style="Instrument.TButton",
+        )
+        self.instrument_button.grid(row=0, column=6, padx=(6, 0))
         self._update_serial_port_style()
 
         camera_group = ttk.Frame(toolbar, style="Toolbar.TFrame")
@@ -2367,6 +2396,8 @@ class ProbeApp(tk.Tk):
             get_camera_fov_rotation_deg=self._camera_fov_rotation_deg,
             start_run=self.start_autotest,
             stop_run=self.stop_autotest,
+            resume_run=self.resume_autotest,
+            start_resume_run=self.start_loaded_autotest_resume,
             set_status=self.status_var.set,
             on_overlay_changed=self._set_layoutbond_matrix_overlay,
             on_probe_assist_changed=self._on_autotest_probe_assist_changed,
@@ -4576,8 +4607,47 @@ class ProbeApp(tk.Tk):
         self._numeric_entry(agent_config_panel, self.agent_timeout_var, kind="float", minimum=1, maximum=300).grid(row=5, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
         ttk.Button(agent_config_panel, text="Save Agent API", style="Accent.TButton", command=self.apply_config).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10, 0))
 
+        ntfy_panel = ttk.Frame(system_panel, style="Panel.TFrame")
+        ntfy_panel.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(24, 0))
+        ntfy_panel.columnconfigure(1, weight=1)
+        ttk.Label(ntfy_panel, text="NTFY NOTIFICATIONS", style="Section.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 6)
+        )
+        ttk.Checkbutton(ntfy_panel, text="Enabled", variable=self.ntfy_enabled_var).grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=2
+        )
+        ttk.Label(ntfy_panel, text="Server", style="Muted.TLabel").grid(row=2, column=0, sticky="w", pady=2)
+        tk.Entry(ntfy_panel, textvariable=self.ntfy_server_url_var, **self._numeric_widget_options()).grid(
+            row=2, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5
+        )
+        ttk.Label(ntfy_panel, text="Topic", style="Muted.TLabel").grid(row=3, column=0, sticky="w", pady=2)
+        tk.Entry(ntfy_panel, textvariable=self.ntfy_topic_var, **self._numeric_widget_options()).grid(
+            row=3, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5
+        )
+        ttk.Checkbutton(ntfy_panel, text="Notify ERROR / CRITICAL", variable=self.ntfy_notify_errors_var).grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=2
+        )
+        ttk.Checkbutton(ntfy_panel, text="Notify major completions", variable=self.ntfy_notify_completions_var).grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=2
+        )
+        ntfy_buttons = ttk.Frame(ntfy_panel, style="Panel.TFrame")
+        ntfy_buttons.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ntfy_buttons.columnconfigure((0, 1), weight=1)
+        ttk.Button(ntfy_buttons, text="Save ntfy", style="Accent.TButton", command=self.apply_config).grid(
+            row=0, column=0, sticky="ew", padx=(0, 4)
+        )
+        ttk.Button(ntfy_buttons, text="Send Test", command=self.test_ntfy_notification).grid(
+            row=0, column=1, sticky="ew", padx=(4, 0)
+        )
+        ttk.Label(
+            ntfy_panel,
+            text="Error alerts contain no log text, device addresses, paths, or measurement values.",
+            style="Muted.TLabel",
+            wraplength=360,
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
         admin_panel = ttk.Frame(system_panel, style="Panel.TFrame")
-        admin_panel.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(24, 0))
+        admin_panel.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(24, 0))
         admin_panel.columnconfigure(1, weight=1)
         ttk.Label(admin_panel, text="ADMIN MODE", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
         ttk.Label(admin_panel, text="Token", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
@@ -4601,18 +4671,58 @@ class ProbeApp(tk.Tk):
         _bind_config_column_scroll(motion_panel, motion_canvas)
         _bind_config_column_scroll(system_panel, system_canvas)
 
-    def _show_device_status(self):
+    def _manual_instrument_busy(self):
+        window = self.__dict__.get("_instrument_window")
+        return window is not None and window.control_session.claimed
+
+    def _instrument_automatic_busy(self):
+        return self.__dict__.get("autotest_running", False) or self.__dict__.get("mapping_running", False)
+
+    def _ensure_device_status(self):
         window = self.__dict__.get("_device_status_window")
         if window is None or not window.winfo_exists():
             window = DeviceStatusWindow(
                 self,
-                busy=lambda: self.autotest_running or self.__dict__.get("mapping_running", False),
+                busy=lambda: self._instrument_automatic_busy() or self._manual_instrument_busy(),
                 local_status=self._local_device_status,
                 addresses=self._device_status_addresses,
             )
             self._device_status_window = window
             self.device_status_panel = window.panel
+        return window
+
+    def _show_device_status(self):
+        self._ensure_device_status().show()
+
+    def _instrument_device_rows(self):
+        panel = self.__dict__.get("device_status_panel")
+        rows = list(getattr(panel, "rows", {}).values())
+        local = self._local_device_status()
+        local_names = {row["device"] for row in local}
+        return [row for row in rows if row["device"] not in local_names] + local
+
+    def _show_instrument(self):
+        window = self.__dict__.get("_instrument_window")
+        if window is None or not window.winfo_exists():
+            discovery = self._ensure_device_status().panel
+            from .instrument_control import ManualSession, open_manual_adapter
+            session = ManualSession(lambda address: open_manual_adapter(address, self._get_dp100_driver))
+            window = InstrumentWindow(
+                self, rows=self._instrument_device_rows, busy=self._instrument_automatic_busy,
+                scanning=self._device_scan_in_progress, refresh=discovery.refresh,
+                activity=self.instrument_button_var.set, session=session,
+            )
+            self._instrument_window = window
+            if not any(row["status"] == "Connected" for row in discovery.rows.values()):
+                window.refresh()
         window.show()
+
+    def _manual_instrument_blocks_measurement(self):
+        if not self._manual_instrument_busy():
+            return False
+        messagebox.showinfo("Instrument occupied",
+                            "Release the manual instrument in Instrument before starting an automatic test.")
+        return True
 
     def _local_device_status(self):
         rows = []
@@ -5398,6 +5508,51 @@ class ProbeApp(tk.Tk):
         out_height, out_width = rgb.shape[:2]
         return f"P6 {out_width} {out_height} 255\n".encode("ascii") + rgb.tobytes()
 
+    def _configure_ntfy_notifications(self) -> None:
+        config = self.probe_config
+        if self.__dict__.get("ntfy_notifier") is None:
+            self.ntfy_notifier = NtfyNotifier(
+                enabled=config.ntfy_enabled,
+                server_url=config.ntfy_server_url,
+                topic=config.ntfy_topic,
+            )
+        else:
+            self.ntfy_notifier.configure(
+                enabled=config.ntfy_enabled,
+                server_url=config.ntfy_server_url,
+                topic=config.ntfy_topic,
+            )
+        self.ntfy_error_handler = install_ntfy_error_handler(
+            logger,
+            self.ntfy_notifier,
+            enabled=config.ntfy_enabled and config.ntfy_notify_errors,
+        )
+
+    def _notify_ntfy_completion(self, message: str, *, title: str) -> bool:
+        config = self.probe_config
+        notifier = self.ntfy_notifier
+        if not config.ntfy_enabled or not config.ntfy_notify_completions or notifier is None:
+            return False
+        return notifier.notify(message, title=title, priority="default", tags="white_check_mark")
+
+    def test_ntfy_notification(self) -> None:
+        if not self.apply_config(save=True):
+            return
+        notifier = self.ntfy_notifier
+        if not self.probe_config.ntfy_enabled or notifier is None:
+            self.config_status_var.set("ntfy is disabled.")
+            self.status_var.set("Enable ntfy before sending a test.")
+            return
+        queued = notifier.notify(
+            format_test_notification(self.probe_config.ntfy_topic),
+            title="SAP | TEST",
+            priority="default",
+            tags="test_tube",
+        )
+        message = "ntfy test queued." if queued else "ntfy test could not be queued."
+        self.config_status_var.set(message)
+        self.status_var.set(message)
+
     def apply_config(self, save: bool = True) -> bool:
         if self.__dict__.get("mapping_running", False):
             self.status_var.set("Configuration is locked during Wire-bond Mapping.")
@@ -5461,6 +5616,11 @@ class ProbeApp(tk.Tk):
                 agent_base_url=self.agent_base_url_var.get() or DEFAULT_AGENT_BASE_URL,
                 agent_model=self.agent_model_var.get() or DEFAULT_AGENT_MODEL,
                 agent_timeout_seconds=float(self.agent_timeout_var.get() or DEFAULT_AGENT_TIMEOUT_SECONDS),
+                ntfy_enabled=self.ntfy_enabled_var.get() if "ntfy_enabled_var" in self.__dict__ else self.probe_config.ntfy_enabled,
+                ntfy_server_url=self.ntfy_server_url_var.get() if "ntfy_server_url_var" in self.__dict__ else self.probe_config.ntfy_server_url,
+                ntfy_topic=self.ntfy_topic_var.get() if "ntfy_topic_var" in self.__dict__ else self.probe_config.ntfy_topic,
+                ntfy_notify_errors=self.ntfy_notify_errors_var.get() if "ntfy_notify_errors_var" in self.__dict__ else self.probe_config.ntfy_notify_errors,
+                ntfy_notify_completions=self.ntfy_notify_completions_var.get() if "ntfy_notify_completions_var" in self.__dict__ else self.probe_config.ntfy_notify_completions,
             )
             updated.validate()
         except ValueError as exc:
@@ -5472,6 +5632,8 @@ class ProbeApp(tk.Tk):
         if coordinate_basis(self.probe_config) != coordinate_basis(updated):
             self._invalidate_display_basis("Motor polarity or pulse scale changed")
         self.probe_config = updated
+        if "ntfy_enabled_var" in self.__dict__:
+            self._configure_ntfy_notifications()
         derive_missing_calibrations(self.probe_config)
         self._remap_current_positions_for_polarity_change(previous_polarity)
         self._sync_config_vars_from_config()
@@ -5570,6 +5732,12 @@ class ProbeApp(tk.Tk):
         self.agent_base_url_var.set(self.probe_config.agent_base_url)
         self.agent_model_var.set(self.probe_config.agent_model)
         self.agent_timeout_var.set(f"{self.probe_config.agent_timeout_seconds:g}")
+        if "ntfy_enabled_var" in self.__dict__:
+            self.ntfy_enabled_var.set(self.probe_config.ntfy_enabled)
+            self.ntfy_server_url_var.set(self.probe_config.ntfy_server_url)
+            self.ntfy_topic_var.set(self.probe_config.ntfy_topic)
+            self.ntfy_notify_errors_var.set(self.probe_config.ntfy_notify_errors)
+            self.ntfy_notify_completions_var.set(self.probe_config.ntfy_notify_completions)
 
     @staticmethod
     def _autofocus_peak_model_label(model: str) -> str:
@@ -7535,6 +7703,7 @@ class ProbeApp(tk.Tk):
             return
         path = filedialog.askopenfilename(
             title="Import FocusMap JSON",
+            initialdir=str(Path.cwd()),
             initialfile=FOCUSMAP_AUTOSAVE_FILENAME,
             filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
         )
@@ -9004,6 +9173,8 @@ class ProbeApp(tk.Tk):
         threading.Thread(target=read_corner, daemon=True).start()
 
     def _start_mapping(self, settings: MappingSettings) -> None:
+        if self._manual_instrument_blocks_measurement():
+            return
         if self._device_scan_in_progress():
             messagebox.showinfo("Device scan", "Wait for the device connection scan to finish before starting measurement.")
             return
@@ -9386,7 +9557,97 @@ class ProbeApp(tk.Tk):
             self.__dict__.pop("_mapping_session_dir", None)
             self.result_queue.put(("mapping_finished", status, error, session_dir))
 
-    def start_autotest(self, settings: AutoTestSettings | MappingSettings, points_override: tuple[AutoTestPoint, ...] | None = None) -> None:
+    def resume_autotest(self, session_dir: Path) -> None:
+        """Load a session into AutoTest controls for review without moving the stage."""
+        self.__dict__.pop("_pending_autotest_resume", None)
+        if self.autotest_panel is not None:
+            self.autotest_panel.clear_resume_plan()
+        try:
+            session_dir = Path(session_dir).resolve()
+            manifest = read_manifest(session_dir)
+            mapper = self.gds_stage_mapper_panel.mapper if self.gds_stage_mapper_panel is not None else None
+            if mapper is None:
+                raise ValueError("Calibrate LayoutMap before resuming AutoTest.")
+            if manifest is not None:
+                settings = settings_from_manifest(manifest)
+                specs = point_specs_from_manifest(manifest)
+                points = generate_autotest_points_from_specs(
+                    specs, settings, mapper, self._camera_fov_rotation_deg())
+            else:
+                if self.autotest_panel is None:
+                    raise ValueError("AutoTest settings are unavailable for this older session.")
+                try:
+                    settings = self.autotest_panel.settings_from_ui()
+                except ValueError as exc:
+                    raise ValueError(
+                        "This older session has no saved AutoTest plan. Restore its original "
+                        "Origin, grid, Z settings and workflow before resuming."
+                    ) from exc
+                specs = self.autotest_panel.custom_point_specs
+                points = (generate_autotest_points_from_specs(specs, settings, mapper, self._camera_fov_rotation_deg())
+                          if specs is not None else generate_autotest_points(settings, mapper, self._camera_fov_rotation_deg()))
+            completed = completed_prefix(session_dir, settings, points, manifest)
+            if len(completed) == len(points):
+                raise ValueError(f"All {len(points)} AutoTest points are already complete.")
+            if self.autotest_panel is None:
+                raise ValueError("AutoTest panel is unavailable.")
+            self.autotest_panel.load_resume_plan(session_dir, settings, specs, len(completed), len(points))
+            self._pending_autotest_resume = (session_dir, settings, specs)
+            self.autotest_panel.set_status(
+                f"Loaded {session_dir.name}: {len(completed)}/{len(points)} complete; "
+                f"next {points[len(completed)].name}. Review Test Point, Device Separate and Measurement Flow, "
+                "then click Start Loaded Resume."
+            )
+            if settings.measurement_flow:
+                self.autotest_panel.open_measurement_flow()
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            if self.autotest_panel is not None:
+                self.autotest_panel.set_status(f"Cannot load AutoTest session: {exc}")
+
+    def start_loaded_autotest_resume(self) -> None:
+        pending = self.__dict__.get("_pending_autotest_resume")
+        if pending is None or self.autotest_panel is None:
+            return
+        session_dir, settings, specs = pending
+        try:
+            if self.autotest_panel.loaded_resume_dir != session_dir:
+                raise ValueError("Select the session again before starting.")
+            if self.autotest_panel.settings_from_ui() != settings or self.autotest_panel.custom_point_specs != specs:
+                raise ValueError("Displayed AutoTest plan changed. Select the session again to restore its saved settings.")
+            manifest = read_manifest(session_dir)
+            if manifest is not None:
+                settings_from_manifest(manifest)  # Validate the saved plan before stage motion.
+                recovery = manifest.get("recovery") or {}
+                if recovery.get("motion_settings_inferred"):
+                    motion = (
+                        f"Z down margin: {settings.z_down_margin_um:g} um\n"
+                        f"Z up split: {settings.z_up_fast_percent:g}% fast\n"
+                        f"Z speeds: {settings.z_fast_speed_percent}% fast / {settings.z_slow_speed_percent}% slow\n"
+                        f"Z wobble: {settings.z_wobble_um:g} um x {settings.z_wobble_cycles}\n"
+                        f"Z contact offset: {settings.z_offset_um:g} um"
+                    )
+                    if not messagebox.askyesno(
+                        "Review recovered AutoTest settings",
+                        "This older session did not save its AutoTest settings. "
+                        "The point grid and IV sweep were verified from result files, "
+                        "but these Z settings were reconstructed from logs and defaults.\n\n"
+                        + motion
+                        + "\n\nVerify stage, probe and current calibration before continuing. Start at the first unfinished point?",
+                    ):
+                        self.autotest_panel.set_status("Resume canceled; recovered Z settings were not accepted.")
+                        return
+            mapper = self.gds_stage_mapper_panel.mapper if self.gds_stage_mapper_panel is not None else None
+            if mapper is None:
+                raise ValueError("Calibrate LayoutMap before resuming AutoTest.")
+            points = (generate_autotest_points_from_specs(specs, settings, mapper, self._camera_fov_rotation_deg())
+                      if specs is not None else generate_autotest_points(settings, mapper, self._camera_fov_rotation_deg()))
+            self.start_autotest(settings, points, resume_session_dir=session_dir)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            self.autotest_panel.set_status(f"Cannot start AutoTest resume: {exc}")
+
+    def start_autotest(self, settings: AutoTestSettings | MappingSettings, points_override: tuple[AutoTestPoint, ...] | None = None, *, resume_session_dir: Path | None = None) -> None:
+        if self._manual_instrument_blocks_measurement():
+            return
         if self._device_scan_in_progress():
             messagebox.showinfo("Device scan", "Wait for the device connection scan to finish before starting measurement.")
             return
@@ -9443,7 +9704,27 @@ class ProbeApp(tk.Tk):
                     self.autotest_panel.set_status("No camera frame available for AutoTest photo.")
                 return
         try:
-            session_dir = self._prepare_autotest_session_dir() if self._autotest_requires_session_dir(normalized_settings) else None
+            resume_count = 0
+            resume_history = ()
+            if resume_session_dir is None:
+                session_dir = self._prepare_autotest_session_dir()
+                create_manifest(session_dir, normalized_settings, points)
+            else:
+                session_dir = Path(resume_session_dir).resolve()
+                if not session_dir.is_dir():
+                    raise ValueError("Selected AutoTest session directory does not exist.")
+                manifest = read_manifest(session_dir)
+                if manifest is None and (session_dir.parent.name != "autotest_session" or not (session_dir / "workflow_plots").is_dir()):
+                    raise ValueError("Older sessions must be selected from an autotest_session folder with Plot Panel history.")
+                completed = completed_prefix(session_dir, normalized_settings, points, manifest)
+                resume_count = len(completed)
+                if resume_count == len(points):
+                    if self.autotest_panel is not None:
+                        self.autotest_panel.set_status(f"All {len(points)} AutoTest points are already complete.")
+                    return
+                if manifest is None:
+                    create_manifest(session_dir, normalized_settings, points, (point.order for point in completed))
+                resume_history = tuple(session_dir / "workflow_plots" / f"{point.row}_{point.col}.json" for point in completed)
         except Exception as exc:
             if self.autotest_panel is not None:
                 self.autotest_panel.set_status(f"AutoTest session setup failed: {exc}")
@@ -9457,8 +9738,10 @@ class ProbeApp(tk.Tk):
             self.disable_home_signal_polling()
         self.autotest_running = True
         self.motion_busy = True
-        self.autotest_progress_current = 0
+        self.autotest_progress_current = resume_count
         self.autotest_progress_total = len(points)
+        self._autotest_resume_completed = resume_count
+        self._autotest_resume_history = resume_history
         self.autotest_grid_rows, self.autotest_grid_cols = self._autotest_grid_shape(points, normalized_settings)
         self.autotest_started_at = time.monotonic()
         self.autotest_completed_point_times = []
@@ -9467,8 +9750,12 @@ class ProbeApp(tk.Tk):
         self.autotest_stop_event.clear()
         if self.autotest_panel is not None:
             self.autotest_panel.set_running(True)
-            self.autotest_panel.set_status(f"AutoTest running: {len(points)} point(s).")
-            self.autotest_panel.set_progress(0, len(points), "Preparing AutoTest", estimate_text="ETA: waiting for first completed device")
+            self.autotest_panel.point_overlay_states = {(point.row, point.col): "done" if point.order <= resume_count else "pending" for point in points}
+            self.autotest_panel._schedule_preview_redraw()
+            message = (f"Resuming AutoTest: {resume_count}/{len(points)} complete; next {points[resume_count].name}"
+                       if resume_count else f"AutoTest running: {len(points)} point(s).")
+            self.autotest_panel.set_status(message)
+            self.autotest_panel.set_progress(resume_count, len(points), message, estimate_text="ETA: waiting for first newly completed device")
         for workflow_button in self.workflow_buttons:
             workflow_button.configure(state="disabled")
         self._update_admin_mode_controls()
@@ -9521,6 +9808,74 @@ class ProbeApp(tk.Tk):
         (session_dir / "b1500").mkdir(parents=True, exist_ok=True)
         return session_dir
 
+    @staticmethod
+    def _is_remote_stage_disconnect(exc: Exception, client) -> bool:
+        port = str(getattr(client, "port", ""))
+        if not port.startswith("socket://"):
+            return False
+        try:
+            import serial
+            if not isinstance(exc, serial.SerialException):
+                return False
+        except ImportError:
+            return False
+        text = str(exc).lower()
+        return any(token in text for token in (
+            "winerror 10054", "connection was forcibly closed", "connection reset",
+            "socket disconnected", "read failed", "write failed", "broken pipe",
+        ))
+
+    def _reconnect_autotest_stage_transport_without_motion(self) -> None:
+        old_client = self.serial_client
+        old_tunnel = self.ssh_serial_tunnel
+        if old_client is None or not str(old_client.port).startswith("socket://") or old_tunnel is None:
+            raise RuntimeError("The disconnected stage was not using the managed SSH transport.")
+        ssh_target = old_tunnel.ssh_target
+        try:
+            old_client.close()
+        finally:
+            old_tunnel.close()
+        self.serial_client = None
+        self.ssh_serial_tunnel = None
+        errors: list[str] = []
+        for attempt in range(1, 4):
+            if self.autotest_stop_event.is_set():
+                break
+            self.result_queue.put((
+                "autotest_status",
+                f"Remote stage connection dropped; rebuilding SSH transport ({attempt}/3). No motion will be retried.",
+            ))
+            tunnel = SshSerialTunnel(ssh_target)
+            client = None
+            try:
+                tunnel.start()
+                client = ControllerSerialClient(tunnel.serial_url)
+                client.set_admin_mode_enabled(self.admin_mode_enabled)
+                client.before_coordinate_reset = self._before_display_coordinate_reset
+                tunnel.wait_for_serial_open(client)
+                result = client.communication_test()
+                if not result.ok:
+                    raise RuntimeError(result.message)
+                client.read_stable_xyz_positions()
+                self.serial_client = client
+                self.ssh_serial_tunnel = tunnel
+                logger.warning("AutoTest rebuilt the remote stage transport without retrying motion.")
+                return
+            except Exception as exc:
+                errors.append(f"attempt {attempt}: {exc}")
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                try:
+                    tunnel.close()
+                except Exception:
+                    pass
+                if attempt < 3:
+                    self.autotest_stop_event.wait(float(attempt))
+        raise RuntimeError("; ".join(errors) or "reconnect canceled")
+
     def _autotest_worker(self, settings: AutoTestSettings, points: tuple[AutoTestPoint, ...], session_dir: Path | None) -> None:
         self.__dict__.pop("_workflow_run_id", None)
         assert self.serial_client is not None
@@ -9534,7 +9889,8 @@ class ProbeApp(tk.Tk):
             normalized_settings = settings.normalized()
             z_margin_pulses = int(round(normalized_settings.z_down_margin_um / self.probe_config.um_per_pulse("Z")))
             total = len(points)
-            for index, point in enumerate(points, start=1):
+            for point in points[self.__dict__.get("_autotest_resume_completed", 0):]:
+                index = point.order
                 if self.autotest_stop_event.is_set():
                     self.result_queue.put(("autotest_status", f"Stopped after {index - 1}/{total} point(s)."))
                     break
@@ -9585,12 +9941,25 @@ class ProbeApp(tk.Tk):
                 self._execute_autotest_measurement_flow(point, normalized_settings, session_dir, cv2)
                 if self.autotest_stop_event.is_set():
                     break
+                if session_dir is not None:
+                    mark_completed(session_dir, point)
                 measure_text = self._autotest_measurement_summary(normalized_settings)
                 self.result_queue.put(("autotest_progress", index, total, f"{measure_text} at {point.name}", point.row, point.col, "done"))
             if not self.autotest_stop_event.is_set():
                 self.result_queue.put(("autotest_done", len(points)))
         except Exception as exc:
-            self.result_queue.put(("autotest_error", exc))
+            client = self.serial_client
+            if session_dir is not None and client is not None and self._is_remote_stage_disconnect(exc, client):
+                reconnect_error = None
+                try:
+                    self._reconnect_autotest_stage_transport_without_motion()
+                except Exception as recovery_exc:
+                    reconnect_error = recovery_exc
+                self.result_queue.put((
+                    "autotest_transport_lost", exc, reconnect_error, Path(session_dir),
+                ))
+            else:
+                self.result_queue.put(("autotest_error", exc))
         finally:
             self.result_queue.put(("autotest_finished",))
 
@@ -9705,27 +10074,45 @@ class ProbeApp(tk.Tk):
         errors = validate_flow_graph(settings.measurement_flow)
         if errors:
             raise ValueError("; ".join(errors))
-        panel = next((node for node in settings.measurement_flow if node.type_id == "plot_panel"), None)
-        if panel is not None:
-            from .workflow_ports import output_type, metric_unit
-            by_id = {step_node_id(node, i): node for i, node in enumerate(settings.measurement_flow)}
-            params = dict(panel.params)
+        from .workflow_ports import output_type, metric_unit
+        by_id = {step_node_id(node, i): node for i, node in enumerate(settings.measurement_flow)}
+        panels = []
+        for index, node in enumerate(settings.measurement_flow):
+            if node.type_id != "plot_panel":
+                continue
+            params = dict(node.params)
             for i in range(1, 7):
                 source = by_id.get(params.get(f"_input_slot{i}_source"))
                 output = params.get(f"_input_slot{i}_output", "")
                 if source is not None:
                     params[f"_input_slot{i}_type"] = output_type(source, output)
+                    if source.type_id == "iv" and output in {"live", "curve", "live_voltage", "curve_voltage", "live_resistance", "curve_resistance"}:
+                        params[f"_input_slot{i}_x_label"] = ("I measure" if source.params.get("sweep_mode", "voltage") == "current"
+                                                              else params.get(f"slot{i}_iv_x_axis", "V set"))
+                    params[f"_input_slot{i}_retain_between_points"] = control_node_runs_on_every_path(
+                        settings.measurement_flow, params[f"_input_slot{i}_source"])
                     if not params.get(f"slot{i}_title"):
                         params[f"slot{i}_title"] = f"{params.get(f'_input_slot{i}_source')}: {output.rsplit('.', 1)[-1]}"
                     params[f"_input_slot{i}_unit"] = source.params.get("output_unit", "") if output == "result" else metric_unit(output)
-            panel = replace(panel, params=params)
+            panels.append((step_node_id(node, index), replace(node, params=params)))
         if point.order == 1 or "_workflow_run_id" not in self.__dict__:
             self._workflow_run_id = uuid.uuid4().hex
-            if panel is not None:
-                self.result_queue.put(("workflow_plot_start", self._workflow_run_id, panel,
+            for panel_id, panel in panels:
+                self.result_queue.put(("workflow_plot_start", self._workflow_run_id, panel_id, panel,
                     (self.autotest_grid_rows, self.autotest_grid_cols)))
+            if panels:
+                for history_path in self.__dict__.pop("_autotest_resume_history", ()):
+                    saved = json.loads(history_path.read_text(encoding="utf-8"))
+                    saved_panels = saved.get("panels", {})
+                    first_panel_id = panels[0][0]
+                    values = {panel_id: item.get("values", {}) for panel_id, item in saved_panels.items()}
+                    details = {panel_id: item.get("details", {}) for panel_id, item in saved_panels.items()}
+                    values.setdefault(first_panel_id, saved.get("values", {}))
+                    details.setdefault(first_panel_id, saved.get("details", {}))
+                    self.result_queue.put(("workflow_point_done", self._workflow_run_id,
+                        saved["point"]["row"], saved["point"]["col"], values, "done", history_path, details))
         run_id = self._workflow_run_id
-        if panel is not None:
+        if panels:
             self.result_queue.put(("workflow_point_start", run_id, point.row, point.col))
         results = {}
         status = "done"
@@ -9740,21 +10127,26 @@ class ProbeApp(tk.Tk):
                 results[failed_result["node_id"]] = failed_result
             raise
         finally:
-            if panel is not None:
-                values, details = {}, {}
+            if panels:
+                values_by_panel, details_by_panel = {}, {}
                 completion_error = None
+                measurement_status = status
                 had_error = status == "failed"
-                for i in range(1, 7):
-                    if panel.params.get(f"_input_slot{i}_type") == "number":
-                        try:
-                            value = resolve_data_input(panel, f"slot{i}", settings.measurement_flow, results) if status == "done" else InvalidValue(f"Point {status}")
-                        except (ValueError, RuntimeError) as exc:
-                            value = InvalidValue(str(exc))
-                            completion_error = exc
-                            status = "failed"
-                        values[str(i)] = value if isinstance(value, (float, int)) and math.isfinite(value) else None
-                        details[str(i)] = {"reason": value.reason if isinstance(value, InvalidValue) else "No feature value" if value is None else None,
-                            "skipped": isinstance(value, InvalidValue) and "source not executed" in value.reason}
+                for panel_id, panel in panels:
+                    values, details = {}, {}
+                    for i in range(1, 7):
+                        if panel.params.get(f"_input_slot{i}_type") == "number":
+                            try:
+                                value = resolve_data_input(panel, f"slot{i}", settings.measurement_flow, results) if measurement_status == "done" else InvalidValue(f"Point {measurement_status}")
+                            except (ValueError, RuntimeError) as exc:
+                                value = InvalidValue(str(exc))
+                                completion_error = completion_error or exc
+                                status = "failed"
+                            values[str(i)] = value if isinstance(value, (float, int)) and math.isfinite(value) else None
+                            details[str(i)] = {"reason": value.reason if isinstance(value, InvalidValue) else "No feature value" if value is None else None,
+                                "skipped": isinstance(value, InvalidValue) and "source not executed" in value.reason}
+                    values_by_panel[panel_id] = values
+                    details_by_panel[panel_id] = details
                 curves = {node_id: {key.replace("curve", "live", 1): family for key, family in result.items() if key.startswith("curve") and isinstance(family, dict)} for node_id, result in results.items()}
                 history_path = None
                 try:
@@ -9763,13 +10155,18 @@ class ProbeApp(tk.Tk):
                         folder = plot_root / "workflow_plots"
                         folder.mkdir(parents=True, exist_ok=True)
                         history_path = folder / f"{point.row}_{point.col}.json"
-                        history_path.write_text(json.dumps(json_value({"run_id": run_id, "point": {"row": point.row, "col": point.col}, "status": status, "values": values, "details": details, "curves": curves}), allow_nan=False), encoding="utf-8")
+                        first_panel_id = panels[0][0]
+                        history = {"run_id": run_id, "point": {"row": point.row, "col": point.col}, "status": status,
+                            "values": values_by_panel[first_panel_id], "details": details_by_panel[first_panel_id],
+                            "panels": {panel_id: {"values": values_by_panel[panel_id], "details": details_by_panel[panel_id]} for panel_id, _ in panels},
+                            "curves": curves}
+                        history_path.write_text(json.dumps(json_value(history), allow_nan=False), encoding="utf-8")
                 except (OSError, ValueError, TypeError) as exc:
                     status = "failed"
                     completion_error = completion_error or exc
                     history_path = None
                 finally:
-                    self.result_queue.put(("workflow_point_done", run_id, point.row, point.col, values, status, history_path, details))
+                    self.result_queue.put(("workflow_point_done", run_id, point.row, point.col, values_by_panel, status, history_path, details_by_panel))
                 if completion_error and not had_error:
                     raise completion_error
 
@@ -10643,6 +11040,8 @@ class ProbeApp(tk.Tk):
             if not driver.connect():
                 raise RuntimeError("ATK-DP100 connection failed.")
             self._dp100_driver = driver
+        elif not driver.connected and not driver.connect():
+            raise RuntimeError("ATK-DP100 reconnection failed.")
         return driver
 
     def _execute_autotest_measurement_steps(self, point: AutoTestPoint, steps: tuple[str, ...], session_dir: Path | None, cv2_module) -> None:
@@ -11556,6 +11955,9 @@ class ProbeApp(tk.Tk):
                 "step": config.step,
                 "bidirectional": config.bidirectional,
                 "scan_type": config.scan_type,
+                "low": config.low, "initial_direction": config.initial_direction,
+                "segments": config.segments, "source_range": config.source_range,
+                "autozero": config.autozero,
                 "voltage_limit_v": config.voltage_limit_v,
                 "current_limit_a": config.current_limit_a,
                 "measure_range": config.measure_range,
@@ -11599,16 +12001,17 @@ class ProbeApp(tk.Tk):
     def _autotest_estimate_text(self, current: int, total: int, state: str | None) -> str:
         total = max(0, int(total))
         current = max(0, min(int(current), total)) if total else max(0, int(current))
-        if state == "done" and current > len(self.autotest_completed_point_times):
+        previous = self.__dict__.get("_autotest_resume_completed", 0)
+        if state == "done" and current > previous + len(self.autotest_completed_point_times):
             self.autotest_completed_point_times.append(time.monotonic())
-        completed = len(self.autotest_completed_point_times)
+        completed = previous + len(self.autotest_completed_point_times)
         base = f"Progress: {completed}/{total} completed"
         if total <= 0:
             return base
-        if completed <= 0 or self.autotest_started_at is None:
+        if not self.autotest_completed_point_times or self.autotest_started_at is None:
             return f"{base} | ETA: waiting for first completed device"
         elapsed = self.autotest_completed_point_times[-1] - self.autotest_started_at
-        average_s = max(0.0, elapsed / completed)
+        average_s = max(0.0, elapsed / len(self.autotest_completed_point_times))
         remaining_s = average_s * max(0, total - completed)
         end_timestamp = time.time() + remaining_s
         return f"{base} | Remaining: {self._format_duration(remaining_s)} | Ends: {time.strftime('%H:%M:%S', time.localtime(end_timestamp))}"
@@ -12253,7 +12656,7 @@ class ProbeApp(tk.Tk):
             return False
 
     def _probe_safe_z_margin_pulses(self) -> int:
-        margin_um = max(0.0, float(getattr(self.probe_config, "probe_safe_z_margin_um", 100.0)))
+        margin_um = max(0.0, float(getattr(self.probe_config, "probe_safe_z_margin_um", 500.0)))
         return int(round(margin_um / self.probe_config.um_per_pulse("Z")))
 
     def _probe_contact_z_at_xy(self, x_value: int, y_value: int, fallback_z: int) -> int:
@@ -12900,6 +13303,9 @@ class ProbeApp(tk.Tk):
         threading.Thread(target=self._move_xyz_cc_worker, args=(steps, targets), daemon=True).start()
 
     def emergency_stop(self) -> None:
+        instrument = self.__dict__.get("_instrument_window")
+        if instrument is not None and instrument.control_session.claimed:
+            instrument.release()
         self.realtime_stop_event.set()
         self.af_plane_stop_event.set()
         self.autofocus_stop_event.set()
@@ -13649,29 +14055,40 @@ class ProbeApp(tk.Tk):
             return
         if event_type == "workflow_plot_start":
             from .workflow_plot import WorkflowPlotPanel
-            old = self.__dict__.get("_workflow_plot")
+            if event[1] != self.__dict__.get("_workflow_plot_run"):
+                for old in self.__dict__.get("_workflow_plots", {}).values():
+                    old.close()
+                self._workflow_plots = {}
+                self._workflow_plot_run = event[1]
+            panel_id = event[2]
+            old = self._workflow_plots.get(panel_id)
             if old is not None:
                 old.close()
-            self._workflow_plot_run = event[1]
-            self._workflow_plot = WorkflowPlotPanel(self, event[2], event[3])
+            self._workflow_plots[panel_id] = WorkflowPlotPanel(self, event[3], event[4])
             self._workflow_plot_active = True
             return
-        plot = self.__dict__.get("_workflow_plot")
+        plots = self.__dict__.get("_workflow_plots", {})
         if event_type == "workflow_display":
             snapshot = event[1].take()
-            if snapshot and plot is not None and snapshot[0] == self.__dict__.get("_workflow_plot_run"):
-                for output, curves in snapshot[2].items():
-                    plot.curves_updated(snapshot[1], output, curves)
+            if snapshot and plots and snapshot[0] == self.__dict__.get("_workflow_plot_run"):
+                for plot in plots.values():
+                    for output, curves in snapshot[2].items():
+                        plot.curves_updated(snapshot[1], output, curves)
             return
         if event_type in {"workflow_point_start", "workflow_point_done"}:
-            if plot is not None and event[1] == self.__dict__.get("_workflow_plot_run"):
+            if plots and event[1] == self.__dict__.get("_workflow_plot_run"):
                 if event_type == "workflow_point_start":
-                    plot.point_started(*event[2:])
+                    for plot in plots.values():
+                        plot.point_started(*event[2:])
                 else:
-                    plot.point_finished(*event[2:])
+                    _, _, row, col, values_by_panel, status, history_path, details_by_panel = event
+                    for panel_id, plot in plots.items():
+                        plot.point_finished(row, col, values_by_panel.get(panel_id, {}), status,
+                                            history_path, details_by_panel.get(panel_id, {}))
             return
-        if event_type in {"mapping_finished", "autotest_finished"} and plot is not None:
-            plot.finish()
+        if event_type in {"mapping_finished", "autotest_finished"} and plots:
+            for plot in plots.values():
+                plot.finish()
             self._workflow_plot_active = False
         if self.__dict__.get("_workflow_plot_active", False) and event_type in {
             "iv_started", "iv_sample", "iv_done", "hp6614c_sweep_started", "hp6614c_sweep_sample", "hp6614c_done",
@@ -14657,6 +15074,27 @@ class ProbeApp(tk.Tk):
                 self.autotest_panel.set_status(message)
             self.status_var.set(message)
             logger.info(message)
+            self._notify_ntfy_completion(
+                format_autotest_completion(int(count)),
+                title="SAP | AUTOTEST COMPLETE",
+            )
+            return
+
+        if event_type == "autotest_transport_lost":
+            _, exc, reconnect_error, session_dir = event
+            reconnected = reconnect_error is None
+            message = (
+                "AutoTest paused: remote stage connection was closed. SSH/stage communication was restored; "
+                "the unfinished point was not repeated automatically."
+                if reconnected else
+                "AutoTest paused: remote stage connection was closed. Automatic communication recovery failed; "
+                f"reconnect the controller before continuing ({reconnect_error})."
+            )
+            self._autotest_reload_session_after_finish = (Path(session_dir), message)
+            if self.autotest_panel is not None:
+                self.autotest_panel.set_status(message)
+            self.status_var.set(message)
+            logger.error("AutoTest remote stage transport lost: %s; reconnect error: %s", exc, reconnect_error)
             return
 
         if event_type == "autotest_error":
@@ -14669,6 +15107,8 @@ class ProbeApp(tk.Tk):
             return
 
         if event_type == "autotest_finished":
+            self.__dict__.pop("_autotest_resume_history", None)
+            self.__dict__.pop("_autotest_resume_completed", None)
             self.autotest_running = False
             self.motion_busy = False
             self.autotest_started_at = None
@@ -14685,6 +15125,15 @@ class ProbeApp(tk.Tk):
             if self.autotest_restore_home_signal and not self.home_signal_enabled and self.serial_client:
                 self.autotest_restore_home_signal = False
                 self.toggle_home_signal_polling()
+            reload_session = self.__dict__.pop("_autotest_reload_session_after_finish", None)
+            if reload_session is not None:
+                session_dir, recovery_message = reload_session
+                def load_interrupted_session():
+                    self.resume_autotest(session_dir)
+                    if self.autotest_panel is not None:
+                        current = self.autotest_panel.status_var.get()
+                        self.autotest_panel.set_status(f"{recovery_message} {current}")
+                self.after_idle(load_interrupted_session)
             return
 
         if event_type == "motor_command":
@@ -14900,6 +15349,19 @@ class ProbeApp(tk.Tk):
         self.after(15, self._update_camera_frame)
 
     def destroy(self) -> None:
+        instrument = self.__dict__.get("_instrument_window")
+        if instrument is not None and instrument.control_session.claimed:
+            # Keep the UI alive until OFF has been confirmed. A failed cleanup
+            # remains visible and requires retry, never a silent app exit.
+            if instrument.control_session.fault and not instrument.control_session.releasing:
+                instrument.show()
+                self.status_var.set("Instrument output cleanup failed. Retry OFF / release before exiting.")
+                return
+            instrument.request_close()
+            self.after(150, self.destroy)
+            return
+        if instrument is not None:
+            instrument.control_session.shutdown()
         if self.__dict__.get("mapping_running", False):
             self.autotest_stop_event.set()
             self.mapping_panel.status.set("Closing: waiting for mapping to save results and turn bias off.")

@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from semi_auto_probe.auto_test import create_autotest_flow_card, autotest_flow_definitions_by_type
 from semi_auto_probe.flow_editor import MeasurementFlowEditor
-from semi_auto_probe.workflow_library import save_workflow, load_workflow
+from semi_auto_probe.workflow_library import save_workflow, load_workflow, cards_from_template
 
 
 class BlenderEditorTests(unittest.TestCase):
@@ -63,6 +63,15 @@ class BlenderEditorTests(unittest.TestCase):
         self.assertEqual((self.read.x, self.read.y), xy)
         e._finish_inline_edit(commit=False)
         self.assertFalse(widget.winfo_exists())
+
+    def test_keithley_current_curve_connects_to_plot(self):
+        iv = create_autotest_flow_card("iv", "keithley_iv")
+        iv.params["_outputs"] = "curve"
+        self.editor.cards = [iv, self.plot]
+        self.assertEqual(self.editor._default_target_input(self.plot, "curve@curve"), "plot@slot1")
+        self.assertTrue(self.editor._connect("keithley_iv", "curve@curve", "plot", "plot@slot1"))
+        self.assertEqual(self.plot.params["_input_slot1_type"], "curve")
+        self.assertEqual(self.plot.params["_input_slot1_output"], "curve")
 
     def test_choice_changes_preserve_existing_connection(self):
         e = self.editor
@@ -162,6 +171,7 @@ class BlenderEditorTests(unittest.TestCase):
         e = self.editor
         e.cards = [self.read, self.plot]
         e.zoom = 1.3
+        self.read.params["_outputs"] = "live"
         e.redraw()
         e.pending_edge = ("read", "trace@live")
         x, y = e._socket_position(self.plot, "plot@slot1", incoming=True)
@@ -174,6 +184,98 @@ class BlenderEditorTests(unittest.TestCase):
         e._edge_dragging = True
         e._canvas_release(event)
         self.assertEqual(self.plot.params["_input_slot1_source"], "read")
+
+    def test_plot_layout_controls_socket_and_inspector_counts(self):
+        e = self.editor
+        e._show_inspector(self.plot)
+        for layout, count in (("1x1", 1), ("1x2", 2), ("2x2", 4), ("2x3", 6), ("1x2", 2)):
+            e.param_vars["layout"].set(layout)
+            expected = [f"plot@slot{i}" for i in range(1, count + 1)]
+            self.assertEqual([kind for kind, _ in e._node_inputs(self.plot)], expected)
+            for i in range(1, 7):
+                self.assertEqual(bool(e.canvas.find_withtag(f"input:plot:plot@slot{i}")), i <= count)
+            visible = [page for page in e._plot_slot_pages if e._plot_slot_notebook.tab(page, "state") != "hidden"]
+            self.assertEqual(len(visible), count)
+
+    def test_shrinking_plot_hides_wires_and_restores_saved_configuration(self):
+        e = self.editor
+        e._param_changed(self.plot, "layout", "2x3")
+        e._connect("read", "trace@live", "plot", "plot@slot6")
+        self.plot.params["slot6_title"] = "Retained plot"
+        wire = "edge:read:_input_slot6_source:plot"
+        self.assertTrue(e.canvas.find_withtag(wire))
+        large_height = e._node_height(self.plot)
+        e._begin_inline_edit(self.plot, "layout")
+        e._inline_editor[2].set("1x2")
+        e._finish_inline_edit(redraw=True)
+        self.assertFalse(e.canvas.find_withtag(wire))
+        self.assertLess(e._node_height(self.plot), large_height)
+        path = Path(self.tmp.name) / "hidden-slots.json"
+        save_workflow(path, e.cards)
+        restored = {c.card_id: c for c in load_workflow(path)}
+        self.assertEqual(restored["plot"].params["_input_slot6_source"], "read")
+        e._param_changed(self.plot, "layout", "2x3")
+        self.assertTrue(e.canvas.find_withtag(wire))
+        self.assertEqual(self.plot.params["slot6_title"], "Retained plot")
+
+    def test_cannot_connect_to_inactive_plot_slot(self):
+        e = self.editor
+        e._connect("read", "trace@live", "plot", "plot@slot6")
+        self.assertNotIn("_input_slot6_source", self.plot.params)
+        self.assertIn("hidden", e.status_var.get())
+
+    def test_b1500_template_results_have_distinct_exposed_sockets(self):
+        e = self.editor
+        e.cards = cards_from_template("FET / B1500 / Transfer")
+        e.redraw()
+        test = next(c for c in e.cards if c.type_id == "b1500_transfer")
+        plot = next(c for c in e.cards if c.type_id == "plot_panel")
+        positions = []
+        for slot in range(1, 5):
+            metric = plot.params[f"_input_slot{slot}_output"]
+            dtype = plot.params[f"_input_slot{slot}_type"]
+            kind = f"{dtype}@{metric}"
+            self.assertTrue(e.canvas.find_withtag(f"port:{test.card_id}:{kind}"), kind)
+            position = e._socket_position(test, kind)
+            self.assertNotEqual(position, e._socket_position(test, "next"))
+            route = e._wire_route(test, plot, kind, target_kind=f"plot@slot{slot}")
+            self.assertEqual(route[0], position)
+            positions.append(position)
+        self.assertEqual(len(set(positions)), 4)
+
+    def test_unexposing_result_removes_its_links_only(self):
+        e = self.editor
+        e._connect("read", "trace@live", "plot", "plot@slot1")
+        e._connect("read", "number@statistics.mean_current_a", "plot", "plot@slot2")
+        e._show_inspector(self.read)
+        e.output_vars["live"].set(False)
+        e._result_outputs_changed(self.read)
+        self.assertNotIn("_input_slot1_source", self.plot.params)
+        self.assertNotIn("_input_slot1_output", self.plot.params)
+        self.assertEqual(self.plot.params["_input_slot2_output"], "statistics.mean_current_a")
+        self.assertFalse(e.canvas.find_withtag("port:read:trace@live"))
+        self.assertTrue(e.canvas.find_withtag("port:read:number@statistics.mean_current_a"))
+
+    def test_unknown_output_does_not_use_flow_socket(self):
+        e = self.editor
+        self.assertIsNone(e._socket_position(self.read, "number@not_a_result"))
+
+    def test_output_checkbox_creates_socket_and_slot_keeps_one_source(self):
+        e = self.editor
+        e._show_inspector(self.read)
+        e.result_output_widgets["live"].invoke()
+        self.assertTrue(e.canvas.find_withtag("port:read:trace@live"))
+        e._connect("read", "trace@live", "plot", "plot@slot1")
+        e.result_output_widgets["statistics.mean_current_a"].invoke()
+        e._connect("read", "number@statistics.mean_current_a", "plot", "plot@slot1")
+        self.assertEqual(self.plot.params["_input_slot1_output"], "statistics.mean_current_a")
+        self.assertEqual(self.plot.params["_input_slot1_type"], "number")
+        self.assertEqual(len([edge for edge in e._routed_edges if "edge:read:_input_slot1_source:plot" in edge[3]]), 1)
+        path = Path(self.tmp.name) / "outputs.json"
+        save_workflow(path, e.cards)
+        restored = {c.card_id: c for c in load_workflow(path)}
+        self.assertIn("live", restored["read"].params["_outputs"].split(","))
+        self.assertIn("statistics.mean_current_a", restored["read"].params["_outputs"].split(","))
 
     def test_diagonal_segment_clipping(self):
         e = self.editor

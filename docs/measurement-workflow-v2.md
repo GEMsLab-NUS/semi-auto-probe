@@ -9,22 +9,27 @@
 单击卡片选中，拖动卡片移动；双击标题打开参数栏，再次双击同一卡片或点击 Close 关闭。
 参数栏打开后，单击其他卡片不会切换正在编辑的对象；双击其他卡片才切换。
 每类节点直接显示最多三个常用参数（如 IV 起止电压和步长、定偏压和电流限值、公式及输出类型）。
-点击参数值即可输入或选择，Enter 或离开输入框提交，Esc 取消；非数值及非有限数不会写入数值参数。
+点击参数值即可输入或选择，Enter 或离开输入框提交，Esc 取消；无效输入保留为红色错误草稿，不会覆盖有效参数。节点内与参数栏共用数值校验，支持科学计数法和兼容单位（如 250 mV、10 uA、20 ms）。修改范围错误时会显示字段旁提示；错误草稿需修正或取消后才能保存或调试运行。
 节点编辑与参数栏、保存文件使用同一份参数；高级参数仍在参数栏编辑。缩放低于 65% 时隐藏参数细节。
 
 从输出端口拖动连线时，兼容输入高亮，靠近端口会吸附；Esc 可取消连线。
 悬停端口可在底部查看完整名称和类型。滚轮以指针位置为中心缩放，中键或空白处拖动平移。
 连线优先使用平滑曲线，遇到节点阻挡则沿避障路线圆滑转弯；直线段交叉处保留跨线提示。
-右键拖动按实际可见路径切断连线。若卡片重叠封住端口，显示红色短线并在拖动结束后提示移动卡片。
+悬停连线会高亮全线及两端并显示完整来源；单击选中后按 Delete 删除，拖动两端圆形手柄可改接来源或目标。无效改接、空白处释放或 Esc 都保留原线。右键拖动按实际可见路径切断连线。若卡片重叠封住端口，显示红色短线并在拖动结束后提示移动卡片。
+
+**Undo / Redo** 按钮以及 Ctrl+Z / Ctrl+Y（或 Ctrl+Shift+Z）支持最近 100 步图编辑操作：添加、删除、移动、改接、剪线、参数修改、输出暴露和清空。一次拖动或改接只记录一步；参数栏同一次连续输入合并为一步。新操作会清除重做分支。删除节点同时清理所有下游引用，包括隐藏子图的连接。
+
+**Validate** 在画布下方列出全部当前返回的问题，节点用感叹号标记；选择问题行会定位节点，能识别参数的问题会打开并滚动到对应字段。
 
 1. 打开 **Config Measure Flow**。可以从库中加载 **General / Examples / Current and Heatmap**，
    或 **General / Examples / Curve Feature Branch**。
 2. 用控制线连接 Start、测量/校正、条件分支和 End。条件的 True/False 都要接线；允许分支重新汇合。
    数据卡片不串进控制路径，数据线不会再次运行仪器。
-3. 在测试卡片的 Result Outputs 中选择输出端口。`live` 是实时电流曲线族，
+3. 点击测试节点上的 **Outputs…**，在详情栏顶部 **Expose Result Outputs** 勾选需要暴露的结果。每个结果显示独立、带名称与类型颜色的端口，从该端口连到 Plot Slot；Flow 端口只用于执行顺序。取消勾选会断开该结果的连接（包括隐藏子图连接），其他结果连线不变。已有模板或文件中被连接的结果会自动补齐暴露端口；同一 Slot 改接其他结果时替换原来源。`live` 是实时电流曲线族，
    `curve` 是完成后的完整电流曲线族；`*_voltage` 和 `*_resistance` 分别表示电压和逐点 V/I。
+   Keithley IV 电压扫描时，`live`/`curve` 的纵轴是测量电流；每个 Plot Slot 的 **IV voltage X axis** 可选 `V set`（默认，设定电压）或 `V measure`（测量电压）。`*_voltage` 的纵轴是测量电压，同样可切换横轴。电流扫描时横轴为测量电流。无需额外输出端口。
    数值特征端口附带单位。仪器没有提供的特征明确标记为不可用，不从别的测试猜取。
-4. 添加一个 **Plot Panel**，选择 1×1、1×2、2×2 或 2×3。子图从左到右、从上到下编号。
+4. 可添加多个 **Plot Panel**；每个节点打开独立绘图窗口，初始尺寸随布局调整为紧凑、近方形的子图。每个节点可选择 1×1、1×2、2×2 或 2×3。节点分别显示 1、2、4、6 个输入端口，端口标签显示子图序号和已连接的结果名称/单位，未连接时明确标记 Unconnected；参数栏只显示对应子图页；子图从左到右、从上到下编号。缩小布局时隐藏多余端口和连线，保留其来源与子图配置，扩大布局后恢复。
    将实时输出或数值特征连到对应 Slot；也可以在各子图设置页的 source 下拉框选择。
 5. 每个格子只接一个源和一种物理量。同一测试、同一物理量的曲线族可以一起显示。
    `Curve` 设为 `all` 显示整个曲线族，或填写实际曲线标签固定选择一条。
@@ -34,9 +39,9 @@
 热力图的坐标是扫描计划的零基行/列，与测量点身份绑定，不依赖蛇形扫描的采集次序。
 蓝色星标表示当前正在测试的格点。整点 workflow 结束后才提交该格点的特征值；
 有值时按色标着色，缺失为灰色、分支跳过为深灰色、失败为红色、中断为橙色。
-对数显示屏蔽非正值并提示，原始数据不改动。
+对数轴和对数色标按绝对值绘图，仅屏蔽零和非有限值；原始数据不改动。
 
-开始新点会清空实时曲线，但保留此前热力图。测试结束后点击热力图格点可回看该点保存的曲线。
+开始新点时，所有执行路径都会经过的粗扫节点保留上一条实时曲线，直到新采样到达；条件分支中的精扫节点清空旧曲线，只有实际执行时才实时更新。测量过程中 live 面板显示全部已采集点；节点完成后 live/curve 面板都显示完整曲线，不按窗口宽度抽稀。此前热力图保留。测试结束后点击热力图格点可回看该点保存的曲线。
 运行中点击不切换回放，避免混入其他测量点的数据。窗口关闭按钮隐藏窗口，不停止采集。
 
 ## 数学与判断
@@ -82,7 +87,7 @@ Number Compare 保留单输入阈值比较，Compare A/B 提供双输入比较�
 
 - `workflow_ports.py` 是编辑器和执行器共享的端口注册表。
   端口类型包括 number、bool、curve（完整曲线）、trace（显示流）、calibration、waveform。
-  panel 的 plot 输入只接受 number 或 trace。
+  panel 的 plot 输入接受 number、trace 或 curve。
 - `workflow_formula.Curve` 保存 X/Y、曲线标签及单位；`InvalidValue` 保存错误原因。
 - `workflow_runtime.NodeCapture` 属于单节点、单测量点、单运行。
   结果明确包含 `run_id/node_id/point/status/valid/outputs`、特征统计以及完整曲线。
@@ -99,12 +104,12 @@ Number Compare 保留单输入阈值比较，Compare A/B 提供双输入比较�
 
 工作流文件统一为 version 2，模板名称不带版本号；不再读取 version 1 或无版本文件。
 旧数学 operator 参数和 Mapping Heatmap 不再转换或从模板库提供，请使用表达式/独立算术卡和 Plot Panel。
-个人文件不会自动覆盖。模板树按器件分类，同一器件流程可用于 Probe 或 Bonding 位置扫描。
+Save 遇到同名文件不会覆盖；选中用户库中的旧 workflow 后点击 Overwrite，可用当前画布覆盖该文件并保留原名称。内置模板不可覆盖。模板树按器件分类，同一器件流程可用于 Probe 或 Bonding 位置扫描。
 
 
 ## 刷新与验证
 
-实时刷新上限 20 FPS；在线 min/max 摘要随采样更新，显示开销不随原始历史长度线性增长。
+实时刷新上限 20 FPS；每次曲线更新包含全部已采集点，显示开销随采样点数增加。
 每个生产者最多保留一个待处理显示通知，新的显示快照覆盖旧快照。
 采样保存、完成和错误事件不通过这个可合并通道。
 
@@ -120,14 +125,22 @@ Number Compare 保留单输入阈值比较，Compare A/B 提供双输入比较�
 .venv/Scripts/python.exe scripts/benchmark_workflow_plot.py
 ```
 
-基准结果和实际渲染预览位于 `.runtime/workflow-v2/`。
-Windows 11 / Python 3.14.5 / Matplotlib Agg 的一次实测：
-
-| 场景 | 中位耗时 | P95 |
-| --- | ---: | ---: |
-| 三幅实时图，每幅两条同源曲线；原始每条 10 万点，显示约 2382 点 | 17.0 ms | 17.5 ms |
-| 三幅热力图，每幅 100×100 格 | 27.5 ms | 29.6 ms |
-
-模拟收集 10 万采样约 0.99 s，保留全部采样、待处理显示通知为 1。
-这些是渲染基准，不包含真实仪器延迟或 Tk 窗口合成开销；20 FPS 是刷新上限，不是所有布局的实机保证。
+渲染预览可由基准脚本生成在 `.runtime/workflow-v2/`。Windows 11 / Python 3.14.5 / Matplotlib Agg 实测：三幅实时图、每幅两条 10 万点曲线，全点更新与渲染中位耗时约 130 ms。20 FPS 是刷新上限，不是所有布局的实机保证。
 自动化测试另外覆盖四种 Tk 布局、公式编辑、跨点隔离、失败时保留部分曲线，以及 Mapping 归档后回看所需的文件。
+
+
+### Editor routing performance checks
+
+Run the hardware-free HP6614C editor benchmark from the repository root:
+
+```powershell
+.venv/Scripts/python.exe scripts/benchmark_flow_editor.py
+.venv/Scripts/python.exe scripts/benchmark_flow_editor.py --copies 3 --output .runtime/flow-editor-performance/30-nodes.json
+.venv/Scripts/python.exe -m unittest discover -s tests -p 'test_flow_editor_performance.py'
+```
+
+The benchmark writes callback timings and a cProfile recording under `.runtime/flow-editor-performance/`. These measure Tk editor operations, not monitor frame presentation. Each drag sample moves to a different position. No instrument is connected or measured.
+
+Routing keeps orthogonal planning spines separate from sampled display curves. Zoom reuses world-coordinate routes. Geometry changes invalidate incident paths and paths intersecting either the old or new node bounds; topology/parameter changes invalidate the routing cache. Blocked paths are retried on movement. Nearby routing candidates are checked against all obstacles before acceptance, with full-graph search as fallback. Hit testing continues to use the displayed curve.
+
+On the development machine, the 10-node FET / HP6614C / Screen and Characterize example improved from ~1.83 s to ~0.10 s to construct, ~1.7 s to ~17 ms per zoom callback, and ~7.8 s to ~51 ms for the first measured drag. Subsequent moving samples took ~59–69 ms. A synthetic 30-node graph (three copies) measured ~58–60 ms zoom and ~153–243 ms drag; dense graphs still incur routing and full-canvas drawing costs.

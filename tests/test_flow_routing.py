@@ -52,7 +52,7 @@ class RoutingTests(unittest.TestCase):
         target = create_autotest_flow_card("plot_panel", "plots")
         source.x, source.y = 400, 0
         target.x, target.y = 330, 200
-        target.params.update(_input_slot3_source="read", _input_slot3_output="statistics.mean_current_a", _input_slot3_type="number")
+        target.params.update(layout="2x2", _input_slot3_source="read", _input_slot3_output="statistics.mean_current_a", _input_slot3_type="number")
         editor = object.__new__(MeasurementFlowEditor)
         editor.cards = [source, target]
         route = editor._orthogonal_route(source, target, "number@statistics.mean_current_a", target_kind="plot@slot3")

@@ -8,6 +8,12 @@ from pathlib import Path
 from typing import Any
 
 from .camera_stage_transform import normalize_camera_fov_rotation_deg
+from .ntfy import (
+    DEFAULT_NTFY_SERVER_URL,
+    DEFAULT_NTFY_TOPIC,
+    normalize_ntfy_server_url,
+    normalize_ntfy_topic,
+)
 
 
 DEFAULT_CONFIG_FILENAME = "probe_config.local.json"
@@ -312,7 +318,7 @@ class ProbeConfig:
     cc_speed_percent: int = 100
     fine_speed_percent: int = 40
     safe_speed_percent: int = 15
-    probe_safe_z_margin_um: float = 100.0
+    probe_safe_z_margin_um: float = 500.0
     active_motor_speed_profile: str = MOTOR_SPEED_PROFILE_FAST
     controller_motion_parameters: dict[str, dict[str, int]] = field(default_factory=lambda: {
         axis: dict(DEFAULT_CONTROLLER_MOTION_PARAMETERS[axis])
@@ -352,6 +358,11 @@ class ProbeConfig:
     agent_base_url: str = DEFAULT_AGENT_BASE_URL
     agent_model: str = DEFAULT_AGENT_MODEL
     agent_timeout_seconds: float = DEFAULT_AGENT_TIMEOUT_SECONDS
+    ntfy_enabled: bool = True
+    ntfy_server_url: str = DEFAULT_NTFY_SERVER_URL
+    ntfy_topic: str = DEFAULT_NTFY_TOPIC
+    ntfy_notify_errors: bool = True
+    ntfy_notify_completions: bool = True
 
     def validate(self) -> None:
         if self.objective not in OBJECTIVE_OPTIONS:
@@ -459,6 +470,11 @@ class ProbeConfig:
             raise ValueError("Agent model cannot be empty.")
         if self.agent_timeout_seconds <= 0 or self.agent_timeout_seconds > 300:
             raise ValueError("Agent API timeout must be in range 0..300 seconds.")
+        for name in ("ntfy_enabled", "ntfy_notify_errors", "ntfy_notify_completions"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be true or false.")
+        self.ntfy_server_url = normalize_ntfy_server_url(self.ntfy_server_url)
+        self.ntfy_topic = normalize_ntfy_topic(self.ntfy_topic)
 
     def cc_acceleration_units(self) -> int:
         return int(round(self.cc_accel_time_s * 100.0))
@@ -571,6 +587,11 @@ class ProbeConfig:
             "agent_base_url": self.agent_base_url,
             "agent_model": self.agent_model,
             "agent_timeout_seconds": self.agent_timeout_seconds,
+            "ntfy_enabled": self.ntfy_enabled,
+            "ntfy_server_url": self.ntfy_server_url,
+            "ntfy_topic": self.ntfy_topic,
+            "ntfy_notify_errors": self.ntfy_notify_errors,
+            "ntfy_notify_completions": self.ntfy_notify_completions,
         }
 
     @classmethod
@@ -642,6 +663,11 @@ class ProbeConfig:
             agent_base_url=str(data.get("agent_base_url", DEFAULT_AGENT_BASE_URL)),
             agent_model=str(data.get("agent_model", DEFAULT_AGENT_MODEL)),
             agent_timeout_seconds=float(data.get("agent_timeout_seconds", DEFAULT_AGENT_TIMEOUT_SECONDS)),
+            ntfy_enabled=data.get("ntfy_enabled", True) is True,
+            ntfy_server_url=str(data.get("ntfy_server_url", DEFAULT_NTFY_SERVER_URL)),
+            ntfy_topic=str(data.get("ntfy_topic", DEFAULT_NTFY_TOPIC)),
+            ntfy_notify_errors=data.get("ntfy_notify_errors", True) is True,
+            ntfy_notify_completions=data.get("ntfy_notify_completions", True) is True,
         )
         derive_missing_calibrations(config)
         config.validate()

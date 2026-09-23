@@ -2677,6 +2677,8 @@ class GDSStageMapperPanel:
     def load_calibration_dialog(self) -> None:
         path = filedialog.askopenfilename(
             title="Load GDS Calibration",
+            initialdir=str(Path.cwd()),
+            initialfile=LAYOUTBOND_AUTOSAVE_FILENAME,
             filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
         )
         if not path:

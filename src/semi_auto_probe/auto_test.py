@@ -23,7 +23,7 @@ PROBE_ASSIST_PROBES: tuple[tuple[str, str, str, str, str], ...] = (
 )
 WOBBTEST_FLOW_CARD_HEIGHT_Z = 464
 WOBBTEST_FLOW_CARD_HEIGHT_ZXY = 544
-IV_FLOW_CARD_HEIGHT = 532
+IV_FLOW_CARD_HEIGHT = 627
 HP6614C_FLOW_CARD_HEIGHT = 610
 
 
@@ -210,12 +210,16 @@ AUTOTEST_FLOW_DEFINITIONS: tuple[AutoTestFlowDefinition, ...] = (
             AutoTestFlowParam("resource", "VISA resource", "GPIB0::18::INSTR"),
             AutoTestFlowParam("output_terminal", "Output terminal", "rear"),
             AutoTestFlowParam("sweep_mode", "Sweep mode", "voltage"),
-            AutoTestFlowParam("scan_type", "Scan type", "single"),
+            AutoTestFlowParam("initial_direction", "Initial direction", "up"),
+            AutoTestFlowParam("low", "Low (source unit)", "-1"),
+            AutoTestFlowParam("segments", "Segments (blank preserves legacy path)", "1"),
             AutoTestFlowParam("start", "Start", "0"),
-            AutoTestFlowParam("stop", "Vtop", "1"),
+            AutoTestFlowParam("stop", "Top (source unit)", "1"),
             AutoTestFlowParam("step", "Step", "0.05"),
             AutoTestFlowParam("voltage_limit_v", "Voltage limit V", "20"),
             AutoTestFlowParam("current_limit_a", "Current limit A", "1e-3"),
+            AutoTestFlowParam("source_range", "Source range", "auto"),
+            AutoTestFlowParam("autozero", "Auto zero", "true"),
             AutoTestFlowParam("measure_range", "Measure range", "auto"),
             AutoTestFlowParam("source_delay_s", "Delay s", "0.02"),
             AutoTestFlowParam("nplc", "NPLC", "1"),
@@ -718,6 +722,7 @@ _EXTRA_DEFINITIONS = tuple(
     ) + tuple(param for i in range(1, 7) for param in (
         AutoTestFlowParam(f"slot{i}_title", f"Plot {i} title", ""),
         AutoTestFlowParam(f"slot{i}_series", "Curve (all or label)", "all"),
+        AutoTestFlowParam(f"slot{i}_iv_x_axis", "IV voltage X axis", "V set"),
         AutoTestFlowParam(f"slot{i}_xscale", "X scale", "linear"),
         AutoTestFlowParam(f"slot{i}_yscale", "Y scale", "linear"),
         AutoTestFlowParam(f"slot{i}_xlim", "X range (auto or min,max)", "auto"),
@@ -781,12 +786,17 @@ def autotest_flow_definitions_by_type() -> dict[str, AutoTestFlowDefinition]:
     return {definition.type_id: definition for definition in AUTOTEST_FLOW_DEFINITIONS}
 
 
-def create_autotest_flow_card(type_id: str, card_id: str, *, expanded: bool = False) -> AutoTestFlowCard:
+def create_autotest_flow_card(type_id: str, card_id: str, *, expanded: bool = False, saved_params: dict[str, str] | None = None) -> AutoTestFlowCard:
     definition = autotest_flow_definitions_by_type()[type_id]
+    params = {param.key: param.default for param in definition.parameters}
+    if saved_params is not None:
+        params.update(saved_params)
+        if type_id == 'iv' and 'segments' not in saved_params:
+            params['segments'] = ''  # Do not reinterpret historical single/double/dualpolar paths.
     return AutoTestFlowCard(
         card_id=card_id,
         type_id=type_id,
-        params={param.key: param.default for param in definition.parameters},
+        params=params,
         expanded=expanded,
     )
 
@@ -959,11 +969,17 @@ def generate_autotest_points_from_specs(
     return tuple(points)
 
 
-def autotest_point_specs_from_json_payload(payload: object) -> tuple[AutoTestPointSpec, ...]:
+def autotest_point_specs_from_json_payload(
+    payload: object,
+    *,
+    grid_settings: AutoTestSettings | None = None,
+) -> tuple[AutoTestPointSpec, ...]:
     if isinstance(payload, list):
         raw_points = payload
     elif isinstance(payload, dict):
         raw_points = payload.get("points")
+        if not isinstance(raw_points, list) and "coordinate_list" in payload:
+            return _autotest_point_specs_from_sac_payload(payload, grid_settings)
     else:
         raise ValueError("AutoTest point list must be a JSON object or array.")
     if not isinstance(raw_points, list):
@@ -987,6 +1003,57 @@ def autotest_point_specs_from_json_payload(payload: object) -> tuple[AutoTestPoi
         specs.append(AutoTestPointSpec(name=name, u=u, v=v, row=row, col=col))
     if not specs:
         raise ValueError("AutoTest point list is empty.")
+    return tuple(specs)
+
+
+def _autotest_point_specs_from_sac_payload(
+    payload: dict[object, object],
+    grid_settings: AutoTestSettings | None,
+) -> tuple[AutoTestPointSpec, ...]:
+    raw_coordinates = payload.get("coordinate_list")
+    if not isinstance(raw_coordinates, list):
+        raise ValueError("SAC coordinate list JSON must contain a coordinate_list array.")
+    if grid_settings is None:
+        raise ValueError(
+            "SAC coordinate lists contain row/col indices, so the current AutoTest grid settings are required."
+        )
+    settings = grid_settings.normalized()
+    raw_devices = payload.get("devices")
+    devices_by_position: dict[tuple[int, int], dict[object, object]] = {}
+    if isinstance(raw_devices, list):
+        for device in raw_devices:
+            if not isinstance(device, dict):
+                continue
+            try:
+                position = (int(float(device["row"])), int(float(device["col"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+            devices_by_position[position] = device
+
+    specs: list[AutoTestPointSpec] = []
+    for index, coordinate in enumerate(raw_coordinates, start=1):
+        if not isinstance(coordinate, (list, tuple)) or len(coordinate) != 2:
+            raise ValueError(f"SAC coordinate {index} must be [row, col].")
+        try:
+            row_value = float(coordinate[0])
+            col_value = float(coordinate[1])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"SAC coordinate {index} must contain numeric row/col values.") from exc
+        row = int(row_value)
+        col = int(col_value)
+        if row_value != row or col_value != col:
+            raise ValueError(f"SAC coordinate {index} row/col values must be integers.")
+        device = devices_by_position.get((row, col), {})
+        name = str(
+            device.get("device_name")
+            or device.get("name")
+            or compile_autotest_point_name(settings.name_pattern, i_index=col, j_index=row)
+        ).strip()
+        u = settings.origin_u + col * settings.u_vector_u + row * settings.v_vector_u
+        v = settings.origin_v + col * settings.u_vector_v + row * settings.v_vector_v
+        specs.append(AutoTestPointSpec(name=name, u=u, v=v, row=row, col=col))
+    if not specs:
+        raise ValueError("SAC coordinate list is empty.")
     return tuple(specs)
 
 
@@ -1337,6 +1404,8 @@ class AutoTestPanel:
         fov_height_var: tk.StringVar,
         start_run: Callable[[AutoTestSettings, tuple[AutoTestPoint, ...] | None], None],
         stop_run: Callable[[], None],
+        resume_run: Callable[[Path], None] | None = None,
+        start_resume_run: Callable[[], None] | None = None,
         get_camera_fov_rotation_deg: Callable[[], float] | None = None,
         set_status: Callable[[str], None] | None = None,
         on_overlay_changed: Callable[[list[MatrixOverlay]], None] | None = None,
@@ -1357,6 +1426,9 @@ class AutoTestPanel:
         self.get_camera_fov_rotation_deg = get_camera_fov_rotation_deg or (lambda: 0.0)
         self.start_run = start_run
         self.stop_run = stop_run
+        self.resume_run = resume_run
+        self.start_resume_run = start_resume_run
+        self.loaded_resume_dir: Path | None = None
         self.set_app_status = set_status
         self.on_overlay_changed = on_overlay_changed
         self.on_probe_assist_changed = on_probe_assist_changed
@@ -1631,10 +1703,9 @@ class AutoTestPanel:
                 ttk.Spinbox(section, from_=1, to=500, increment=1, textvariable=count_var, width=7).grid(row=index, column=4, sticky="ew", pady=(6, 0))
         actions = ttk.Frame(section, style="Panel.TFrame")
         actions.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(10, 0))
-        actions.columnconfigure((0, 1, 2), weight=1, uniform="autotest_point_actions")
-        ttk.Button(actions, text="Previous Points", command=self.previous_point).grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(actions, text="Import List", command=self.import_point_list).grid(row=0, column=1, sticky="ew", padx=(4, 4))
-        ttk.Button(actions, text="Generate List", command=self.open_generate_list_dialog).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        actions.columnconfigure((0, 1), weight=1, uniform="autotest_point_actions")
+        ttk.Button(actions, text="Generate List", command=self.open_generate_list_dialog).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(actions, text="Previous Point", command=self.previous_point).grid(row=0, column=1, sticky="ew", padx=(4, 0))
         ttk.Label(section, textvariable=self.point_source_var, style="Muted.TLabel").grid(row=5, column=0, columnspan=5, sticky="ew", pady=(6, 0))
         return row + 1
 
@@ -1745,15 +1816,20 @@ class AutoTestPanel:
 
     def _build_run_section(self, parent: ttk.Frame, row: int) -> int:
         section = self._section(parent, "Execution", row)
-        section.columnconfigure((0, 1), weight=1)
+        section.columnconfigure((0, 1, 2), weight=1)
         self.run_button = ttk.Button(section, text="Run AutoTest", style="Accent.TButton", command=self._start_run, state="disabled")
         self.run_button.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        self.resume_button = ttk.Button(section, text="Resume Session...", command=self._resume_run, state="disabled")
+        self.resume_button.grid(row=0, column=1, sticky="ew", padx=5)
         self.stop_button = ttk.Button(section, text="Stop", command=self.stop_run, state="disabled")
-        self.stop_button.grid(row=0, column=1, sticky="ew", padx=(5, 0))
+        self.stop_button.grid(row=0, column=2, sticky="ew", padx=(5, 0))
+        self.start_resume_button = ttk.Button(section, text="Start Loaded Resume", style="Accent.TButton",
+                                               command=self._start_loaded_resume, state="disabled")
+        self.start_resume_button.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         self.execution_progress_bar = ttk.Progressbar(section, variable=self.execution_progress_var, maximum=100, mode="determinate")
-        self.execution_progress_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
-        ttk.Label(section, textvariable=self.execution_progress_text_var, style="Muted.TLabel", padding=(2, 5), wraplength=320).grid(row=2, column=0, columnspan=2, sticky="ew")
-        ttk.Label(section, textvariable=self.status_var, style="Status.TLabel", padding=8, wraplength=320).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        self.execution_progress_bar.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        ttk.Label(section, textvariable=self.execution_progress_text_var, style="Muted.TLabel", padding=(2, 5), wraplength=320).grid(row=3, column=0, columnspan=3, sticky="ew")
+        ttk.Label(section, textvariable=self.status_var, style="Status.TLabel", padding=8, wraplength=320).grid(row=4, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         return row + 1
 
     def _bind_preview_updates(self) -> None:
@@ -1882,16 +1958,27 @@ class AutoTestPanel:
             return
         try:
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
-            specs = autotest_point_specs_from_json_payload(payload)
+            specs = self._point_specs_from_import_payload(payload)
         except Exception as exc:
             self.status_var.set(f"Import List failed: {exc}")
             return
         self._set_custom_point_specs(specs, f"Imported {len(specs)} point(s) from {Path(path).name}.")
 
+    def _point_specs_from_import_payload(self, payload: object) -> tuple[AutoTestPointSpec, ...]:
+        grid_settings = None
+        if (
+            isinstance(payload, dict)
+            and not isinstance(payload.get("points"), list)
+            and "coordinate_list" in payload
+        ):
+            grid_settings = self.settings_from_ui()
+        return autotest_point_specs_from_json_payload(payload, grid_settings=grid_settings)
+
     def _set_custom_point_specs(self, specs: tuple[AutoTestPointSpec, ...], message: str) -> None:
         self.custom_point_specs = tuple(specs)
         self._preview_cache_key = None
         self._preview_cache_points = None
+        self.point_overlay_states = {}
         self.point_source_var.set(f"Point source: {len(specs)} imported/generated point(s)")
         self.status_var.set(message)
         self.redraw_preview()
@@ -1932,10 +2019,26 @@ class AutoTestPanel:
         }
         status_var = tk.StringVar(value="Configure nested arrays and preview point placement.")
 
-        form = ttk.Frame(dialog, style="Panel.TFrame", padding=12)
-        form.grid(row=0, column=0, sticky="nsew")
+        source_notebook = ttk.Notebook(dialog)
+        source_notebook.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        form = ttk.Frame(source_notebook, style="Panel.TFrame", padding=12)
+        custom_form = ttk.Frame(source_notebook, style="Panel.TFrame", padding=12)
+        source_notebook.add(form, text="Advanced Array")
+        source_notebook.add(custom_form, text="Custom List")
         for column in range(4):
             form.columnconfigure(column, weight=1 if column in (1, 3) else 0)
+        custom_form.columnconfigure(0, weight=1)
+        imported_specs: tuple[AutoTestPointSpec, ...] | None = None
+        imported_path_var = tk.StringVar(value="No custom list loaded.")
+        ttk.Label(
+            custom_form,
+            text="Import a JSON point list. Native points use their saved u/v coordinates; legacy row/col-only lists use the base array settings.",
+            style="Muted.TLabel",
+            wraplength=300,
+        ).grid(row=0, column=0, sticky="ew")
+        ttk.Label(custom_form, textvariable=imported_path_var, style="Value.TLabel", wraplength=300).grid(
+            row=1, column=0, sticky="ew", pady=(12, 0)
+        )
 
         def add_pair(row_index: int, title: str, u_key: str, v_key: str) -> int:
             ttk.Label(form, text=title, style="Muted.TLabel").grid(row=row_index, column=0, sticky="w", pady=(8 if row_index else 0, 2), padx=(0, 6))
@@ -1962,7 +2065,7 @@ class AutoTestPanel:
         ttk.Entry(form, textvariable=variables["name_pattern"], width=20).grid(row=row_index, column=1, columnspan=3, sticky="ew", pady=(8, 0))
         row_index += 1
 
-        preview_frame = ttk.Frame(dialog, style="Panel.TFrame", padding=12)
+        preview_frame = ttk.LabelFrame(dialog, text="Point Preview", padding=12)
         preview_frame.grid(row=0, column=1, sticky="nsew")
         preview_frame.columnconfigure(0, weight=1)
         preview_frame.rowconfigure(0, weight=1)
@@ -1970,7 +2073,7 @@ class AutoTestPanel:
         preview_canvas.grid(row=0, column=0, sticky="nsew")
         ttk.Label(preview_frame, textvariable=status_var, style="Muted.TLabel").grid(row=1, column=0, sticky="ew", pady=(8, 0))
 
-        def current_specs() -> tuple[AutoTestPointSpec, ...]:
+        def generated_specs() -> tuple[AutoTestPointSpec, ...]:
             return generate_nested_autotest_point_specs(
                 origin_u=float(variables["origin_u"].get()),
                 origin_v=float(variables["origin_v"].get()),
@@ -1988,6 +2091,13 @@ class AutoTestPanel:
                 outer_rows=int(float(variables["outer_rows"].get())),
                 name_pattern=variables["name_pattern"].get(),
             )
+
+        def current_specs() -> tuple[AutoTestPointSpec, ...]:
+            if source_notebook.index(source_notebook.select()) == 1:
+                if imported_specs is None:
+                    raise ValueError("Import a custom JSON list to preview it.")
+                return imported_specs
+            return generated_specs()
 
         def generator_params() -> dict[str, object]:
             return {key: variable.get() for key, variable in variables.items()}
@@ -2015,6 +2125,33 @@ class AutoTestPanel:
                 y = height / 2.0 - (spec.v - center_v) * scale
                 preview_canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill="#38bdf8", outline="#bae6fd")
             status_var.set(f"Preview: {len(specs)} point(s). Tokens: {{bi}}, {{bj}}, {{i}}, {{j}}, {{n}}.")
+
+        def import_custom_list() -> None:
+            nonlocal imported_specs
+            path = filedialog.askopenfilename(
+                title="Direct Import AutoTest Point List",
+                filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+            )
+            if not path:
+                return
+            try:
+                payload = json.loads(Path(path).read_text(encoding="utf-8"))
+                specs = self._point_specs_from_import_payload(payload)
+            except Exception as exc:
+                status_var.set(f"Import failed: {exc}")
+                return
+            imported_specs = specs
+            imported_path_var.set(f"{Path(path).name}: {len(specs)} point(s)")
+            self._set_custom_point_specs(specs, f"Imported {len(specs)} point(s) from {Path(path).name}.")
+            status_var.set(f"Imported {len(specs)} point(s); preview uses the saved coordinates.")
+            draw_preview()
+
+        ttk.Button(
+            custom_form,
+            text="Direct Import JSON...",
+            style="Accent.TButton",
+            command=import_custom_list,
+        ).grid(row=2, column=0, sticky="ew", pady=(12, 0))
 
         def save_json() -> None:
             try:
@@ -2051,7 +2188,7 @@ class AutoTestPanel:
             Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
             status_var.set(f"Saved {Path(path).name}.")
 
-        def direct_import() -> None:
+        def direct_import_generated() -> None:
             try:
                 specs = current_specs()
             except Exception as exc:
@@ -2070,10 +2207,11 @@ class AutoTestPanel:
         footer.columnconfigure((0, 1, 2), weight=1, uniform="generate_list_actions")
         ttk.Button(footer, text="Save JSON", command=save_json).grid(row=0, column=0, sticky="ew", padx=(0, 4))
         ttk.Button(footer, text="Save List", command=save_list).grid(row=0, column=1, sticky="ew", padx=(4, 4))
-        ttk.Button(footer, text="Direct Import", style="Accent.TButton", command=direct_import).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        ttk.Button(footer, text="Direct Import", style="Accent.TButton", command=direct_import_generated).grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
         for variable in variables.values():
             variable.trace_add("write", draw_preview)
+        source_notebook.bind("<<NotebookTabChanged>>", draw_preview)
         preview_canvas.bind("<Configure>", draw_preview)
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
         draw_preview()
@@ -2185,10 +2323,92 @@ class AutoTestPanel:
         self.redraw_preview()
         self.start_run(settings, points)
 
+    def _resume_run(self) -> None:
+        if self.resume_run is None or not self._prerequisites_ready():
+            self.status_var.set("Calibrate FocusMap and LayoutMap before resuming AutoTest.")
+            return
+        directory = filedialog.askdirectory(title="Select AutoTest session to resume",
+                                            initialdir=str(Path.cwd() / "autotest_session"))
+        if directory:
+            self.resume_run(Path(directory))
+
+    def _start_loaded_resume(self) -> None:
+        if self.loaded_resume_dir is None or self.start_resume_run is None:
+            self.status_var.set("Select an AutoTest session before starting resume.")
+            return
+        self.start_resume_run()
+
+    def clear_resume_plan(self) -> None:
+        self.loaded_resume_dir = None
+        self.start_resume_button.configure(state="disabled")
+
+    def load_resume_plan(self, session_dir: Path, settings: AutoTestSettings,
+                         specs: tuple[AutoTestPointSpec, ...] | None, completed: int, total: int) -> None:
+        from .workflow_library import cards_from_workflow_payload
+
+        values = {
+            "origin_u_var": settings.origin_u, "origin_v_var": settings.origin_v,
+            "u_vector_u_var": settings.u_vector_u, "u_vector_v_var": settings.u_vector_v,
+            "v_vector_u_var": settings.v_vector_u, "v_vector_v_var": settings.v_vector_v,
+            "rows_var": settings.rows, "cols_var": settings.cols,
+            "z_down_margin_var": settings.z_down_margin_um,
+            "z_up_fast_percent_var": settings.z_up_fast_percent,
+            "z_fast_speed_percent_var": settings.z_fast_speed_percent,
+            "z_slow_speed_percent_var": settings.z_slow_speed_percent,
+            "z_wobble_um_var": settings.z_wobble_um,
+            "z_wobble_cycles_var": settings.z_wobble_cycles,
+            "z_offset_um_var": settings.z_offset_um,
+        }
+        cards = cards_from_workflow_payload({
+            "format": "semi_auto_probe.measurement_workflow", "version": 2,
+            "nodes": [{"type_id": step.type_id, "params": step.params} for step in settings.measurement_flow],
+        }) if settings.measurement_flow else []
+        for card, step in zip(cards, settings.measurement_flow):
+            card.params = {key: value for key, value in step.params.items()
+                           if key not in {"_node_id", "_x", "_y"}}
+        existing_editor = getattr(self, "_measurement_dialog", None)
+        if existing_editor is not None:
+            try:
+                if existing_editor.winfo_exists():
+                    existing_editor.grab_release()
+                    existing_editor.destroy()
+            except tk.TclError:
+                pass
+            self._measurement_dialog = None
+        self.loaded_resume_dir = None
+        for name, value in values.items():
+            getattr(self, name).set(f"{value:g}" if isinstance(value, float) else str(value))
+        self.fov_width_var.set(f"{settings.fov_width_um:g}")
+        self.fov_height_var.set(f"{settings.fov_height_um:g}")
+        self.name_pattern_var.set(settings.name_pattern)
+        self.custom_point_specs = tuple(specs) if specs is not None else None
+        positions = ([(spec.row, spec.col) for spec in specs] if specs is not None else
+                     [(row, col) for row in range(settings.rows) for col in range(settings.cols)])
+        self.point_overlay_states = {
+            position: "done" if index < completed else "pending"
+            for index, position in enumerate(positions)
+        }
+        self._preview_cache_key = None
+        self._preview_cache_points = None
+        self.measurement_flow_cards[:] = cards
+        self.measurement_flow_next_id = max(
+            (int(card.card_id[5:]) for card in cards
+             if card.card_id.startswith("flow_") and card.card_id[5:].isdigit()), default=0) + 1
+        self._update_measurement_summary()
+        self._update_z_up_split_text()
+        self._draw_z_wobble_curve()
+        self.point_source_var.set(f"Point source: resumed session, {total} saved point(s)")
+        self.execution_progress_text_var.set(f"Progress: {completed}/{total} | Ready to resume")
+        self.execution_progress_var.set(100 * completed / total if total else 0)
+        self.loaded_resume_dir = Path(session_dir)
+        self.start_resume_button.configure(state="normal")
+        self.redraw_preview()
+
     def set_running(self, running: bool) -> None:
         self.running = running
         self.measurement_button.configure(state="disabled" if running else "normal")
         self.stop_button.configure(state="normal" if running else "disabled")
+        self.start_resume_button.configure(state="disabled" if running or self.loaded_resume_dir is None else "normal")
         self._update_prerequisite_status()
 
     def set_progress(
@@ -2260,6 +2480,10 @@ class AutoTestPanel:
         self._set_prerequisite_chip(self.layoutmap_status_label, layoutmap_ready)
         if hasattr(self, "run_button"):
             self.run_button.configure(state="normal" if focusmap_ready and layoutmap_ready and not self.running else "disabled")
+            self.resume_button.configure(state="normal" if self.resume_run is not None and focusmap_ready and layoutmap_ready and not self.running else "disabled")
+            self.start_resume_button.configure(
+                state="normal" if self.loaded_resume_dir is not None and focusmap_ready and layoutmap_ready and not self.running else "disabled"
+            )
 
     def _set_prerequisite_chip(self, label: tk.Label, ready: bool) -> None:
         if ready:
@@ -3267,13 +3491,13 @@ class AutoTestPanel:
         for column, (key, label) in enumerate(
             (
                 ("sweep_mode", "Source"),
-                ("scan_type", "Path"),
+                ("initial_direction", "Direction"),
                 ("start", "Start"),
-                ("stop", "Vtop/list"),
+                ("stop", "Top/list"),
             )
         ):
             ttk.Label(sweep, text=label, style="Muted.TLabel").grid(row=0, column=column, sticky="w", padx=(0, 6))
-            if key in {"sweep_mode", "scan_type"}:
+            if key in {"sweep_mode", "initial_direction"}:
                 combo(sweep, key, self._flow_param_choices(key), 1, column, width=10, padx=(0, 6 if column < 3 else 0))
             else:
                 entry(sweep, key, 1, column, width=10, padx=(0, 6 if column < 3 else 0))
@@ -3281,6 +3505,12 @@ class AutoTestPanel:
         ttk.Label(sweep, text="Delay s", style="Muted.TLabel").grid(row=2, column=1, sticky="w", padx=(0, 6), pady=(6, 0))
         entry(sweep, "step", 3, 0)
         entry(sweep, "source_delay_s", 3, 1)
+        ttk.Label(sweep, text='Low', style='Muted.TLabel').grid(row=2, column=2, sticky='w')
+        ttk.Label(sweep, text='Segments', style='Muted.TLabel').grid(row=2, column=3, sticky='w')
+        entry(sweep, 'low', 3, 2)
+        entry(sweep, 'segments', 3, 3)
+        ttk.Label(sweep, text='Each segment ends at one feature point: Top, Start, Low, Start (reversed when scanning down). Blank Segments preserves an old workflow path.',
+                  style='Muted.TLabel', wraplength=420).grid(row=4, column=0, columnspan=4, sticky='w')
 
         protection = group("Compliance and Acquisition", 2)
         protection.columnconfigure((0, 1, 2, 3), weight=1, uniform=f"iv_protection_{card.card_id}")
@@ -3298,6 +3528,10 @@ class AutoTestPanel:
             else:
                 entry(protection, key, 1, column, width=10, padx=(0, 6 if column < 3 else 0))
 
+        ttk.Label(protection, text='Source range', style='Muted.TLabel').grid(row=2, column=0, sticky='w')
+        entry(protection, 'source_range', 3, 0)
+        ttk.Label(protection, text='Auto zero', style='Muted.TLabel').grid(row=2, column=1, sticky='w')
+        combo(protection, 'autozero', ('true', 'false'), 3, 1)
         output = group("Statistics and Display", 3)
         output.columnconfigure((0, 1, 2, 3), weight=1, uniform=f"iv_output_{card.card_id}")
         for column, (key, label) in enumerate(
@@ -3662,6 +3896,7 @@ class AutoTestPanel:
         choices = {
             "output_terminal": ("rear", "front"),
             "sweep_mode": ("voltage", "current"),
+            "initial_direction": ("up", "down"),
             "scan_type": ("single", "double", "dualpolar"),
             "bidirectional": ("false", "true"),
             "output_statistics": ("true", "false"),
@@ -3687,6 +3922,16 @@ class AutoTestPanel:
 
     def _set_flow_card_param(self, card: AutoTestFlowCard, key: str, value: str) -> None:
         card.params[key] = value
+        if card.type_id == 'iv' and key == 'measure_range':
+            from .smu_settings import reduce_workflow_limit
+            adjustment = reduce_workflow_limit(card.params)
+            if adjustment:
+                limit_key, limit = adjustment
+                card.params[limit_key] = limit
+                variable = self._flow_entry_vars.get((card.card_id, limit_key))
+                if variable is not None:
+                    variable.set(limit)
+                self._flow_editor_status_var.set(f'Protection reduced to {limit} for the selected measurement range.')
         self._update_measurement_summary()
         if card.type_id == "wobb_test" and key == "mode":
             self._flow_editor_status_var.set(f"WobbTest mode: {value}.")
@@ -3705,6 +3950,10 @@ class AutoTestPanel:
                 parts.append(f"XY +/-{card.params.get('xy_range_um', '2')} um")
             return " | ".join(parts)
         if card.type_id == "iv":
+            if card.params.get('segments', '').strip():
+                return (f"{card.params.get('sweep_mode', 'voltage')} | Start {card.params.get('start', '0')} "
+                        f"{card.params.get('initial_direction', 'up')} | Top {card.params.get('stop', '1')} "
+                        f"Low {card.params.get('low', '-1')} | {card.params['segments']} segments")
             return (
                 f"{card.params.get('resource', 'GPIB0::18::INSTR')} | "
                 f"{card.params.get('sweep_mode', 'voltage')} {card.params.get('scan_type', card.params.get('bidirectional', 'single'))} | "

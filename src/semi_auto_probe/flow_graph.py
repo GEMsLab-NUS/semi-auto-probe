@@ -114,8 +114,6 @@ def validate_flow_graph(steps: Sequence[AutoTestFlowStep]) -> tuple[str, ...]:
                 errors.append(f"{node_id}: {input_name} expects {input_type}, but {source_id} outputs {actual_type or 'no data'}.")
     errors.extend(_data_cycle_errors(steps, ids))
     panels = [step for step in steps if step.type_id == "plot_panel"]
-    if len(panels) > 1:
-        errors.append("A workflow can contain only one Plot Panel.")
     strict = bool(panels) or any(step.params.get("_workflow_version") == "2" for step in steps)
     if strict:
         starts_explicit = [ids[i] for i, step in enumerate(steps) if step.type_id == "workflow_start"]
@@ -174,6 +172,26 @@ def validate_flow_graph(steps: Sequence[AutoTestFlowStep]) -> tuple[str, ...]:
     if not starts:
         errors.append("Graph has no start node; check for a cycle.")
     return tuple(errors)
+
+
+def control_node_runs_on_every_path(steps: Sequence[AutoTestFlowStep], target_id: str) -> bool:
+    """Whether every Start-to-End control path visits target_id."""
+    by_id = {step_node_id(step, index): step for index, step in enumerate(steps)}
+    if target_id not in by_id or by_id[target_id].type_id in DATA_ONLY_TYPES:
+        return False
+    pending = [graph_start_node(steps)]
+    seen = set()
+    while pending:
+        node_id = pending.pop()
+        if node_id is None or node_id == target_id or node_id in seen:
+            continue
+        seen.add(node_id)
+        step = by_id[node_id]
+        if step.type_id == "workflow_end":
+            return False
+        pending.extend(str(step.params[key]) for key in ("_next", "_true", "_false")
+                       if step.params.get(key) in by_id)
+    return True
 
 
 def graph_start_node(steps: Sequence[AutoTestFlowStep]) -> str | None:

@@ -53,3 +53,6 @@ src/semi_auto_probe/homepage/
 
 # Local test and diagnostic artifacts
 /.cache/
+
+# Local manual instrument recordings
+/manualtest_session/

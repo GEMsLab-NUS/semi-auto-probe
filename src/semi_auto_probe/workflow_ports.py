@@ -2,6 +2,8 @@
 from __future__ import annotations
 import re
 
+PLOT_LAYOUTS = {"1x1": (1, 1), "1x2": (1, 2), "2x2": (2, 2), "2x3": (2, 3)}
+
 LIGHT_OUTPUT_TYPES = frozenset({"laser_output", "laser_pulse", "light_control", "light_pulse"})
 LIGHT_INPUT_TYPES = frozenset({"photo_iv", "photo_transient"})
 MATH_TYPES = frozenset({'math_formula', 'math_add', 'math_subtract', 'math_multiply', 'math_divide'})
@@ -71,6 +73,15 @@ def input_ports(node):
         return tuple((f'slot{i}', 'plot') for i in range(1, 7))
     return DATA_INPUTS.get(node.type_id, ())
 
+def visible_input_ports(node):
+    """Keep saved slot declarations stable; expose only slots in the current layout."""
+    ports = input_ports(node)
+    if node.type_id == 'plot_panel':
+        rows, columns = PLOT_LAYOUTS.get(node.params.get('layout', '1x2'), (1, 2))
+        return ports[:rows * columns]
+    return ports
+
+
 def output_ports(node):
     if node.type_id == 'math_formula':
         return (('result', node.params.get('output_type', 'number')),)
@@ -92,7 +103,7 @@ def output_type(node, name):
     return ''
 
 def compatible(actual, expected):
-    return actual == expected or (expected == 'plot' and actual in {'number', 'trace'})
+    return actual == expected or (expected == 'plot' and actual in {'number', 'trace', 'curve'})
 
 def metric_unit(name):
     leaf = name.rsplit('.', 1)[-1]

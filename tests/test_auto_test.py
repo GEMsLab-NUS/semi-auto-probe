@@ -145,6 +145,102 @@ class AutoTestTests(unittest.TestCase):
         self.assertAlmostEqual(points[1].stage_x_um, 106.0)
         self.assertAlmostEqual(points[1].stage_y_um, 212.0)
 
+    def test_sac_coordinate_list_uses_current_grid_basis(self) -> None:
+        payload = {
+            "schema_version": 1,
+            "coordinate_list": [[0, 1], [2, 3]],
+            "devices": [
+                {"device_name": "A2", "row": 0, "col": 1},
+                {"device_name": "C4", "row": 2, "col": 3},
+            ],
+        }
+        settings = AutoTestSettings(
+            origin_u=100.0,
+            origin_v=200.0,
+            u_vector_u=10.0,
+            u_vector_v=1.0,
+            v_vector_u=-2.0,
+            v_vector_v=20.0,
+            rows=4,
+            cols=5,
+            fov_width_um=10.0,
+            fov_height_um=10.0,
+            z_down_margin_um=100.0,
+            z_up_fast_percent=50.0,
+            z_fast_speed_percent=50,
+            z_slow_speed_percent=2,
+            name_pattern="Dev{i}{j}",
+        )
+
+        specs = autotest_point_specs_from_json_payload(payload, grid_settings=settings)
+
+        self.assertEqual(
+            specs,
+            (
+                AutoTestPointSpec("A2", 110.0, 201.0, 0, 1),
+                AutoTestPointSpec("C4", 126.0, 243.0, 2, 3),
+            ),
+        )
+
+    def test_native_points_take_priority_over_legacy_sac_coordinate_list(self) -> None:
+        payload = {
+            "format": "semi_auto_probe.autotest_point_list",
+            "version": 1,
+            "points": [{"name": "A2", "u": 123.5, "v": -45.25, "row": 0, "col": 1}],
+            "coordinate_list": [[0, 1]],
+        }
+
+        specs = autotest_point_specs_from_json_payload(payload)
+
+        self.assertEqual(specs, (AutoTestPointSpec("A2", 123.5, -45.25, 0, 1),))
+
+    def test_native_point_import_does_not_require_valid_base_array_settings(self) -> None:
+        panel = object.__new__(AutoTestPanel)
+        panel.settings_from_ui = lambda: self.fail("native u/v points must not read base array settings")
+        payload = {
+            "format": "semi_auto_probe.autotest_point_list",
+            "version": 1,
+            "points": [{"name": "A2", "u": 123.5, "v": -45.25, "row": 0, "col": 1}],
+            "coordinate_list": [[0, 1]],
+        }
+
+        specs = panel._point_specs_from_import_payload(payload)
+
+        self.assertEqual(specs, (AutoTestPointSpec("A2", 123.5, -45.25, 0, 1),))
+
+    def test_legacy_coordinate_only_import_uses_base_array_settings(self) -> None:
+        panel = object.__new__(AutoTestPanel)
+        settings = AutoTestSettings(100, 200, 10, 1, -2, 20, 4, 5, 10, 10, 100, 50, 50, 2, "Dev{i}{j}")
+        panel.settings_from_ui = lambda: settings
+
+        specs = panel._point_specs_from_import_payload({"coordinate_list": [[2, 3]]})
+
+        self.assertEqual(specs, (AutoTestPointSpec("DevD3", 126.0, 243.0, 2, 3),))
+
+    def test_importing_custom_points_clears_previous_completion_colors(self) -> None:
+        class Variable:
+            def __init__(self) -> None:
+                self.value = ""
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+        panel = object.__new__(AutoTestPanel)
+        panel.custom_point_specs = None
+        panel._preview_cache_key = "old"
+        panel._preview_cache_points = (object(),)
+        panel.point_overlay_states = {(0, 1): "done"}
+        panel.point_source_var = Variable()
+        panel.status_var = Variable()
+        redraws: list[bool] = []
+        panel.redraw_preview = lambda: redraws.append(True)
+        specs = (AutoTestPointSpec("A2", 10.0, 20.0, 0, 1),)
+
+        panel._set_custom_point_specs(specs, "Imported")
+
+        self.assertEqual(panel.point_overlay_states, {})
+        self.assertEqual(redraws, [True])
+
     def test_nested_point_generator_payload_round_trips(self) -> None:
         specs = generate_nested_autotest_point_specs(
             origin_u=0,
@@ -240,7 +336,8 @@ class AutoTestTests(unittest.TestCase):
         self.assertEqual(steps[2].params["resource"], "GPIB0::18::INSTR")
         self.assertEqual(steps[2].params["output_terminal"], "rear")
         self.assertEqual(steps[2].params["sweep_mode"], "voltage")
-        self.assertEqual(steps[2].params["scan_type"], "single")
+        self.assertEqual(steps[2].params["segments"], "1")
+        self.assertEqual(steps[2].params["initial_direction"], "up")
         self.assertEqual(steps[2].params["measure_range"], "auto")
         self.assertEqual(steps[2].params["output_statistics"], "true")
         self.assertEqual(steps[2].params["resistance_method"], "linear_fit")

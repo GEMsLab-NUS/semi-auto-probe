@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -70,7 +71,7 @@ def cards_from_workflow_payload(payload: Any) -> list[AutoTestFlowCard]:
         params = {str(key): str(value) for key, value in item.get("params", {}).items()}
         _require_current_card(item["type_id"], params)
         card_id = params.pop("_node_id", f"flow_{index + 1}")
-        card = create_autotest_flow_card(str(item["type_id"]), card_id)
+        card = create_autotest_flow_card(str(item["type_id"]), card_id, saved_params=params)
         card.params.update(params)
         card.x = float(card.params.pop("_x", index * 280))
         card.y = float(card.params.pop("_y", 0))
@@ -82,6 +83,22 @@ def save_workflow(path: Path, cards: list[AutoTestFlowCard], *, name: str | None
     path = path.with_suffix(".json")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(workflow_payload(cards, name=name or path.stem), indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def overwrite_workflow(path: Path, cards: list[AutoTestFlowCard]) -> Path:
+    """Replace an existing user workflow while keeping its name and file path."""
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    existing = json.loads(path.read_text(encoding="utf-8"))
+    name = existing.get("name") if isinstance(existing, dict) else None
+    payload = workflow_payload(cards, name=name if isinstance(name, str) and name else path.stem)
+    replacement = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        replacement.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        replacement.replace(path)
+    finally:
+        replacement.unlink(missing_ok=True)
     return path
 
 
@@ -397,7 +414,7 @@ def template_tree() -> dict[str, Any]:
 def cards_from_template(name: str) -> list[AutoTestFlowCard]:
     cards: list[AutoTestFlowCard] = []
     for item in builtin_templates()[name]:
-        card = create_autotest_flow_card(str(item["type_id"]), str(item["id"]))
+        card = create_autotest_flow_card(str(item["type_id"]), str(item["id"]), saved_params={str(k): str(v) for k, v in item.get("params", {}).items()})
         card.x, card.y = float(item.get("x", 0)), float(item.get("y", 0))
         card.params.update({str(key): str(value) for key, value in item.get("params", {}).items()})
         cards.append(card)

@@ -133,6 +133,23 @@ class DP100Driver:
         logger.debug("DP100 readback: %g V, %g mA.", voltage_mv / 1000, current_ma)
         return DP100Reading(voltage_mv / 1000.0, current_ma / 1000.0)
 
+    def read_settings(self) -> dict:
+        """GetCurrentBasic: index, output state, V/I setpoints, OVP/OCP (mV/mA)."""
+        if not self.connected:
+            raise RuntimeError('DP100 disconnected.')
+        result = self._api.GetCurrentBasic(0, 0, 0, 0, 0, 0)
+        if not result[0]:
+            raise RuntimeError('DP100 status readback failed.')
+        _, preset, state, voltage, current, ovp, ocp = result
+        return dict(preset=int(preset), output=int(state) > 0, voltage=float(voltage) / 1000,
+                    current=float(current) / 1000, ovp=float(ovp) / 1000, ocp=float(ocp) / 1000)
+
+    def use_preset(self, setpoint: DP100Setpoint, *, ovp_v: float, ocp_a: float) -> None:
+        value = setpoint.normalized()
+        if not self._api.UseGroup(value.preset_index, value.current_ma, value.voltage_mv,
+                                  _uint16_si(ocp_a, 1000, 'OCP'), _uint16_si(ovp_v, 1000, 'OVP')):
+            raise RuntimeError('DP100 rejected preset activation.')
+
     def shutdown(self) -> None:
         try:
             self.set_output(DP100Setpoint(0, 0, 1), False)

@@ -43,37 +43,6 @@ class DisplayMailbox:
             return event
 
 
-class Envelope:
-    """Online min/max buckets: display work stays bounded as raw curves grow."""
-    def __init__(self, budget=1200):
-        self.budget, self.stride = budget, 1
-        self.buckets = []
-
-    @staticmethod
-    def merge(a, b, values):
-        candidates = a + b
-        finite = [i for i in candidates if math.isfinite(values[i])]
-        if not finite:
-            return [candidates[0], candidates[-1]]
-        return sorted({candidates[0], min(finite, key=values.__getitem__),
-                       max(finite, key=values.__getitem__), candidates[-1]})
-
-    def append(self, values):
-        index = len(values) - 1
-        if index // self.stride >= len(self.buckets):
-            self.buckets.append([index])
-        else:
-            self.buckets[-1] = self.merge(self.buckets[-1], [index], values)
-        if len(self.buckets) > self.budget:
-            self.buckets = [self.merge(self.buckets[i], self.buckets[i+1], values)
-                            if i+1 < len(self.buckets) else self.buckets[i]
-                            for i in range(0, len(self.buckets), 2)]
-            self.stride *= 2
-
-    def indices(self):
-        return [index for bucket in self.buckets for index in bucket]
-
-
 class NodeCapture:
     def __init__(self, node_id, type_id, run_id, point, queue, plot=False, *, sweep_mode="voltage"):
         self.node_id, self.type_id, self.run_id = node_id, type_id, run_id
@@ -81,6 +50,7 @@ class NodeCapture:
         self.sweep_mode = sweep_mode
         self.series = {}
         self.last_publish = 0
+        self.completed = False
         self.mailbox = DisplayMailbox()
 
     def sample(self, sample, label=None):
@@ -103,28 +73,29 @@ class NodeCapture:
             x = current
         unit = "s" if time_axis else "A" if current_axis else "V"
         if label not in self.series:
-            self.series[label] = {"x": [], "current": [], "voltage": [], "resistance": [], "x_unit": unit,
-                                  "envelopes": {q: Envelope() for q in ("current", "voltage", "resistance")}}
+            self.series[label] = {"x": [], "current": [], "voltage": [], "resistance": [], "x_unit": unit}
         data = self.series[label]
         data["x"].append(float(x))
         data["current"].append(float(current))
         data["voltage"].append(float(voltage))
         data["resistance"].append(float(voltage) / float(current) if current else float("nan"))
-        for quantity, envelope in data["envelopes"].items():
-            envelope.append(data[quantity])
         self.publish()
 
-    def family(self, quantity, display=False):
+    def family(self, quantity):
         family = {}
+        current_axis = self.type_id == "iv" and self.sweep_mode == "current"
         for label, data in self.series.items():
-            indices = data["envelopes"][quantity].indices() if display else range(len(data["x"]))
-            family[label] = Curve(tuple(data["x"][i] for i in indices), tuple(data[quantity][i] for i in indices), label, data["x_unit"], {"current": "A", "voltage": "V", "resistance": "Ω"}[quantity])
+            indices = range(len(data["x"]))
+            family[label] = Curve(tuple(data["x"][i] for i in indices), tuple(data[quantity][i] for i in indices), label, data["x_unit"], {"current": "A", "voltage": "V", "resistance": "Ω"}[quantity],
+                                  tuple(data["voltage"][i] for i in indices) if self.type_id == "iv" and not current_axis else None)
         return family
 
     def publish(self, force=False):
         now = time.monotonic()
         if self.plot and (force or now - self.last_publish >= .05):
-            outputs = {name: self.family(quantity, display=True) for name, quantity in (("live", "current"), ("live_voltage", "voltage"), ("live_resistance", "resistance"))}
+            outputs = {name: self.family(quantity) for name, quantity in (("live", "current"), ("live_voltage", "voltage"), ("live_resistance", "resistance"))}
+            if self.completed:
+                outputs.update({name: self.family(quantity) for name, quantity in (("curve", "current"), ("curve_voltage", "voltage"), ("curve_resistance", "resistance"))})
             self.mailbox.publish(self.queue, (self.run_id, self.node_id, outputs))
             self.last_publish = time.monotonic()
 
@@ -172,5 +143,6 @@ class NodeCapture:
                        status=status, valid=status == "done")
         for output, quantity in (("curve", "current"), ("curve_voltage", "voltage"), ("curve_resistance", "resistance")):
             payload[output] = self.family(quantity)
+        self.completed = True
         self.publish(force=True)
         return payload

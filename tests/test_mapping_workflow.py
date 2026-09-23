@@ -117,15 +117,20 @@ class MappingWorkflowTests(unittest.TestCase):
         card = create_autotest_flow_card("iv", "sweep")
         card.params.update(start="0", stop="0.1", step="0.1", source_delay_s="0", output_off_after="false", _node_id="sweep")
         flow = (AutoTestFlowStep("iv", card.params),)
+        from test_instrument_control import FakeVisa
+        instrument = FakeVisa()  # New cards confirm output/ranges and query paired V/I.
         with tempfile.TemporaryDirectory() as tmp:
-            _, events, (_, metadata, results) = self.run_map(Path(tmp), flow, x_b_um=0, y_b_um=0)
-            self.assertEqual(metadata["status"], "completed")
+            _, _, (_, metadata, results) = self.run_map(Path(tmp), flow, instrument_factory=lambda: instrument, x_b_um=0, y_b_um=0)
+            events = instrument.commands
+            self.assertEqual(metadata["status"], "completed", metadata.get("error"))
             self.assertEqual(events[-1], ":OUTP OFF")
             artifacts = results[0, 0].workflow_data["artifacts"]
             result_path = next(path for path in artifacts if "iv" in Path(path).parts and path.endswith(".json"))
             payload = json.loads(read_mapping_artifact(Path(tmp), result_path))
             self.assertIsNone(payload["coordinates"]["gds"])
             self.assertFalse(payload["measurement"]["output_off_after"])
+            self.assertEqual(payload["measurement"]["segments"], 1)
+            self.assertEqual(payload["measurement"]["initial_direction"], "up")
             self.assertTrue(any(key.endswith("resistance_ohm") for key in results[0, 0].workflow_data["metrics"]))
 
     def test_invalid_fixed_z_flow_rejected_before_motion(self):

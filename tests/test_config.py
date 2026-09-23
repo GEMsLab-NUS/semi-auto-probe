@@ -38,7 +38,7 @@ class ProbeConfigTest(unittest.TestCase):
         self.assertEqual(config.cc_speed_percent, 100)
         self.assertEqual(config.fine_speed_percent, 40)
         self.assertEqual(config.safe_speed_percent, 15)
-        self.assertEqual(config.probe_safe_z_margin_um, 100.0)
+        self.assertEqual(config.probe_safe_z_margin_um, 500.0)
         self.assertEqual(config.active_motor_speed_profile, MOTOR_SPEED_PROFILE_FAST)
         self.assertEqual(config.motor_speed_percent(), 100)
         self.assertEqual(config.camera_exposure_mode, CAMERA_CONTROL_MODE_AUTO)
@@ -261,6 +261,27 @@ class ProbeConfigTest(unittest.TestCase):
             self.assertEqual(loaded.agent_base_url, "https://api.deepseek.com")
             self.assertEqual(loaded.agent_model, "deepseek-chat")
             self.assertAlmostEqual(loaded.agent_timeout_seconds, 12.5)
+
+    def test_ntfy_defaults_and_round_trip(self) -> None:
+        defaults = ProbeConfig()
+        self.assertTrue(defaults.ntfy_enabled)
+        self.assertEqual(defaults.ntfy_server_url, "https://ntfy.sh")
+        self.assertEqual(defaults.ntfy_topic, "SAP_alerts")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / DEFAULT_CONFIG_FILENAME
+            config = ProbeConfig(
+                ntfy_enabled=True,
+                ntfy_server_url="https://notify.example.test/",
+                ntfy_topic="lab_alerts",
+                ntfy_notify_errors=False,
+                ntfy_notify_completions=True,
+            )
+            save_probe_config(config, path)
+            loaded = load_probe_config(path)
+        self.assertEqual(loaded.ntfy_server_url, "https://notify.example.test")
+        self.assertEqual(loaded.ntfy_topic, "lab_alerts")
+        self.assertFalse(loaded.ntfy_notify_errors)
+        self.assertTrue(loaded.ntfy_notify_completions)
 
     def test_jog_step_levels_parse_and_format_text(self) -> None:
         levels = parse_jog_step_levels_text("100, 1, 10, 10; 1000")

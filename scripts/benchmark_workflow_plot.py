@@ -19,7 +19,7 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 from semi_auto_probe.workflow_formula import Curve
-from semi_auto_probe.workflow_plot import PlotSlot, display_sample_indices
+from semi_auto_probe.workflow_plot import PlotSlot
 from semi_auto_probe.workflow_runtime import NodeCapture
 
 
@@ -29,9 +29,8 @@ def main():
     rng = np.random.default_rng(15)
     x = np.linspace(0, 10, 100_000)
     y = np.sin(x * 3) * 1e-6 + 2e-6
-    # The UI receives bounded min/max envelopes, never the raw history.
-    display_indices = display_sample_indices(y, 1200)
-    family = {"Vg=1 V": Curve(tuple(x[display_indices]), tuple(y[display_indices])), "Vg=2 V": Curve(tuple(x[display_indices]), tuple(y[display_indices] * 1.7))}
+    # Workflow plots now draw every acquired point.
+    family = {"Vg=1 V": Curve(tuple(x), tuple(y)), "Vg=2 V": Curve(tuple(x), tuple(y * 1.7))}
     params = {f"slot{i}_title": title for i, title in enumerate(("Current vs time", "Mean current", "I-V family", "Resistance", "Transient response", "Feature map"), 1)}
     params.update(slot1_xlim="0,10", slot1_ylim="0,0.000006", slot3_xlim="0,10", slot3_ylim="0,0.000006", slot5_xlim="0,10", slot5_ylim="0,0.000006")
     plots = []
@@ -71,7 +70,7 @@ def main():
     acquisition_ms = (time.perf_counter() - start) * 1000
     summary = {key: {"median": float(np.median(samples)), "p95": float(np.percentile(samples, 95))} for key, samples in timings.items()}
     summary.update(python=sys.version.split()[0], platform=platform.platform(), backend="Matplotlib Agg",
-                   curve_points=100_000, display_points_per_curve=len(display_indices), curves_per_live_subplot=2, mapping_cells=10_000,
+                   curve_points=100_000, display_points_per_curve=len(x), curves_per_live_subplot=2, mapping_cells=10_000,
                    capture_100k_samples_ms=acquisition_ms, pending_display_notifications=events.qsize(),
                    raw_samples_retained=len(capture.series["Current"]["x"]))
     (output / "benchmark.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")

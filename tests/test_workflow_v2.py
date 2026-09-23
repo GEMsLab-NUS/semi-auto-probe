@@ -12,10 +12,10 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 from semi_auto_probe.auto_test import create_autotest_flow_card, measurement_flow_steps_from_cards, AutoTestSettings
-from semi_auto_probe.flow_graph import resolve_data_input, evaluate_condition, validate_flow_graph
+from semi_auto_probe.flow_graph import control_node_runs_on_every_path, resolve_data_input, evaluate_condition, validate_flow_graph
 from semi_auto_probe.workflow_formula import Curve, InvalidValue, evaluate_expression
-from semi_auto_probe.workflow_library import cards_from_template, cards_from_workflow_payload, workflow_payload
-from semi_auto_probe.workflow_plot import PlotSlot, LAYOUTS, validate_panel, display_sample_indices
+from semi_auto_probe.workflow_library import cards_from_template, cards_from_workflow_payload, overwrite_workflow, save_workflow, workflow_payload
+from semi_auto_probe.workflow_plot import PlotSlot, LAYOUTS, validate_panel
 from semi_auto_probe.workflow_runtime import NodeCapture, DisplayMailbox
 from semi_auto_probe.app import ProbeApp
 
@@ -90,6 +90,16 @@ class GraphAndPersistenceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "version 2"):
                 cards_from_workflow_payload(legacy)
 
+    def test_overwrite_keeps_existing_file_when_new_workflow_is_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = save_workflow(Path(tmp) / "old.json",
+                                 cards_from_template("General / Examples / Current and Heatmap"), name="Old custom")
+            previous = path.read_bytes()
+            invalid = card("math_formula", "invalid", operator="+")
+            with self.assertRaises(ValueError):
+                overwrite_workflow(path, [invalid])
+            self.assertEqual(path.read_bytes(), previous)
+
     def test_missing_end_wrong_source_type_and_control_cycles(self):
         nodes = cards_from_template("General / Examples / Current and Heatmap")
         nodes[-1].params["_input_slot1_output"] = "statistics.mean_current_a"
@@ -117,6 +127,27 @@ class PlotTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_panel(node)
 
+    def test_multiple_plot_panels_are_valid(self):
+        start, read, end = card("workflow_start", "start"), card("iv", "read"), card("workflow_end", "end")
+        first, second = card("plot_panel", "first_plot"), card("plot_panel", "second_plot")
+        start.params["_next"] = "read"
+        read.params["_next"] = "end"
+        wire(first, "slot1", "read", "live", "trace")
+        wire(second, "slot1", "read", "curve", "curve")
+        steps = measurement_flow_steps_from_cards([start, read, end, first, second])
+        self.assertEqual(validate_flow_graph(steps), ())
+
+    def test_conditional_fine_source_is_optional(self):
+        start, coarse = card("workflow_start", "start"), card("iv", "coarse")
+        condition, fine, end = card("condition_metric", "condition"), card("iv", "fine"), card("workflow_end", "end")
+        start.params["_next"] = "coarse"
+        coarse.params["_next"] = "condition"
+        condition.params.update(_true="fine", _false="end")
+        fine.params["_next"] = "end"
+        steps = measurement_flow_steps_from_cards([start, coarse, condition, fine, end])
+        self.assertTrue(control_node_runs_on_every_path(steps, "coarse"))
+        self.assertFalse(control_node_runs_on_every_path(steps, "fine"))
+
     def test_persistent_artists_and_same_source_family(self):
         fig = Figure(figsize=(4, 3))
         FigureCanvasAgg(fig)
@@ -129,6 +160,70 @@ class PlotTests(unittest.TestCase):
         self.assertEqual(len(slot.axes.lines), 2)
         slot.curves({})
         self.assertEqual(len(slot.axes.lines), 0)
+
+    def test_curve_and_trace_slots_use_subtle_grid_but_heatmap_does_not(self):
+        for mode in ("curve", "trace"):
+            slot = PlotSlot(Figure(figsize=(4, 3)), {}, 1, (2, 3), mode)
+            slot.figure.canvas.draw()
+            gridlines = slot.axes.get_xgridlines() + slot.axes.get_ygridlines()
+            self.assertTrue(gridlines)
+            self.assertTrue(all(line.get_visible() for line in gridlines))
+            self.assertTrue(all(line.get_color() == "#808080" for line in gridlines))
+            self.assertTrue(all(line.get_alpha() == 0.28 for line in gridlines))
+            self.assertEqual(slot.axes.get_axisbelow(), True)
+
+        heatmap = PlotSlot(Figure(figsize=(4, 3)), {}, 1, (2, 3), "number")
+        heatmap.figure.canvas.draw()
+        self.assertFalse(any(line.get_visible() for line in
+                             heatmap.axes.get_xgridlines() + heatmap.axes.get_ygridlines()))
+
+    def test_workflow_plot_ticks_use_engineering_units(self):
+        fig = Figure(figsize=(4, 3))
+        FigureCanvasAgg(fig)
+        slot = PlotSlot(fig, {"_input_slot1_x_label": "V set"}, 1, (2, 3), "trace")
+        slot.curves({"current": Curve((0, 2e-6), (0, 70e-9), x_unit="V", y_unit="A")})
+        self.assertEqual(slot.axes.get_xlabel(), "V set (V)")
+        self.assertEqual(slot.axes.xaxis.get_major_formatter()(2e-6), "2 µV")
+        self.assertEqual(slot.axes.yaxis.get_major_formatter()(70e-9), "70 nA")
+
+        heatmap = PlotSlot(Figure(figsize=(4, 3)), {"_input_slot1_unit": "A"}, 1, (2, 3), "number")
+        self.assertEqual(heatmap.colorbar.formatter(3e-3), "3 mA")
+
+    def test_iv_plot_slot_switches_voltage_x_axis(self):
+        curve = Curve((0., 1.), (2e-9, 3e-9), x_unit="V", y_unit="A", x_measured=(.02, 1.03))
+        for source, expected_x, expected_label in (
+            ("V set", (0., 1.), "V set (V)"),
+            ("V measure", (.02, 1.03), "V measure (V)"),
+        ):
+            fig = Figure(figsize=(4, 3))
+            FigureCanvasAgg(fig)
+            slot = PlotSlot(fig, {"slot1_iv_x_axis": source, "_input_slot1_x_label": source}, 1, (1, 1), "trace")
+            slot.curves({"current": curve})
+            self.assertEqual(tuple(slot.lines["current"].get_xdata()), expected_x)
+            self.assertEqual(slot.axes.get_xlabel(), expected_label)
+        self.assertEqual(curve.x, (0., 1.))
+
+    def test_log_axes_display_absolute_values_without_changing_raw_curves(self):
+        fig = Figure(figsize=(4, 3))
+        FigureCanvasAgg(fig)
+        slot = PlotSlot(fig, {"slot1_xscale": "log", "slot1_yscale": "log"}, 1, (2, 3), "trace")
+        curve = Curve((-2., 0., 3.), (-70e-9, 0., 90e-9), x_unit="V", y_unit="A")
+        slot.curves({"sweep": curve})
+        x, y = slot.lines["sweep"].get_data()
+        self.assertEqual(x[0], 2.)
+        self.assertAlmostEqual(y[0], 70e-9)
+        self.assertTrue(np.isnan(x[1]) and np.isnan(y[1]))
+        self.assertEqual((curve.x[0], curve.y[0]), (-2., -70e-9))
+        self.assertIn("|Current|", slot.axes.get_ylabel())
+
+    def test_log_heatmap_displays_magnitude_and_hides_zero(self):
+        slot = PlotSlot(Figure(figsize=(4, 3)), {"slot1_cscale": "log"}, 1, (1, 3), "number")
+        values = np.array([[-2., 0., 3.]])
+        slot.heatmap(values, np.full((1, 3), -1), None)
+        shown = slot.image.get_array()
+        self.assertEqual(shown[0, 0], 2.)
+        self.assertTrue(np.ma.is_masked(shown[0, 1]))
+        self.assertEqual(values[0, 0], -2.)
 
     def test_heatmap_reuses_axes_colorbar_and_masks_log_values(self):
         fig = Figure(figsize=(4, 3))
@@ -159,16 +254,6 @@ class PlotTests(unittest.TestCase):
         self.assertEqual(slot.marker.get_markerfacecolor(), "none")
         slot.heatmap(np.ones((2, 3)), np.full((2, 3), -1), (1, 2))
         fig.canvas.draw()
-
-    def test_downsampling_keeps_narrow_extrema_and_order(self):
-        data = np.zeros(100_000)
-        data[12345], data[12346] = 999, -999
-        indices = display_sample_indices(data, 500)
-        self.assertIn(12345, indices)
-        self.assertIn(12346, indices)
-        self.assertTrue(np.all(np.diff(indices) > 0))
-        self.assertLessEqual(len(indices), 1002)
-
 
 class RuntimeTests(unittest.TestCase):
     def test_mapping_panel_history_survives_point_archival(self):
@@ -228,12 +313,123 @@ class RuntimeTests(unittest.TestCase):
         capture = NodeCapture("read", "iv", "run1", SimpleNamespace(name="p", row=0, col=1), events, True)
         for i in range(100):
             capture.sample({"source_value": i, "voltage_v": i, "current_a": i * .1}, "Vtop1")
+        live_snapshot = events.get()[1].take()
+        self.assertIn("live", live_snapshot[2])
+        self.assertNotIn("curve", live_snapshot[2])
         result = capture.result({"statistics": {"resistance_ohm": 10}}, "done")
         self.assertEqual(result["node_id"], "read")
         self.assertEqual(result["point"]["col"], 1)
         self.assertEqual(len(result["curve"]["Vtop1"].x), 100)
         self.assertEqual(events.qsize(), 1)
+        completed_snapshot = events.get()[1].take()
+        self.assertEqual(completed_snapshot[2]["curve"]["Vtop1"], result["curve"]["Vtop1"])
         self.assertEqual(result["outputs"]["statistics.resistance_ohm"]["unit"], "Ω")
+
+    def test_running_iv_live_plot_displays_every_acquired_point(self):
+        events = queue.Queue()
+        capture = NodeCapture("fine", "iv", "run", SimpleNamespace(name="p", row=0, col=0), events, True)
+        count = 2500
+        for i in range(count):
+            capture.sample({"source_value": float(i), "voltage_v": float(i), "current_a": float(i) * 1e-9})
+        capture.publish(force=True)
+        snapshot = events.get()[1].take()[2]
+        self.assertEqual(len(snapshot["live"]["Current"].x), count)
+        fig = Figure(figsize=(4, 3))
+        FigureCanvasAgg(fig)
+        slot = PlotSlot(fig, {"_input_slot1_x_label": "V set"}, 1, (1, 1), "trace")
+        slot.curves(snapshot["live"])
+        self.assertEqual(len(slot.lines["Current"].get_xdata()), count)
+
+    def test_completed_iv_live_plot_displays_every_acquired_point(self):
+        events = queue.Queue()
+        capture = NodeCapture("fine", "iv", "run", SimpleNamespace(name="p", row=0, col=0), events, True)
+        count = 2500
+        for i in range(count):
+            capture.sample({"source_value": float(i % 50), "voltage_v": float(i % 50),
+                            "current_a": float((i % 60) - 30) * 1e-9})
+        result = capture.result({}, "done")
+        self.assertEqual(len(result["curve"]["Current"].x), count)
+        snapshot = events.get()[1].take()[2]
+        self.assertEqual(len(snapshot["live"]["Current"].x), count)
+        fig = Figure(figsize=(4, 3))
+        FigureCanvasAgg(fig)
+        slot = PlotSlot(fig, {"_input_slot1_x_label": "V set"}, 1, (1, 1), "trace")
+        slot.curves(snapshot["live"])
+        self.assertEqual(len(slot.lines["Current"].get_xdata()), count)
+
+    def test_resume_restores_saved_plot_cells_before_new_point(self):
+        app = ProbeApp.__new__(ProbeApp)
+        app.autotest_stop_event = threading.Event()
+        app.result_queue = queue.Queue()
+        app.autotest_grid_rows, app.autotest_grid_cols = 1, 3
+        start, read, end, panel = (card("workflow_start", "start"), card("iv", "read"),
+                                   card("workflow_end", "end"), card("plot_panel", "plots"))
+        start.params["_next"] = "read"
+        read.params["_next"] = "end"
+        panel.params["layout"] = "1x1"
+        wire(panel, "slot1", "read", "live", "trace")
+        settings = SimpleNamespace(measurement_flow=measurement_flow_steps_from_cards([start, read, end, panel]))
+        app._execute_autotest_measurement_graph_impl = lambda *args: None
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "workflow_plots"
+            folder.mkdir()
+            paths = []
+            for col in (0, 1):
+                path = folder / f"0_{col}.json"
+                path.write_text(json.dumps({"point": {"row": 0, "col": col}, "status": "done",
+                                            "values": {"1": col + 1}, "details": {}, "curves": {}}))
+                paths.append(path)
+            app._autotest_resume_history = tuple(paths)
+            point = SimpleNamespace(name="new", row=0, col=2, order=3)
+            app._execute_autotest_measurement_graph(point, settings, Path(tmp), None)
+            events = list(app.result_queue.queue)
+            start_index = next(i for i, item in enumerate(events) if item[0] == "workflow_point_start")
+            restored = [item for item in events[:start_index] if item[0] == "workflow_point_done"]
+            self.assertEqual([(item[2], item[3]) for item in restored], [(0, 0), (0, 1)])
+            self.assertEqual(restored[1][4]["plots"]["1"], 2)
+            self.assertEqual(events[start_index][2:], (0, 2))
+
+    def test_multiple_panels_receive_separate_point_values(self):
+        app = ProbeApp.__new__(ProbeApp)
+        app.autotest_stop_event = threading.Event()
+        app.result_queue = queue.Queue()
+        app.autotest_grid_rows = app.autotest_grid_cols = 1
+        start, coarse, fine, end = (card("workflow_start", "start"), card("iv", "coarse"),
+                                    card("iv", "fine"), card("workflow_end", "end"))
+        first, second = card("plot_panel", "coarse_plot"), card("plot_panel", "fine_plot")
+        start.params["_next"] = "coarse"
+        coarse.params["_next"] = "fine"
+        fine.params["_next"] = "end"
+        wire(first, "slot1", "coarse", "statistics.max_abs_current_a", "number")
+        wire(first, "slot2", "coarse", "live", "trace")
+        wire(second, "slot1", "fine", "statistics.max_abs_current_a", "number")
+        wire(second, "slot2", "fine", "live", "trace")
+        second.params["slot2_iv_x_axis"] = "V measure"
+        settings = SimpleNamespace(measurement_flow=measurement_flow_steps_from_cards(
+            [start, coarse, fine, end, first, second]))
+        def execute(point, settings, step, directory, cv):
+            if step.type_id == "iv":
+                app._workflow_sample({"source_value": 1., "voltage_v": 1.,
+                                      "current_a": 1e-9 if step.params["_node_id"] == "coarse" else 2e-9})
+            return {}
+        app._execute_autotest_flow_step_impl = execute
+        with tempfile.TemporaryDirectory() as tmp:
+            point = SimpleNamespace(name="p", row=0, col=0, order=1)
+            app._execute_autotest_measurement_flow(point, settings, Path(tmp), None)
+            events = list(app.result_queue.queue)
+            starts = [event for event in events if event[0] == "workflow_plot_start"]
+            self.assertEqual({event[2] for event in starts}, {"coarse_plot", "fine_plot"})
+            coarse_window = next(event[3] for event in starts if event[2] == "coarse_plot")
+            self.assertEqual(coarse_window.params["_input_slot2_x_label"], "V set")
+            self.assertEqual(coarse_window.params["slot2_iv_x_axis"], "V set")
+            fine_window = next(event[3] for event in starts if event[2] == "fine_plot")
+            self.assertEqual(fine_window.params["_input_slot2_x_label"], "V measure")
+            done = next(event for event in events if event[0] == "workflow_point_done")
+            self.assertAlmostEqual(done[4]["coarse_plot"]["1"], 1e-9)
+            self.assertAlmostEqual(done[4]["fine_plot"]["1"], 2e-9)
+            history = json.loads((Path(tmp) / "workflow_plots" / "0_0.json").read_text())
+            self.assertAlmostEqual(history["panels"]["coarse_plot"]["values"]["1"], 1e-9)
+            self.assertAlmostEqual(history["panels"]["fine_plot"]["values"]["1"], 2e-9)
 
     def test_simulated_desktop_graph_isolates_points(self):
         app = ProbeApp.__new__(ProbeApp)

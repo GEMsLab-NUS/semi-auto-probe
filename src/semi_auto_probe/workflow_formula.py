@@ -24,6 +24,7 @@ class Curve:
     label: str = ""
     x_unit: str = "s"
     y_unit: str = "A"
+    x_measured: tuple[float, ...] | None = None
 
 
 def _values(value):
@@ -55,7 +56,8 @@ def _segment(curve, start, stop):
     if not isinstance(curve, Curve):
         raise ValueError("segment requires a curve")
     start, stop = int(start), int(stop)
-    return Curve(curve.x[start:stop], curve.y[start:stop], curve.label, curve.x_unit, curve.y_unit)
+    return Curve(curve.x[start:stop], curve.y[start:stop], curve.label, curve.x_unit, curve.y_unit,
+                 curve.x_measured[start:stop] if curve.x_measured is not None else None)
 
 
 FUNCTIONS = {
