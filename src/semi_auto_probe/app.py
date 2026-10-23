@@ -69,7 +69,7 @@ from .workflow_ports import DATA_ONLY_TYPES, CURVE_NODES
 from .workflow_runtime import NodeCapture, json_value
 from .workflow_formula import InvalidValue
 import uuid
-from .waveform import calibrated_power_setpoint, calibrated_response_program, run_dp100_waveform, serialize_waveform_points
+from .waveform import WaveformPoint, calibrated_power_setpoint, calibrated_response_program, run_dp100_waveform, serialize_waveform_points
 from .b1500 import B1500_TEST_OUTPUT, B1500_TEST_TRANSFER, B1500SweepConfig, KeysightB1500Runner, b1500_config_from_params
 from .camera import CameraSettings, UsbCamera, camera_source_choices, normalize_camera_source
 from .camera_stage_transform import (
@@ -157,8 +157,17 @@ from .keithley2450 import (
     calculate_iv_statistics,
     constant_voltage_current_config_from_params,
     iv_sweep_configs_from_params,
+    normalize_sweep_mode,
     parse_bool,
 )
+from .keithley_timing import (
+    drive_profile_from_laser_waveform,
+    interpolate_drive_profile,
+    parse_drive_profile,
+    repeat_drive_profile,
+    serialize_drive_profile,
+)
+from .smu_settings import ManualSettings, parse_si_value
 from .hp6614c import (
     HP6614C_HEATMAP_ON_OFF_RATIO,
     HP6614C_TEST_OUTPUT,
@@ -197,6 +206,7 @@ REMOTE_SSH_TARGET = "icalculate@100.77.247.59"
 RESULT_POLL_INTERVAL_MS = 25
 RESULT_POLL_MAX_EVENTS = 30
 RESULT_POLL_MAX_SECONDS = 0.012
+STARTUP_READY_TIMEOUT_SECONDS = 20.0
 AUTOTEST_RESULT_POLL_INTERVAL_MS = 8
 AUTOTEST_RESULT_POLL_MAX_EVENTS = 12
 AUTOTEST_RESULT_POLL_MAX_SECONDS = 0.004
@@ -1359,21 +1369,38 @@ def _actual_gate_voltage_from_reading(programmed_v: float, readback_v: float | N
 
 
 class ProbeApp(tk.Tk):
-    def __init__(self, *, restore_last: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        restore_last: bool = False,
+        startup_progress: Callable[[str, int], None] | None = None,
+    ) -> None:
         super().__init__()
+        # Do not expose a partially constructed window. The lightweight
+        # startup module keeps its splash visible until this constructor ends.
+        self.withdraw()
+        report_startup = startup_progress or (lambda _status, _value: None)
+        report_startup("Loading configuration...", 64)
         self.title("Semi Auto Probe")
         self.window_icon: tk.PhotoImage | None = None
         self._set_window_icon()
         self.geometry("1400x880")
         self.minsize(1040, 600)
         self.configure(bg="#0b0f14")
-        self.after_idle(self._maximize_default_window)
+        if startup_progress is None:
+            self.after_idle(self._maximize_default_window)
 
         self.serial_client: ControllerSerialClient | None = None
         self.ssh_serial_tunnel: SshSerialTunnel | None = None
         self.camera: UsbCamera | None = None
         self.camera_running = False
         self.camera_rendering = False
+        self._startup_camera_settled = False
+        self._startup_controller_settled = False
+        self._startup_restore_settled = not restore_last
+        self._startup_revealed = startup_progress is None
+        self._startup_reveal_job: str | None = None
+        self._startup_progress_message: str | None = None
         self.camera_image: tk.PhotoImage | None = None
         self.vision_panel: VisionPanel | None = None
         self.gds_stage_mapper_panel: GDSStageMapperPanel | None = None
@@ -1698,8 +1725,11 @@ class ProbeApp(tk.Tk):
         self.set_autofocus_z_zero_button: ttk.Button | None = None
         self.go_home_button: ttk.Button | None = None
 
+        report_startup("Initializing the interface theme...", 76)
         self._configure_theme()
+        report_startup("Building the main interface...", 84)
         self._build_ui()
+        report_startup("Starting controls and background services...", 94)
         self._bind_keyboard_controls()
         self.bind("<Configure>", self._on_window_configure)
         self.port_combo["values"] = (DEFAULT_SERIAL_PORT,)
@@ -1708,6 +1738,10 @@ class ProbeApp(tk.Tk):
         self.after(RESULT_POLL_INTERVAL_MS, self._poll_result_queue)
         if restore_last:
             self.after_idle(self._restore_startup_context_without_display_calibration)
+        if startup_progress is None:
+            self.deiconify()
+        else:
+            report_startup("Waiting for the live camera and controller...", 96)
 
     def _set_window_icon(self) -> None:
         icon_path = Path(__file__).parent / "assets" / "logo-system-diagram.png"
@@ -1717,7 +1751,7 @@ class ProbeApp(tk.Tk):
             logger.warning("Window icon asset not found.")
             return
         try:
-            self.window_icon = tk.PhotoImage(file=str(icon_path))
+            self.window_icon = tk.PhotoImage(master=self, file=str(icon_path))
             self.iconphoto(True, self.window_icon)
         except tk.TclError as exc:
             logger.warning("Failed to load window icon from %s: %s", icon_path, exc)
@@ -1730,6 +1764,63 @@ class ProbeApp(tk.Tk):
                 self.attributes("-zoomed", True)
             except tk.TclError:
                 logger.debug("Default maximize is not supported on this platform.")
+
+    def show_when_startup_ready(
+        self,
+        startup_progress: Callable[[str, int], None],
+        on_ready: Callable[[], None] | None,
+    ) -> None:
+        """Keep the main window hidden until asynchronous startup work settles."""
+        self._startup_progress = startup_progress
+        self._startup_on_ready = on_ready
+        self._startup_ready_started_at = time.monotonic()
+        if not self.camera_running:
+            self._startup_camera_settled = True
+        self._startup_reveal_job = self.after(25, self._poll_startup_readiness)
+
+    def _report_startup_wait(self, message: str, value: int = 97) -> None:
+        if message == self._startup_progress_message:
+            return
+        self._startup_progress_message = message
+        self._startup_progress(message, value)
+
+    def _poll_startup_readiness(self) -> None:
+        if self._startup_revealed:
+            return
+        camera_settled = self._startup_camera_settled
+        controller_settled = self._startup_controller_settled
+        restore_settled = self._startup_restore_settled
+        if camera_settled and controller_settled and restore_settled:
+            self._finish_startup_reveal("Startup complete")
+            return
+
+        elapsed = time.monotonic() - self._startup_ready_started_at
+        if elapsed >= STARTUP_READY_TIMEOUT_SECONDS:
+            self._finish_startup_reveal("Opening with available devices")
+            return
+
+        if not restore_settled:
+            self._report_startup_wait("Restoring latest focus and alignment parameters...")
+        elif camera_settled:
+            self._report_startup_wait("Live camera ready; checking the controller...")
+        elif controller_settled:
+            self._report_startup_wait("Controller check complete; waiting for the live camera...")
+        else:
+            self._report_startup_wait("Waiting for the live camera and controller...", 96)
+        self._startup_reveal_job = self.after(50, self._poll_startup_readiness)
+
+    def _finish_startup_reveal(self, message: str) -> None:
+        if self._startup_revealed:
+            return
+        self._startup_revealed = True
+        self._startup_reveal_job = None
+        self._startup_progress(message, 100)
+        self.update_idletasks()
+        if self._startup_on_ready is not None:
+            self._startup_on_ready()
+        self.deiconify()
+        self._maximize_default_window()
+        self.lift()
 
     def _configure_theme(self) -> None:
         self.colors = {
@@ -2510,12 +2601,17 @@ class ProbeApp(tk.Tk):
         return self.gds_stage_mapper_panel is not None and self.gds_stage_mapper_panel.mapper is not None
 
     def _restore_startup_context_without_display_calibration(self) -> None:
-        self.restore_last_focusmap_layoutmap()
-        panel = self.__dict__.get("gds_stage_mapper_panel")
-        # Restoring yesterday's files is not a new host calibration. Keep them
-        # available in the desktop, but start the slave display uncalibrated.
-        self._display_startup_mapper = panel.mapper if panel is not None else None
-        self._display_startup_plane = get_sample_plane_model()
+        try:
+            if not self._startup_revealed:
+                self._report_startup_wait("Restoring latest focus and alignment parameters...", 97)
+            self.restore_last_focusmap_layoutmap()
+            panel = self.__dict__.get("gds_stage_mapper_panel")
+            # Restoring yesterday's files is not a new host calibration. Keep them
+            # available in the desktop, but start the slave display uncalibrated.
+            self._display_startup_mapper = panel.mapper if panel is not None else None
+            self._display_startup_plane = get_sample_plane_model()
+        finally:
+            self._startup_restore_settled = True
 
     def restore_last_focusmap_layoutmap(self) -> None:
         restored: list[str] = []
@@ -9248,7 +9344,8 @@ class ProbeApp(tk.Tk):
         flow = settings.measurement_flow or ()
         if not flow:
             raise ValueError("Configure a measurement workflow with Config Measure Flow first.")
-        supported = {"workflow_start", "workflow_end", "wait", "photo", "iv", "constant_current", "virtual_mask",
+        supported = {"workflow_start", "workflow_end", "wait", "photo", "iv", "hp6614c_bias_loop", "constant_current", "virtual_mask",
+                     "it",
                      "hp6614c_transfer", "hp6614c_output", "b1500_transfer", "b1500_output",
                      "photo_iv", "photo_transient", "laser_output", "laser_pulse", "laser_iv_calibration",
                      "photo_power_steps", "photo_width_steps", "mapping_heatmap",
@@ -9267,8 +9364,12 @@ class ProbeApp(tk.Tk):
                 ProbeApp._validate_virtual_mask_node(step, settings)
             elif step.type_id in {"iv", "photo_iv"}:
                 iv_sweep_configs_from_params(step.params)
+            elif step.type_id == "hp6614c_bias_loop":
+                ProbeApp._hp6614c_bias_loop_values(step.params)
             elif step.type_id == "constant_current":
                 ProbeApp._constant_current_node_config(step.params)
+            elif step.type_id == "it":
+                ProbeApp._keithley_time_config(ProbeApp._resolve_keithley_time_profile(settings, dict(step.params)))
             elif step.type_id == "laser_output":
                 settle = float(step.params.get("settle_s", "0"))
                 if not math.isfinite(settle) or settle < 0:
@@ -9345,6 +9446,8 @@ class ProbeApp(tk.Tk):
                     resources = [other.params.get("resource_name", "GPIB0::18::INSTR")]
                 elif other.type_id in {"iv", "photo_iv"}:
                     resources = [config.resource_name for config in iv_sweep_configs_from_params(other.params)]
+                elif other.type_id == "it":
+                    resources = [other.params.get("resource", "GPIB0::18::INSTR")]
                 elif other.type_id in {"hp6614c_transfer", "hp6614c_output"}:
                     resources = [other.params.get("keithley_resource", "GPIB0::18::INSTR")]
                 else:
@@ -9685,6 +9788,11 @@ class ProbeApp(tk.Tk):
                 errors = validate_flow_graph(normalized_settings.measurement_flow)
                 if errors:
                     raise ValueError("; ".join(errors))
+                for step in normalized_settings.measurement_flow:
+                    if step.type_id == "it":
+                        self._keithley_time_config(
+                            self._resolve_keithley_time_profile(normalized_settings, dict(step.params))
+                        )
             points = (
                 tuple(points_override)
                 if points_override is not None
@@ -9801,11 +9909,7 @@ class ProbeApp(tk.Tk):
         while session_dir.exists():
             session_dir = self.autotest_session_root / f"{time.strftime('%Y%m%d_%H%M%S')}_{suffix:02d}"
             suffix += 1
-        (session_dir / "images").mkdir(parents=True, exist_ok=False)
-        (session_dir / "iv").mkdir(parents=True, exist_ok=True)
-        (session_dir / "wobb").mkdir(parents=True, exist_ok=True)
-        (session_dir / "hp6614c").mkdir(parents=True, exist_ok=True)
-        (session_dir / "b1500").mkdir(parents=True, exist_ok=True)
+        session_dir.mkdir(parents=True, exist_ok=False)
         return session_dir
 
     @staticmethod
@@ -10040,6 +10144,7 @@ class ProbeApp(tk.Tk):
                 "wait": "Pause",
                 "photo": "Photo",
                 "iv": "IV",
+                "hp6614c_bias_loop": "6614C Gate Bias Loop",
                 "wobb_test": "WobbTest",
                 "hp6614c_transfer": "6614C Transfer",
                 "hp6614c_output": "6614C Output",
@@ -10196,7 +10301,11 @@ class ProbeApp(tk.Tk):
                     node_result = self._execute_autotest_step_with_light(point, settings, step, light_step, session_dir, cv2_module)
                 else:
                     node_result = self._execute_autotest_flow_step(point, settings, step, session_dir, cv2_module)
-                results[current_id] = node_result if isinstance(node_result, dict) else {}
+                stored_result = dict(node_result) if isinstance(node_result, dict) else {}
+                nested_results = stored_result.pop("_nested_results", {})
+                results[current_id] = stored_result
+                if isinstance(nested_results, dict):
+                    results.update({str(key): value for key, value in nested_results.items() if isinstance(value, dict)})
                 previous_id = current_id
                 next_id = str(step.params.get("_next", "")).strip()
             current_id = next_id or None
@@ -10596,9 +10705,19 @@ class ProbeApp(tk.Tk):
         return getattr(local, "capture", None) if local is not None else None
 
     def _workflow_sample(self, sample):
+        local = self.__dict__.get("_workflow_local")
         capture = self._workflow_capture()
         if capture is not None:
-            capture.sample(sample)
+            capture.sample(sample, getattr(local, "curve_label", None) if local is not None else None)
+        telemetry_capture = getattr(local, "gate_loop_capture", None) if local is not None else None
+        telemetry_runner = getattr(local, "gate_loop_runner", None) if local is not None else None
+        if telemetry_capture is not None and telemetry_runner is not None:
+            values = sample.to_dict() if hasattr(sample, "to_dict") else sample if isinstance(sample, dict) else vars(sample)
+            source_value = values.get("source_value", values.get("drain_voltage_v", values.get("voltage_v")))
+            if source_value is not None:
+                reading = telemetry_runner.measure_output()
+                telemetry_capture.sample({"source_value": source_value, "voltage_v": reading.voltage_v,
+                                          "current_a": reading.current_a}, getattr(local, "curve_label", None))
 
     def _execute_autotest_flow_step(self, point, settings, step, session_dir, cv2_module):
         if point is None or settings is None:
@@ -10609,7 +10728,7 @@ class ProbeApp(tk.Tk):
         capture = NodeCapture(step_node_id(step, index), step.type_id,
             self.__dict__.get("_workflow_run_id", str(session_dir or "manual")), point, self.result_queue,
             any(node.type_id == "plot_panel" for node in settings.measurement_flow),
-            sweep_mode=step.params.get("sweep_mode", "voltage"))
+            sweep_mode=step.params.get("sweep_mode", step.params.get("source_mode", "voltage")))
         local.capture = capture
         local.failed_result = None
         try:
@@ -10643,8 +10762,6 @@ class ProbeApp(tk.Tk):
             visit += 1
             node_dir = base.with_name(f"{node_id}_visit_{visit}")
         node_dir.mkdir(parents=True)
-        for kind in ("iv", "images", "hp6614c", "b1500", "current"):
-            (node_dir / kind).mkdir()
         record = {"node_id": node_id, "type_id": step.type_id, "params": dict(step.params),
                   "status": "running", "point": point.name, "coordinate_frame": "logical_stage_xy_um",
                   "stage_x_um": point.stage_x_um, "stage_y_um": point.stage_y_um}
@@ -10678,6 +10795,11 @@ class ProbeApp(tk.Tk):
             configs = iv_sweep_configs_from_params(params)
             return self._run_autotest_iv_sweep(point, settings, configs, session_dir, params)
             return
+        if step.type_id == "hp6614c_bias_loop":
+            return self._run_autotest_hp6614c_bias_loop(point, settings, step, session_dir)
+        if step.type_id == "it":
+            params = self._resolve_keithley_time_profile(settings, params)
+            return self._run_autotest_keithley_time(point, params, session_dir)
         if step.type_id == "constant_current":
             hold = isinstance(settings, MappingSettings) and parse_bool(params.get("hold_during_mapping", "false"))
             return self._run_autotest_constant_current(point, params, session_dir, hold_during_mapping=hold)
@@ -10819,6 +10941,7 @@ class ProbeApp(tk.Tk):
             self.result_queue.put(("autotest_status", f"Virtual mask: {intensity * 100:.1f}% gray, target {target_power:g} mW, DP100 {output_text}"))
             return payload
         if step.type_id == "laser_pulse":
+            params = self._resolve_shared_waveform(settings, params)
             driver = self._get_dp100_driver()
             if isinstance(settings, MappingSettings):
                 self._mapping_laser_used = True
@@ -10829,6 +10952,217 @@ class ProbeApp(tk.Tk):
             run_dp100_waveform(driver, params, stop_event=self.autotest_stop_event)
             return
         self.result_queue.put(("autotest_status", f"{step.type_id} step placeholder at {point.name}."))
+
+    @staticmethod
+    def _resolve_shared_waveform(settings, params):
+        source_id = str(params.get("_input_profile_source", "")).strip()
+        if not source_id:
+            return params
+        source = next((
+            candidate for index, candidate in enumerate(settings.measurement_flow or ())
+            if step_node_id(candidate, index) == source_id
+        ), None)
+        if source is None or source.type_id != "waveform":
+            raise ValueError("Waveform input must come from a Waveform node.")
+        profile = repeat_drive_profile(
+            parse_drive_profile(source.params.get("profile_points", ""), source_mode="voltage"),
+            source.params.get("cycles", "1"),
+        )
+        if any(item.value < 0 or item.value > 1 for item in profile):
+            raise ValueError("Laser waveform values must be between 0 and 1.")
+        baseline_v = float(params.get("baseline_voltage_v", "0"))
+        baseline_i = float(params.get("baseline_current_a", "0"))
+        peak_v = float(params.get("peak_voltage_v", DEFAULT_LASER_PARAMS["peak_voltage_v"]))
+        peak_i = float(params.get("peak_current_a", DEFAULT_LASER_PARAMS["peak_current_a"]))
+        points = [
+            WaveformPoint(
+                item.time_s * 1000.0,
+                baseline_v + item.value * (peak_v - baseline_v),
+                baseline_i + item.value * (peak_i - baseline_i),
+            )
+            for item in profile
+        ]
+        resolved = dict(params)
+        resolved["waveform_points"] = serialize_waveform_points(points)
+        resolved["profile_source"] = source_id
+        return resolved
+
+    @staticmethod
+    def _keithley_time_config(params):
+        mode = str(params.get("source_mode", "voltage"))
+        drive_mode = str(params.get("drive_mode", "constant")).strip().lower()
+        if drive_mode not in {"constant", "profile"}:
+            raise ValueError("I/V-t drive mode must be constant or profile.")
+        points = (
+            parse_drive_profile(params.get("profile_points", ""), source_mode=mode)
+            if drive_mode == "profile"
+            else parse_drive_profile(f"0,{params.get('source_value', '0.1')}", source_mode=mode)
+        )
+        points = repeat_drive_profile(points, params.get("profile_cycles", "1"))
+        duration = parse_si_value(params.get("duration_s", "10"), "s")
+        interval = parse_si_value(params.get("sample_interval_s", ".1"), "s")
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError("I/V-t duration must be finite and positive.")
+        if not math.isfinite(interval) or interval <= 0:
+            raise ValueError("I/V-t sample interval must be finite and positive.")
+        if points[-1].time_s > duration:
+            raise ValueError("The final drive-profile time must not exceed I/V-t duration.")
+        config_params = dict(params)
+        config_params.update(
+            sweep_mode=mode,
+            start=f"{points[0].value:.12g}",
+            stop=f"{points[0].value:.12g}",
+            step="1",
+            segments="",
+            source_delay_s="0",
+            output_statistics="false",
+        )
+        config = iv_sweep_configs_from_params(config_params)[0]
+        limit = config.current_limit_a if mode == "voltage" else config.voltage_limit_v
+        for point in points:
+            ManualSettings(
+                mode=mode,
+                value=point.value,
+                limit=limit,
+                terminal=config.output_terminal,
+                source_range=config.source_range,
+                measure_range=config.measure_range,
+                nplc=config.nplc,
+                autozero=config.autozero,
+            ).validate()
+        return config, points, duration, interval
+
+    @staticmethod
+    def _resolve_keithley_time_profile(settings, params):
+        source_id = str(params.get("_input_profile_source", "")).strip()
+        if not source_id:
+            return params
+        source = next((
+            candidate for index, candidate in enumerate(settings.measurement_flow or ())
+            if step_node_id(candidate, index) == source_id
+        ), None)
+        target_mode = normalize_sweep_mode(params.get("source_mode", "voltage"))
+        if source is None or source.type_id not in {"waveform", "laser_pulse", "drive_waveform"}:
+            raise ValueError("I/V-t profile input must come from a Waveform node.")
+        if source.type_id == "waveform":
+            profile_points = source.params.get("profile_points", "")
+            profile_cycles = source.params.get("cycles", "1")
+            repeated = repeat_drive_profile(
+                parse_drive_profile(profile_points, source_mode=target_mode),
+                profile_cycles,
+            )
+            profile_duration_s = repeated[-1].time_s
+        elif source.type_id == "laser_pulse":
+            profile_points = serialize_drive_profile(
+                drive_profile_from_laser_waveform(source.params, source_mode=target_mode)
+            )
+            profile_cycles = "1"
+            profile_duration_s = None
+        else:
+            source_mode = normalize_sweep_mode(source.params.get("source_mode", "voltage"))
+            if source_mode != target_mode:
+                raise ValueError("I/V-t source mode must match the connected legacy drive waveform.")
+            profile_points = source.params.get("profile_points", "")
+            profile_cycles = "1"
+            profile_duration_s = None
+        resolved = dict(params)
+        resolved.update(
+            drive_mode="profile",
+            profile_points=profile_points,
+            profile_cycles=profile_cycles,
+            profile_source=source_id,
+        )
+        if profile_duration_s is not None:
+            resolved["duration_s"] = f"{profile_duration_s:.12g}"
+        return resolved
+
+    def _run_autotest_keithley_time(self, point, params, session_dir):
+        if session_dir is None:
+            raise RuntimeError("Keithley I/V-t measurement needs a result directory.")
+        config, profile, duration, interval = self._keithley_time_config(params)
+        folder = session_dir / "it"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{self._safe_autotest_name(point.name)}.csv"
+        suffix = 1
+        while path.exists():
+            suffix += 1
+            path = folder / f"{self._safe_autotest_name(point.name)}_{suffix}.csv"
+        runner = Keithley2450IVRunner()
+        samples: list[IVSweepSample] = []
+        errors: list[str] = []
+        total = max(1, int(math.floor(duration / interval + 1e-9)) + 1)
+        started = 0.0
+        try:
+            runner.begin_sweep(config, strict_cleanup=True)
+            started = time.monotonic()
+            profile_index = 0
+            next_sample_s = 0.0
+            with path.open("x", newline="", encoding="utf-8") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(["index", "elapsed_s", "source_value", "voltage_v", "current_a", "resistance_ohm", "raw"])
+                while not self.autotest_stop_event.is_set() and next_sample_s <= duration + 1e-9:
+                    next_drive_s = profile[profile_index + 1].time_s if profile_index + 1 < len(profile) else math.inf
+                    event_s = min(next_sample_s, next_drive_s)
+                    wait_s = started + event_s - time.monotonic()
+                    if wait_s > 0 and self.autotest_stop_event.wait(wait_s):
+                        break
+                    elapsed = time.monotonic() - started
+                    while profile_index + 1 < len(profile) and profile[profile_index + 1].time_s <= elapsed + 1e-9:
+                        profile_index += 1
+                    drive_value = interpolate_drive_profile(profile, event_s)
+                    runner.set_sweep_source_value(drive_value)
+                    if next_sample_s <= elapsed + 1e-9:
+                        sample = runner.read_sweep_sample(index=len(samples) + 1, total=total)
+                        sample = replace(sample, index=len(samples) + 1, total=total, elapsed_s=time.monotonic() - started)
+                        if not all(math.isfinite(value) and abs(value) < 9e36 for value in (sample.voltage_v, sample.current_a)):
+                            raise ValueError("Invalid/overrange I/V-t reading.")
+                        samples.append(sample)
+                        self._workflow_sample(sample)
+                        writer.writerow([sample.index, sample.elapsed_s, sample.source_value, sample.voltage_v,
+                                         sample.current_a, sample.resistance_ohm, sample.raw])
+                        sink = self.__dict__.get("_mapping_sample_sink")
+                        if sink is not None:
+                            sink(sample, params.get("_node_id", "it"))
+                        next_sample_s += interval
+                stream.flush()
+        except Exception as exc:
+            errors.append(str(exc))
+        finally:
+            try:
+                runner.end_sweep(strict=True)
+            except Exception as exc:
+                errors.append(f"Output cleanup failed: {exc}")
+        measured = [sample.current_a if config.sweep_mode == "voltage" else sample.voltage_v for sample in samples]
+        tail = measured[-max(1, math.ceil(len(measured) * .2)):] if measured else []
+        steady = statistics.fmean(tail) if tail else None
+        peak = max(measured, key=abs) if measured else None
+        stats = {
+            "sample_count": len(samples),
+            "steady_current_a": steady if config.sweep_mode == "voltage" else None,
+            "peak_current_a": peak if config.sweep_mode == "voltage" else None,
+            "steady_voltage_v": steady if config.sweep_mode == "current" else None,
+            "peak_voltage_v": peak if config.sweep_mode == "current" else None,
+        }
+        status = "failed" if errors else "incomplete" if self.autotest_stop_event.is_set() else "done"
+        payload = {
+            "format": "semi_auto_probe.autotest_result_metadata",
+            "version": 1,
+            "result_type": "keithley_time",
+            "device": {"name": point.name, "row": point.row, "col": point.col, "order": point.order},
+            "measurement": {**dict(config.__dict__), "duration_s": duration, "sample_interval_s": interval,
+                            "drive_mode": params.get("drive_mode", "constant"),
+                            "profile_source": params.get("profile_source"),
+                            "profile_points": [{"time_s": item.time_s, "value": item.value} for item in profile]},
+            "status": status,
+            "errors": errors,
+            "statistics": stats,
+            "sample_count": len(samples),
+            "csv_file": path.name,
+        }
+        path.with_suffix(".json").write_text(json.dumps(payload, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        if errors:
+            raise RuntimeError("; ".join(errors))
+        return {"statistics": stats, "status": status}
 
     @staticmethod
     def _constant_current_node_config(params):
@@ -11058,6 +11392,7 @@ class ProbeApp(tk.Tk):
             raise RuntimeError("AutoTest photo session directory is unavailable.")
         image = self._capture_stitch_frame(stop_event=self.autotest_stop_event)
         output_path = session_dir / "images" / f"{self._safe_autotest_name(point.name)}.png"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         cv2_module.imwrite(str(output_path), image)
         self.result_queue.put(("autotest_status", f"Photo saved for {point.name}: {output_path.name}"))
 
@@ -11423,6 +11758,122 @@ class ProbeApp(tk.Tk):
         statistics_payload = latest_statistics.to_dict() if latest_statistics is not None else None
         self.result_queue.put(("iv_done", point.name, total_samples, output_payload, statistics_payload, point.row, point.col, self.autotest_grid_rows, self.autotest_grid_cols))
         return {"statistics": statistics_payload or {}}
+
+    @staticmethod
+    def _hp6614c_bias_loop_values(params: Mapping[str, object]) -> tuple[float, ...]:
+        values = tuple(float(item.strip()) for item in str(params.get("bias_values_v", "0,2,5,10,15,20,25,30")).split(",") if item.strip())
+        if not values or any(not math.isfinite(value) or value < 0 or value > 100 for value in values):
+            raise ValueError("6614C gate-bias list must contain finite voltages in range 0..100 V.")
+        current_limit = float(params.get("gate_current_limit_a", "1e-6"))
+        settle_s = float(params.get("gate_settle_s", "0.02"))
+        if not math.isfinite(current_limit) or current_limit <= 0 or current_limit > 0.5:
+            raise ValueError("6614C gate current limit must be in range 0..0.5 A.")
+        if not math.isfinite(settle_s) or settle_s < 0 or settle_s > 60:
+            raise ValueError("6614C gate settle time must be in range 0..60 seconds.")
+        return values
+
+    def _run_autotest_hp6614c_bias_loop(self, point, settings, step, session_dir):
+        params = dict(step.params)
+        child_id = str(params.get("_child", "")).strip()
+        child = next(
+            (candidate for index, candidate in enumerate(settings.measurement_flow)
+             if step_node_id(candidate, index) == child_id),
+            None,
+        )
+        if child is None or child.type_id != "iv":
+            raise ValueError("6614C Gate Bias Loop requires one nested Keithley IV card.")
+        configs = iv_sweep_configs_from_params(child.params)
+        biases = self._hp6614c_bias_loop_values(params)
+        local = self.__dict__.setdefault("_workflow_local", threading.local())
+        parent_capture = self._workflow_capture()
+        child_capture = NodeCapture(
+            child_id,
+            "iv",
+            parent_capture.run_id if parent_capture is not None else self.__dict__.get("_workflow_run_id", uuid.uuid4().hex),
+            point,
+            self.result_queue,
+            bool(parent_capture and parent_capture.plot),
+            sweep_mode=child.params.get("sweep_mode", "voltage"),
+        )
+        previous_capture = getattr(local, "capture", None)
+        previous_label = getattr(local, "curve_label", None)
+        previous_gate_capture = getattr(local, "gate_loop_capture", None)
+        previous_gate_runner = getattr(local, "gate_loop_runner", None)
+        summaries = []
+        latest_statistics = {}
+        failure = None
+        owner = HP6614CRunner()
+        instrument = owner._open_resource(
+            str(params.get("hp_resource", "GPIB0::5::INSTR")),
+            verify_identity=parse_bool(params.get("verify_identity", "false")),
+            skip_open_clear=parse_bool(params.get("skip_open_clear", "true"), default=True),
+        )
+        hp_runner = HP6614CRunner(instrument)
+        try:
+            local.capture = child_capture
+            local.gate_loop_capture = parent_capture
+            local.gate_loop_runner = hp_runner
+            for index, programmed_vg in enumerate(biases, start=1):
+                if self.autotest_stop_event.is_set():
+                    break
+                voltage_config = HP6614CVoltageConfig(
+                    resource_name=params.get("hp_resource", "GPIB0::5::INSTR"),
+                    voltage_v=programmed_vg,
+                    current_limit_a=float(params.get("gate_current_limit_a", "1e-6")),
+                    settle_s=float(params.get("gate_settle_s", "0.02")),
+                    output_on=True,
+                    output_off_after=False,
+                    verify_identity=parse_bool(params.get("verify_identity", "false")),
+                    readback=parse_bool(params.get("readback", "true"), default=True),
+                    skip_open_clear=parse_bool(params.get("skip_open_clear", "true"), default=True),
+                ).normalized()
+                reading = hp_runner.apply_voltage(voltage_config)
+                actual_vg = _actual_gate_voltage_from_reading(programmed_vg, reading.voltage_v)
+                local.curve_label = f"Vg={actual_vg:g} V"
+                gate_dir = None if session_dir is None else session_dir / f"gate_{self._safe_filename_token(programmed_vg)}V"
+                payload = self._run_autotest_iv_sweep(point, settings, configs, gate_dir, child.params)
+                latest_statistics = dict(payload.get("statistics", {}))
+                summaries.append({"programmed_gate_voltage_v": programmed_vg, "measured_gate_voltage_v": actual_vg,
+                                  "statistics": latest_statistics})
+                self.result_queue.put(("autotest_status", f"6614C gate loop {index}/{len(biases)} at {point.name}: Vg={actual_vg:g} V."))
+        except Exception as exc:
+            failure = exc
+            raise
+        finally:
+            child_result = child_capture.result(
+                {"statistics": latest_statistics},
+                "failed" if failure is not None else "incomplete" if self.autotest_stop_event.is_set() else "done",
+            )
+            child_capture.publish(force=True)
+            local.capture = previous_capture
+            local.curve_label = previous_label
+            local.gate_loop_capture = previous_gate_capture
+            local.gate_loop_runner = previous_gate_runner
+            try:
+                hp_runner.apply_voltage(HP6614CVoltageConfig(
+                    resource_name=params.get("hp_resource", "GPIB0::5::INSTR"),
+                    voltage_v=0.0,
+                    current_limit_a=float(params.get("gate_current_limit_a", "1e-6")),
+                    settle_s=0.0,
+                    output_on=False,
+                    output_off_after=True,
+                    verify_identity=parse_bool(params.get("verify_identity", "false")),
+                    readback=False,
+                    skip_open_clear=parse_bool(params.get("skip_open_clear", "true"), default=True),
+                ).normalized())
+            except Exception as exc:
+                self.result_queue.put(("autotest_status", f"Warning: failed to turn HP 6614C output off: {exc}"))
+            finally:
+                try:
+                    instrument.close()
+                except Exception:
+                    pass
+        if session_dir is not None:
+            session_dir.mkdir(parents=True, exist_ok=True)
+            (session_dir / "hp6614c_gate_loop.json").write_text(json.dumps({
+                "gate_biases_v": list(biases), "nested_node": child_id, "curves": summaries,
+            }, indent=2, allow_nan=False), encoding="utf-8")
+        return {"gate_biases_v": list(biases), "curves": summaries, "_nested_results": {child_id: child_result}}
 
     def _run_autotest_hp6614c_sweep(
         self,
@@ -13849,6 +14300,7 @@ class ProbeApp(tk.Tk):
 
     def _finish_startup_connection_error(self, remote_error: str) -> None:
         self._startup_connection_pending = False
+        self._startup_controller_settled = True
         self._startup_remote_generation = None
         self._close_serial_transport()
         self.connection_mode_var.set(SERIAL_MODE_LOCAL)
@@ -14150,6 +14602,8 @@ class ProbeApp(tk.Tk):
             return
         if event_type == "read_positions":
             _, entries, source, *rest = event
+            if source == "comm_test":
+                self._startup_controller_settled = True
             expected_targets = rest[0] if rest else None
             self.position_read_pending = False
             record_history = self._record_hex_history_for_source(source)
@@ -14318,6 +14772,8 @@ class ProbeApp(tk.Tk):
         if event_type == "read_position_error":
             _, exc = event
             self.position_read_pending = False
+            if self._startup_connection_attempted and not self._startup_connection_pending:
+                self._startup_controller_settled = True
             self.status_var.set(f"Read current position failed: {exc}")
             logger.error("Read current position failed: %s", exc)
             return
@@ -14456,6 +14912,7 @@ class ProbeApp(tk.Tk):
             self.status_var.set(str(exc))
             self.camera_running = False
             self.camera_rendering = False
+            self._startup_camera_settled = True
             logger.error("Camera unavailable: %s", exc)
             return
 
@@ -15320,6 +15777,7 @@ class ProbeApp(tk.Tk):
             if self.current_page == "Main" and self.vision_panel:
                 self.vision_panel.set_image_bgr(self._bgr_with_scalebar(frame.image_bgr))
                 self.camera_image = self.vision_panel.photo
+                self._startup_camera_settled = True
             with self.focus_lock:
                 self.latest_focus_frame_ppm = self._autofocus_preview_ppm(frame.image_bgr)
             with self.camera_lock:
@@ -15406,16 +15864,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(
+    argv: list[str] | None = None,
+    *,
+    startup_progress: Callable[[str, int], None] | None = None,
+    on_ready: Callable[[], None] | None = None,
+    show_banner: bool = True,
+) -> None:
     args = build_arg_parser().parse_args(argv)
     if args.measure_debug:
+        if startup_progress is not None:
+            startup_progress("Opening the measurement debug interface...", 90)
         from .measure_debug import main as measure_debug_main
 
+        if on_ready is not None:
+            on_ready()
         measure_debug_main()
         return
-    print_startup_banner()
+    if show_banner:
+        print_startup_banner()
     logger.info("Application starting.")
-    app = ProbeApp(restore_last=args.restore_last)
+    if startup_progress is None:
+        app = ProbeApp(restore_last=args.restore_last)
+    else:
+        app = ProbeApp(restore_last=args.restore_last, startup_progress=startup_progress)
+    if startup_progress is not None:
+        app.show_when_startup_ready(startup_progress, on_ready)
     try:
         app.mainloop()
     finally:

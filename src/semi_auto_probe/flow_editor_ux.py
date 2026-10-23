@@ -119,13 +119,18 @@ class FlowEditorUX:
         for suffix, unit in suffixes.items():
             if param.key.lower().endswith(suffix):
                 return unit
-        if param.key in {"start", "stop", "step", "low", "source_range"}:
-            return "A" if card.params.get("sweep_mode") == "current" else "V"
+        if param.key in {"start", "stop", "step", "low", "source_value", "source_range"}:
+            mode = card.params.get("source_mode", card.params.get("sweep_mode"))
+            return "A" if mode == "current" else "V"
         return ""
 
     def _validate_parameter(self, card, key, value, _list_item=False):
         param = next((p for p in self.definitions[card.type_id].parameters if p.key == key), None)
-        if card.type_id == 'iv' and key in {'start', 'stop', 'low', 'step', 'source_range', 'measure_range', 'voltage_limit_v', 'current_limit_a', 'segments'}:
+        keithley_keys = {
+            'start', 'stop', 'low', 'step', 'source_value', 'duration_s', 'sample_interval_s',
+            'source_range', 'measure_range', 'voltage_limit_v', 'current_limit_a', 'segments',
+        }
+        if card.type_id in {'iv', 'it'} and key in keithley_keys:
             from .smu_settings import parse_si_value, MAX_SWEEP_SEGMENTS
             raw = str(value).strip()
             try:
@@ -138,15 +143,17 @@ class FlowEditorUX:
                     return str(count), ''
                 if key in {'source_range', 'measure_range'} and raw.lower() == 'auto':
                     return 'auto', ''
-                unit = 'A' if card.params.get('sweep_mode') == 'current' else 'V'
+                mode = card.params.get('source_mode', card.params.get('sweep_mode', 'voltage'))
+                unit = 'A' if mode == 'current' else 'V'
                 if key == 'voltage_limit_v': unit = 'V'
                 if key == 'current_limit_a': unit = 'A'
                 if key == 'measure_range': unit = 'V' if unit == 'A' else 'A'
+                if key in {'duration_s', 'sample_interval_s'}: unit = 's'
                 separator = ':' if ':' in raw else ','
                 if key == 'stop' and separator in raw:
                     return separator.join(f'{parse_si_value(v, unit):.12g}' for v in raw.split(separator)), ''
                 number = parse_si_value(raw, unit)
-                if key in {'step', 'source_range', 'measure_range', 'voltage_limit_v', 'current_limit_a'} and number <= 0:
+                if key in {'step', 'duration_s', 'sample_interval_s', 'source_range', 'measure_range', 'voltage_limit_v', 'current_limit_a'} and number <= 0:
                     raise ValueError('Value must be positive.')
                 return f'{number:.12g}', ''
             except ValueError as exc:
@@ -187,7 +194,7 @@ class FlowEditorUX:
             number = float(match[1]) * scales[entered_unit] / scales[unit]
         if not math.isfinite(number):
             return value, "Enter a finite number."
-        if key in {"sample_count", "sweep_points", "power_levels", "count", "preset_index"}:
+        if key in {"sample_count", "sweep_points", "power_levels", "count", "cycles", "preset_index"}:
             if number < 1 or not number.is_integer():
                 return value, "Enter a whole number of at least 1."
         positive = {"nplc", "staircase_nplc", "drain_nplc", "sample_interval_ms", "period_ms"}
@@ -244,7 +251,7 @@ class FlowEditorUX:
             for key, value in list(card.params.items()):
                 if key.startswith("_input_") and key.endswith("_source") and value == identity:
                     self._clear_input(card, key[:-7])
-            for key in ("_next", "_true", "_false", "_light_source", "source_node"):
+            for key in ("_next", "_true", "_false", "_light_source", "source_node", "_child", "_parent"):
                 if card.params.get(key) == identity:
                     card.params.pop(key, None)
             if card.params.get("_result_source") == identity:
@@ -419,6 +426,8 @@ class FlowEditorUX:
             source.params.pop(key, None)
         elif key.startswith("_input_"):
             self._clear_input(target, key[:-7])
+            if target.type_id == "it" and key == "_input_profile_source" and getattr(self, "_inspected_id", None) == target.card_id:
+                self._show_inspector(target)
         else:
             target.params.pop(key, None)
             if key == "_result_source":
@@ -460,6 +469,11 @@ class FlowEditorUX:
         return (nearest[1], nearest[2]) if nearest else None
 
     def _apply_rewire(self, edge, source_id, kind, target_id, incoming):
+        original = self._edge_info(edge)
+        if original is not None:
+            old_source, old_kind, old_target, old_incoming = original
+            if source_id == old_source.card_id and kind != old_kind:
+                return False
         before = self._snapshot()
         self._history_group = None
         self._history_suspended = True

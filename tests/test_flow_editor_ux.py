@@ -108,6 +108,50 @@ class EditorUXTests(unittest.TestCase):
         for key,value in (("voltage_v","5 mA"),("sample_count","2.5"),("sample_count","0"),("nplc","0"),("settle_s","-1"),("voltage_v","nan")):
             self.assertTrue(e._validate_parameter(self.read,key,value)[1],(key,value))
 
+    def test_it_profile_is_inline_collapsible_and_connection_locks_constant_drive(self):
+        e = self.editor
+        self.assertTrue(e.library_open)
+        self.assertFalse(any(e.library_open.values()))
+        profile = create_autotest_flow_card("waveform", "profile")
+        profile.params["profile_points"] = "0,0;1m,100m"
+        it = create_autotest_flow_card("it", "it")
+        e.cards.extend((profile, it))
+        e._show_inspector(it)
+        local_height = e._node_height(it)
+        self.assertTrue(e.profile_table.winfo_exists())
+        self.assertTrue(e.profile_table.bind("<Double-1>"))
+        self.assertFalse(hasattr(e, "profile_time_var"))
+        self.assertFalse(hasattr(e, "profile_value_var"))
+        self.assertFalse(e.result_outputs_body.winfo_ismapped())
+        e.result_outputs_toggle.invoke()
+        e.window.update_idletasks()
+        self.assertTrue(e.result_outputs_body.winfo_ismapped())
+        self.assertTrue(e._connect("profile", "waveform@signal", "it", "waveform@profile"))
+        self.assertEqual(it.params["drive_mode"], "profile")
+        self.assertEqual(str(e._field_widgets[("it", "drive_mode")].cget("state")), "disabled")
+        self.assertNotIn(("it", "source_value"), e._field_widgets)
+        self.assertNotIn(("it", "duration_s"), e._field_widgets)
+        self.assertEqual([param.key for param in e._inline_params(it)], ["source_mode", "sample_interval_s"])
+        self.assertFalse(e.profile_table.winfo_exists())
+        self.assertLess(e._node_height(it), local_height)
+        e.redraw()
+        it_sparkline = [item for item in e.canvas.find_withtag("keithley_sparkline")
+                        if f"node:{it.card_id}" in e.canvas.gettags(item)]
+        self.assertEqual(it_sparkline, [])
+
+        laser = create_autotest_flow_card("laser_pulse", "laser")
+        e.cards.append(laser)
+        self.assertTrue(e._connect("profile", "waveform@signal", "laser", "waveform@profile"))
+        e._show_inspector(profile)
+        self.assertEqual(e.profile_table.heading("value", "text"), "Value")
+        self.assertTrue(e.profile_table.bind("<Double-1>"))
+        self.assertTrue(e.profile_table.bind("<Control-v>"))
+        self.assertEqual([param.key for param in e._inline_params(profile)], ["cycles"])
+
+        profile.params["cycles"] = "100"
+        e.redraw()
+        self.assertEqual(len(e.canvas.find_withtag("waveform_ellipsis")), 1)
+
     def test_validation_shows_all_errors_and_locates_parameter(self):
         e=self.editor
         e._show_inspector(self.read)

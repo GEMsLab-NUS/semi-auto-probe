@@ -107,6 +107,23 @@ class Keithley2450Tests(unittest.TestCase):
         self.assertIn(":SENS:CURR:RANG 0.0001", instrument.commands)
         self.assertFalse(any(command.startswith(":SENS:CURR:RANG:AUTO") for command in instrument.commands))
 
+    def test_runner_configures_fixed_source_range_and_autozero(self) -> None:
+        instrument = FakeInstrument()
+        runner = Keithley2450IVRunner(instrument)
+
+        runner.run_sweep(IVSweepConfig(
+            start=0,
+            stop=0.1,
+            step=0.1,
+            source_range=0.2,
+            autozero=False,
+            source_delay_s=0,
+        ))
+
+        self.assertIn(":SOUR:VOLT:RANG 0.2", instrument.commands)
+        self.assertNotIn(":SOUR:VOLT:RANG:AUTO ON", instrument.commands)
+        self.assertIn(":SENS:CURR:AZER 0", instrument.commands)
+
     def test_sweep_session_reuses_configuration_and_honors_samples_per_point(self) -> None:
         instrument = FakeInstrument()
         runner = Keithley2450IVRunner(instrument)

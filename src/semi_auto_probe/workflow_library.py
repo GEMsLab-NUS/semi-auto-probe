@@ -16,6 +16,8 @@ DEFAULT_USERS = ("Xinchuan", "Leo", "Micheal")
 TEMT6000_MAPPING_TEMPLATE = "PD / TEMT6000 / Fixed Bias and Constant Light"
 TEMT6000_PULSED_MAPPING_TEMPLATE = "PD / TEMT6000 / Power and Width Response"
 VIRTUAL_MASK_MAPPING_TEMPLATE = "Spatial / Virtual Mask / NUS Logo"
+KEITHLEY_IT_CONSTANT_TEMPLATE = "Keithley / I-V-t / Constant I-t"
+KEITHLEY_IT_WAVEFORM_TEMPLATE = "Keithley / I-V-t / Waveform I-t"
 
 
 def default_workflow_root() -> Path:
@@ -106,8 +108,69 @@ def load_workflow(path: Path) -> list[AutoTestFlowCard]:
     return cards_from_workflow_payload(json.loads(path.read_text(encoding="utf-8")))
 
 
+def keithley_time_templates() -> dict[str, list[dict[str, Any]]]:
+    common = {
+        "resource": "GPIB0::18::INSTR",
+        "output_terminal": "rear",
+        "source_mode": "voltage",
+        "source_value": "0.1",
+        "duration_s": "10",
+        "sample_interval_s": "0.1",
+        "voltage_limit_v": "20",
+        "current_limit_a": "1e-3",
+        "source_range": "auto",
+        "measure_range": "auto",
+        "nplc": "1",
+        "autozero": "true",
+        "output_off_after": "true",
+        "_outputs": "live,curve,statistics.steady_current_a,statistics.peak_current_a",
+        "_next": "end",
+    }
+    plot = {
+        "type_id": "plot_panel",
+        "id": "plots",
+        "x": 340,
+        "y": 420,
+        "params": {
+            "layout": "1x2",
+            "_input_slot1_source": "measure",
+            "_input_slot1_output": "live",
+            "_input_slot1_type": "trace",
+            "slot1_title": "I-t live current (A)",
+            "_input_slot2_source": "measure",
+            "_input_slot2_output": "curve",
+            "_input_slot2_type": "curve",
+            "slot2_title": "I-t current curve (A)",
+        },
+    }
+    return {
+        KEITHLEY_IT_CONSTANT_TEMPLATE: [
+            {"type_id": "workflow_start", "id": "start", "x": 0, "y": 0,
+             "params": {"_workflow_version": "2", "_next": "measure"}},
+            {"type_id": "it", "id": "measure", "x": 340, "y": 0,
+             "params": {**common, "drive_mode": "constant"}},
+            {"type_id": "workflow_end", "id": "end", "x": 680, "y": 0, "params": {}},
+            plot,
+        ],
+        KEITHLEY_IT_WAVEFORM_TEMPLATE: [
+            {"type_id": "workflow_start", "id": "start", "x": 0, "y": 0,
+             "params": {"_workflow_version": "2", "_next": "measure"}},
+            {"type_id": "waveform", "id": "drive_profile", "x": 0, "y": 240,
+             "params": {"profile_points": "0,0;1,0.1;5,0.1;6,0;10,0"}},
+            {"type_id": "it", "id": "measure", "x": 340, "y": 0,
+             "params": {**common, "drive_mode": "profile",
+                        "profile_points": "0,0;1,0.1;5,0.1;6,0;10,0",
+                        "_input_profile_source": "drive_profile",
+                        "_input_profile_output": "signal",
+                        "_input_profile_type": "waveform"}},
+            {"type_id": "workflow_end", "id": "end", "x": 680, "y": 0, "params": {}},
+            plot,
+        ],
+    }
+
+
 def builtin_templates() -> dict[str, list[dict[str, Any]]]:
-    return {**device_templates(), **{'General / Examples / Current and Heatmap': [{'type_id': 'workflow_start',
+    return {**device_templates(), **keithley_time_templates(), **{'General / Examples / Current and Heatmap': [{'type_id': 'workflow_start',
                                                'id': 'start',
                                                'params': {'_next': 'read', '_workflow_version': '2'}},
                                               {'type_id': 'constant_current',

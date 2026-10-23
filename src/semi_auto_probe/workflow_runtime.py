@@ -120,7 +120,7 @@ class NodeCapture:
                 analysis = analyze_hp6614c_transfer_records(records, metric)
                 payload.setdefault(metric, analysis.mean_value)
             statistics.setdefault("subthreshold_swing_v_dec", payload.get("ss"))
-        if self.type_id in {"hp6614c_output", "b1500_output"} and self.series:
+        if self.type_id in {"hp6614c_output", "hp6614c_bias_loop", "b1500_output"} and self.series:
             from .workflow_formula import evaluate_expression
             slopes = [evaluate_expression("slope(c)", {"c": curve}) for curve in self.family("current").values()]
             resistances = [1 / value for value in slopes if isinstance(value, float) and value != 0]

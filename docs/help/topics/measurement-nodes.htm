@@ -17,6 +17,7 @@
 <tr><td>WobbTest</td><td>在 Keithley bias 下扫描 Z，并可继续 XY 优化接触。固定 Z Wire-bond Mapping 中禁止。当前实际结果含 best_current_a；声明的 contact_resistance_ohm 尚未计算。</td></tr>
 <tr><td>6614C Transfer</td><td>HP 6614C 扫 Vg，Keithley 保持 Vd 并测 Id；设置 HP/Keithley resource、bias list、compliance、NPLC 与 settle。</td></tr>
 <tr><td>6614C Output</td><td>Keithley 扫 Vd，HP 6614C 应用每个 Vg；输出 curve、JSON/CSV 与特征。</td></tr>
+<tr><td>6614C Gate Bias Loop</td><td>Scratch 风格容器：把一张 Keithley IV 卡拖入容器；HP 6614C 依次应用 Vg 列表，每个栅压完整执行一次内层原生 I-V。内层卡输出按 Vg 分组的 Id-Vd；外层卡逐个漏压点回读并输出 HP 的 Ig-Vd，另可输出实际 Vg-Vd。</td></tr>
 </table>
 <h2>Keysight B1500</h2>
 <table class="feature-table">

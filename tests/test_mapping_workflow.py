@@ -82,6 +82,8 @@ class MappingWorkflowTests(unittest.TestCase):
             self.assertEqual(metadata["status"], "completed")
             self.assertEqual(events, [])
             self.assertTrue(all(result.workflow_data["metrics"] == {} for result in results.values()))
+            for name in ("images", "iv", "wobb", "hp6614c", "b1500", "current", "it"):
+                self.assertFalse((Path(tmp) / name).exists(), name)
 
     def test_read_error_and_stop_preserve_partial_point_and_close_output(self):
         for failure in ("timeout", "stop", "initialization", "cleanup"):
@@ -136,8 +138,9 @@ class MappingWorkflowTests(unittest.TestCase):
     def test_invalid_fixed_z_flow_rejected_before_motion(self):
         with self.assertRaisesRegex(ValueError, "WobbTest"):
             settings(measurement_flow=(AutoTestFlowStep("wobb_test", {}),)).normalized()
+        ProbeApp._validate_mapping_workflow(settings(measurement_flow=(AutoTestFlowStep("it", {}),)))
         with self.assertRaisesRegex(ValueError, "not executable"):
-            ProbeApp._validate_mapping_workflow(settings(measurement_flow=(AutoTestFlowStep("it", {}),)))
+            ProbeApp._validate_mapping_workflow(settings(measurement_flow=(AutoTestFlowStep("light_control", {}),)))
         with self.assertRaisesRegex(ValueError, "Configure"):
             ProbeApp._validate_mapping_workflow(settings(measurement_flow=()))
 

@@ -7,8 +7,13 @@ PLOT_LAYOUTS = {"1x1": (1, 1), "1x2": (1, 2), "2x2": (2, 2), "2x3": (2, 3)}
 LIGHT_OUTPUT_TYPES = frozenset({"laser_output", "laser_pulse", "light_control", "light_pulse"})
 LIGHT_INPUT_TYPES = frozenset({"photo_iv", "photo_transient"})
 MATH_TYPES = frozenset({'math_formula', 'math_add', 'math_subtract', 'math_multiply', 'math_divide'})
-DATA_ONLY_TYPES = MATH_TYPES | {'mapping_heatmap', 'plot_panel', 'boolean_compare', 'boolean_compare_pair', 'boolean_logic'}
+DATA_ONLY_TYPES = MATH_TYPES | {'mapping_heatmap', 'plot_panel', 'boolean_compare', 'boolean_compare_pair', 'boolean_logic', 'waveform', 'drive_waveform'}
+CONTROL_CONTAINERS: dict[str, tuple[str, ...]] = {
+    "hp6614c_bias_loop": ("iv",),
+}
 DATA_INPUTS: dict[str, tuple[tuple[str, str], ...]] = {
+    "it": (("profile", "waveform"),),
+    "laser_pulse": (("profile", "waveform"),),
     "virtual_mask": (("calibration", "calibration"),),
     "photo_power_steps": (("calibration", "calibration"),),
     "photo_width_steps": (("calibration", "calibration"),),
@@ -22,6 +27,8 @@ DATA_INPUTS: dict[str, tuple[tuple[str, str], ...]] = {
     "condition_compliance": (("reached", "bool"),),
 }
 DATA_OUTPUTS: dict[str, tuple[tuple[str, str], ...]] = {
+    "waveform": (("signal", "waveform"),),
+    "drive_waveform": (("waveform", "waveform"),),
     "laser_iv_calibration": (("calibration", "calibration"),),
     "math_formula": (("result", "number"),),
     "boolean_compare": (("result", "bool"),),
@@ -31,10 +38,11 @@ RESULT_OUTPUTS: dict[str, tuple[str, ...]] = {
     "virtual_mask": ("target_power_mw", "normalized_intensity"),
     "constant_current": ("statistics.mean_current_a", "statistics.std_current_a", "statistics.estimated_irradiance_w_m2"),
     "iv": ("statistics.resistance_ohm", "statistics.max_abs_current_a", "statistics.compliance_reached"),
-    "it": ("statistics.steady_current_a", "statistics.peak_current_a"),
+    "it": ("statistics.steady_current_a", "statistics.peak_current_a", "statistics.steady_voltage_v", "statistics.peak_voltage_v"),
     "wobb_test": ("statistics.best_current_a", "statistics.contact_resistance_ohm"),
     "hp6614c_transfer": ("vth", "on_off_ratio", "statistics.max_abs_current_a"),
     "hp6614c_output": ("statistics.output_resistance_ohm", "statistics.max_abs_current_a"),
+    "hp6614c_bias_loop": ("statistics.output_resistance_ohm", "statistics.max_abs_current_a"),
     "b1500_transfer": ("vth", "on_off_ratio", "statistics.subthreshold_swing_v_dec"),
     "b1500_output": ("statistics.output_resistance_ohm", "statistics.max_abs_current_a"),
     "photo_iv": ("photocurrent_a", "photo_dark_ratio", "responsivity_a_w"),
@@ -95,6 +103,8 @@ def metric_type(name):
     return 'bool' if name.rsplit('.', 1)[-1] == 'compliance_reached' else 'number'
 
 def output_type(node, name):
+    if node.type_id == 'laser_pulse' and name == 'signal':
+        return 'waveform'
     declared = dict(output_ports(node))
     if name in declared:
         return declared[name]

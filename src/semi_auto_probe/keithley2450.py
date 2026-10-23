@@ -512,6 +512,7 @@ class Keithley2450IVRunner:
         self._owns_instrument = instrument is None
         self._manual_adapter = None
         self._sweep_config: IVSweepConfig | None = None
+        self._sweep_source_value = 0.0
         self._sweep_started_at = 0.0
         self._constant_config: ConstantVoltageCurrentConfig | None = None
         self._constant_source_value = 0.0
@@ -560,6 +561,7 @@ class Keithley2450IVRunner:
                 self.instrument = None
             raise
         self._sweep_config = normalized
+        self._sweep_source_value = normalized.start
         self._sweep_started_at = time.monotonic()
         return normalized
 
@@ -572,6 +574,31 @@ class Keithley2450IVRunner:
         if not math.isfinite(value):
             raise ValueError("Keithley sweep source value must be finite.")
         self._set_source_value(instrument, config.sweep_mode, value)
+        self._sweep_source_value = value
+
+    def read_sweep_sample(self, *, index: int = 1, total: int = 1) -> IVSweepSample:
+        """Read once at the currently programmed source without changing it."""
+        config = self._sweep_config
+        instrument = self.instrument
+        if config is None or instrument is None:
+            raise RuntimeError("Keithley sweep session is not active.")
+        if config.segments is not None:
+            sense_order = 'SOUR, READ' if config.sweep_mode == 'voltage' else 'READ, SOUR'
+            raw = instrument.query(f':READ? "defbuffer1", {sense_order}')
+            self._manual_adapter.check_error('I/V-t measurement')
+            numbers = _parse_reading_numbers(raw)
+            if len(numbers) != 2 or any(not math.isfinite(v) or abs(v) >= 9e36 for v in numbers):
+                raise RuntimeError(f'Invalid/overrange I/V-t reading: {raw}')
+        else:
+            raw = instrument.query(":READ?")
+        return self._sample_from_reading(
+            raw,
+            index=int(index),
+            total=int(total),
+            elapsed_s=time.monotonic() - self._sweep_started_at,
+            source_value=self._sweep_source_value,
+            sweep_mode=config.sweep_mode,
+        )
 
     def sample_sweep(
         self,
@@ -793,7 +820,10 @@ class Keithley2450IVRunner:
         instrument.write(f":ROUT:TERM {'FRON' if config.output_terminal == OUTPUT_TERMINAL_FRONT else 'REAR'}")
         if config.sweep_mode == IV_SWEEP_MODE_VOLTAGE:
             instrument.write(":SOUR:FUNC:MODE VOLT")
-            instrument.write(":SOUR:VOLT:RANG:AUTO ON")
+            if config.source_range is None:
+                instrument.write(":SOUR:VOLT:RANG:AUTO ON")
+            else:
+                instrument.write(f":SOUR:VOLT:RANG {config.source_range:.12g}")
             instrument.write(':SENS:FUNC "CURR"')
             instrument.write(f":SOUR:VOLT:ILIM {config.current_limit_a:.12g}")
             if config.measure_range is None:
@@ -801,9 +831,13 @@ class Keithley2450IVRunner:
             else:
                 instrument.write(f":SENS:CURR:RANG {config.measure_range:.12g}")
             instrument.write(f":SENS:CURR:NPLC {config.nplc:.12g}")
+            instrument.write(f":SENS:CURR:AZER {int(config.autozero)}")
         else:
             instrument.write(":SOUR:FUNC:MODE CURR")
-            instrument.write(":SOUR:CURR:RANG:AUTO ON")
+            if config.source_range is None:
+                instrument.write(":SOUR:CURR:RANG:AUTO ON")
+            else:
+                instrument.write(f":SOUR:CURR:RANG {config.source_range:.12g}")
             instrument.write(':SENS:FUNC "VOLT"')
             instrument.write(f":SOUR:CURR:VLIM {config.voltage_limit_v:.12g}")
             if config.measure_range is None:
@@ -811,6 +845,7 @@ class Keithley2450IVRunner:
             else:
                 instrument.write(f":SENS:VOLT:RANG {config.measure_range:.12g}")
             instrument.write(f":SENS:VOLT:NPLC {config.nplc:.12g}")
+            instrument.write(f":SENS:VOLT:AZER {int(config.autozero)}")
 
     def _configure_constant_voltage_current(self, instrument: VisaInstrument, config: ConstantVoltageCurrentConfig) -> None:
         instrument.write("*RST")

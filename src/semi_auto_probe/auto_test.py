@@ -272,6 +272,21 @@ AUTOTEST_FLOW_DEFINITIONS: tuple[AutoTestFlowDefinition, ...] = (
         ),
     ),
     AutoTestFlowDefinition(
+        "hp6614c_bias_loop",
+        "6614C Gate Bias Loop",
+        "Apply each HP 6614C gate voltage and run the nested Keithley IV card once.",
+        "#16a34a",
+        (
+            AutoTestFlowParam("hp_resource", "HP VISA", "GPIB0::5::INSTR"),
+            AutoTestFlowParam("bias_values_v", "Vg list V", "0,2,5,10,15,20,25,30"),
+            AutoTestFlowParam("gate_current_limit_a", "Ig limit A", "1e-6"),
+            AutoTestFlowParam("gate_settle_s", "Gate settle s", "0.02"),
+            AutoTestFlowParam("verify_identity", "Verify HP identity", "false"),
+            AutoTestFlowParam("readback", "Read back Vg", "true"),
+            AutoTestFlowParam("skip_open_clear", "Skip VISA clear", "true"),
+        ),
+    ),
+    AutoTestFlowDefinition(
         "hp6614c_transfer",
         "6614C Transfer",
         "Sweep HP 6614C gate voltage while Keithley holds drain voltage and measures Id.",
@@ -409,13 +424,45 @@ AUTOTEST_FLOW_DEFINITIONS: tuple[AutoTestFlowDefinition, ...] = (
     ),
     AutoTestFlowDefinition(
         "it",
-        "IT Test",
-        "Run a current-time measurement placeholder.",
+        "Keithley I/V-t",
+        "Source voltage or current while sampling the complementary quantity at an independent interval.",
         "#fbbf24",
         (
+            AutoTestFlowParam("resource", "VISA resource", "GPIB0::18::INSTR"),
+            AutoTestFlowParam("output_terminal", "Output terminal", "rear"),
+            AutoTestFlowParam("source_mode", "Source mode", "voltage"),
+            AutoTestFlowParam("drive_mode", "Drive", "constant"),
+            AutoTestFlowParam("source_value", "Constant drive (V/A)", "0.1"),
             AutoTestFlowParam("duration_s", "Duration (s)", "10"),
             AutoTestFlowParam("sample_interval_s", "Sample interval (s)", "0.1"),
-            AutoTestFlowParam("bias_v", "Bias V", "0.1"),
+            AutoTestFlowParam("profile_points", "Drive profile time_s,value", "0,0;1,0.1;5,0.1;6,0"),
+            AutoTestFlowParam("voltage_limit_v", "Voltage limit (V)", "20"),
+            AutoTestFlowParam("current_limit_a", "Current limit (A)", "1e-3"),
+            AutoTestFlowParam("source_range", "Source range", "auto"),
+            AutoTestFlowParam("measure_range", "Measure range", "auto"),
+            AutoTestFlowParam("nplc", "NPLC", "1"),
+            AutoTestFlowParam("autozero", "Auto zero", "true"),
+            AutoTestFlowParam("output_off_after", "Output off after", "true"),
+        ),
+    ),
+    AutoTestFlowDefinition(
+        "waveform",
+        "Waveform",
+        "Reusable unitless time/value profile; the connected Laser or Keithley node assigns its meaning and units.",
+        "#facc15",
+        (
+            AutoTestFlowParam("cycles", "Cycles", "1"),
+            AutoTestFlowParam("profile_points", "Profile time_s,value", "0,0;1,1;5,1;6,0;10,0"),
+        ),
+    ),
+    AutoTestFlowDefinition(
+        "drive_waveform",
+        "Keithley Drive Waveform",
+        "Reusable two-column time/value drive profile for a Keithley I/V-t node.",
+        "#facc15",
+        (
+            AutoTestFlowParam("source_mode", "Source mode", "voltage"),
+            AutoTestFlowParam("profile_points", "Profile time_s,value", "0,0;1,0.1;5,0.1;6,0"),
         ),
     ),
     AutoTestFlowDefinition(
@@ -794,12 +841,12 @@ AUTOTEST_FLOW_DEFINITIONS = tuple(
 )
 
 FLOW_CATEGORIES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("basic", "Basic", ("wait", "photo")),
+    ("basic", "Basic", ("wait", "photo", "waveform")),
     (
         "electrical",
         "Electrical",
         (
-            "iv", "constant_current", "it", "wobb_test",
+            "iv", "hp6614c_bias_loop", "constant_current", "it", "wobb_test",
             "hp6614c_transfer", "hp6614c_output",
             "b1500_transfer", "b1500_output",
         ),

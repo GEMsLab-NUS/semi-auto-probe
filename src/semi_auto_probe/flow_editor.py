@@ -45,12 +45,14 @@ NODE_TEXT = "#eeeeee"
 NODE_MUTED = "#b1b3ba"
 INLINE_KEYS = {
     "iv": ("start", "initial_direction", "stop", "low", "segments", "step"),
+    "hp6614c_bias_loop": ("bias_values_v",),
     "photo_iv": ("start", "stop", "step"),
     "constant_current": ("voltage_v", "current_limit_a", "sample_count"),
     "laser_output": ("peak_voltage_v", "peak_current_a", "output_state"),
     "laser_pulse": ("peak_current_a", "width_ms", "count"),
     "laser_iv_calibration": ("calibration_current_min_a", "calibration_current_max_a", "calibration_current_step_a"),
     "photo_transient": ("bias_v", "duration_s", "sample_interval_ms"),
+    "it": ("source_mode", "source_value", "duration_s", "sample_interval_s"),
     "photo_power_steps": ("bias_v", "power_levels", "power_width_ms"),
     "photo_width_steps": ("bias_v", "width_min_ms", "width_max_ms"),
     "virtual_mask": ("black_power_mw", "white_power_mw", "settle_s"),
@@ -61,7 +63,7 @@ INLINE_KEYS = {
 # A DC output can be a sequential setup node as well as a light-input source.
 LIGHT_ONLY_TYPES = LIGHT_OUTPUT_TYPES - {"laser_output"}
 BOUNDARY_TYPES = frozenset({"workflow_start", "workflow_end"})
-from .workflow_ports import (DATA_ONLY_TYPES, DATA_INPUTS, DATA_OUTPUTS, RESULT_OUTPUTS, input_ports as registered_input_ports, visible_input_ports, output_ports, metric_type, metric_unit, compatible)
+from .workflow_ports import (CONTROL_CONTAINERS, DATA_ONLY_TYPES, DATA_INPUTS, DATA_OUTPUTS, RESULT_OUTPUTS, input_ports as registered_input_ports, visible_input_ports, output_ports, metric_type, metric_unit, compatible)
 PORT_COLORS = {"control": "#38bdf8", "number": "#c084fc", "bool": "#fb923c", "waveform": "#facc15", "calibration": "#22c55e", "trace": "#38bdf8", "curve": "#818cf8", "plot": "#e879f9"}
 
 
@@ -74,6 +76,15 @@ def input_ports(card):
 
 
 PARAMETER_GROUPS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
+    "it": (
+        ("Instrument", ("resource", "output_terminal", "source_mode")),
+        ("Drive", ("drive_mode", "source_value")),
+        ("Acquisition", ("duration_s", "sample_interval_s", "nplc", "autozero")),
+        ("Limits & Range", ("voltage_limit_v", "current_limit_a", "source_range", "measure_range", "output_off_after")),
+    ),
+    "drive_waveform": (
+        ("Drive", ("source_mode",)),
+    ),
     "virtual_mask": (
         ("Mask & Binding", ("image_path", "coordinate_frame", "bindings")),
         ("Power Mapping", ("black_power_mw", "white_power_mw", "invert_intensity")),
@@ -120,6 +131,11 @@ PARAMETER_GROUPS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
         ("Limits & Range", ("voltage_limit_v", "current_limit_a", "source_range", "measure_range")),
         ("Acquisition", ("source_delay_s", "nplc", "autozero", "output_off_after")),
         ("Result", ("output_statistics", "resistance_method", "plot_layout", "heatmap_values")),
+    ),
+    "hp6614c_bias_loop": (
+        ("Gate source", ("hp_resource", "gate_current_limit_a", "gate_settle_s")),
+        ("Gate sequence", ("bias_values_v",)),
+        ("Communication", ("verify_identity", "readback", "skip_open_clear")),
     ),
     "wobb_test": (
         ("Instrument", ("resource", "output_terminal", "mode")),
@@ -222,9 +238,10 @@ class MeasurementFlowEditor(FlowEditorUX):
         self._cut_start: tuple[float, float] | None = None
         self._library_insert_edge: tuple[str, str, str] | None = None
         self._initial_fit_pending = True
-        self.library_open = {key: key in {"electrical", "light", "math", "conditions"} for key, _label, _items in FLOW_CATEGORIES}
+        self.library_open = {key: False for key, _label, _items in FLOW_CATEGORIES}
         self.param_vars: dict[str, tk.StringVar] = {}
         self.output_vars: dict[str, tk.BooleanVar] = {}
+        self._result_outputs_expanded: dict[str, bool] = {}
         self.wave_drag: str | None = None
         self._waveform_editor_process: subprocess.Popen[bytes] | None = None
 
@@ -260,6 +277,7 @@ class MeasurementFlowEditor(FlowEditorUX):
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         self._hydrate_positions()
         self._ensure_boundary_nodes()
+        self._layout_nested_cards()
         self.redraw()
         self._record_history()
         self.window.after_idle(self._set_initial_sidebar_width)
@@ -761,9 +779,12 @@ class MeasurementFlowEditor(FlowEditorUX):
                 if source is not None and str(source.params.get(key, "")) == target_id:
                     source.params[key] = card.card_id
                     card.params["_true" if is_condition_flow_type(card.type_id) else "_next"] = target_id
+            elif self._nest_card_at(card):
+                self.status_var.set(f"Nested {self.definitions[card.type_id].title} in the 6614C gate loop.")
             self.selected_id = card.card_id
             self._changed()
-            self.status_var.set(f"Added {self.definitions[card.type_id].title}.")
+            if not card.params.get("_parent"):
+                self.status_var.set(f"Added {self.definitions[card.type_id].title}.")
         else:
             self.status_var.set("Drop cancelled.")
         return "break"
@@ -848,16 +869,23 @@ class MeasurementFlowEditor(FlowEditorUX):
                 if target in incoming:
                     incoming[target] += 1
         auxiliary_sources = {card.params.get("_light_source") for card in content if card.params.get("_light_source")}
+        nested = {str(card.params.get("_child", "")).strip() for card in content if card.type_id in CONTROL_CONTAINERS}
         roots = [card for card in content if incoming[card.card_id] == 0
-                 and card.type_id not in LIGHT_ONLY_TYPES | DATA_ONLY_TYPES and card.card_id not in auxiliary_sources]
+                 and card.type_id not in LIGHT_ONLY_TYPES | DATA_ONLY_TYPES
+                 and card.card_id not in auxiliary_sources | nested]
         if not start.params.get("_next"):
             start.params["_next"] = (roots[0].card_id if roots else end.card_id)
         for card in content:
-            if card.type_id not in LIGHT_ONLY_TYPES | DATA_ONLY_TYPES and card.card_id not in auxiliary_sources and not is_condition_flow_type(card.type_id) and not card.params.get("_next"):
+            if card.type_id not in LIGHT_ONLY_TYPES | DATA_ONLY_TYPES and card.card_id not in auxiliary_sources | nested and not is_condition_flow_type(card.type_id) and not card.params.get("_next"):
                 card.params["_next"] = end.card_id
 
     def redraw(self) -> None:
         self._finish_inline_edit()
+        # Saved workflows and undo/redo can restore the parent and child at
+        # different coordinates.  Keep a nested card physically inside its
+        # container whenever the user is not actively dragging a card.
+        if self.drag_id is None:
+            self._layout_nested_cards()
         for card in self.cards:
             if card.type_id in RESULT_OUTPUTS:
                 card.params["_outputs"] = ",".join(self._selected_result_outputs(card))
@@ -910,7 +938,7 @@ class MeasurementFlowEditor(FlowEditorUX):
         self._routing_edges = False
         self._routing_signature = signature
         self._draw_crossing_bridges()
-        for card in self.cards:
+        for card in sorted(self.cards, key=lambda item: item.type_id not in CONTROL_CONTAINERS):
             self._draw_node(card)
         if not self.cards:
             self.canvas.create_text(0, 0, text="Drag nodes here to build a measurement graph", fill=self.colors["muted"], font=("Segoe UI", 13))
@@ -1012,6 +1040,33 @@ class MeasurementFlowEditor(FlowEditorUX):
             self.canvas.create_text(x + width - 10, y + 16, text="!", fill="#ff9b92", font=("Segoe UI", self._zoom_font(11), "bold"), tags=tags)
         if card.type_id == "laser_pulse":
             self._draw_node_sparkline(card, x + 14, y + height - 42, x + width - 14, y + height - 12)
+        elif card.type_id in {"waveform", "it", "drive_waveform"} and not (
+            card.type_id == "it" and self._it_profile_connected(card)
+        ):
+            self._draw_keithley_sparkline(card, x + 14, y + height - 42, x + width - 14, y + height - 12)
+        if card.type_id in CONTROL_CONTAINERS:
+            left, top, right, bottom = self._container_slot_bounds(card)
+            # Cut a real inset into the container, then draw an open C-shaped
+            # outline.  A closed rectangle reads as a card behind another card
+            # and its right edge visibly crosses the nested node.
+            self._rounded_box(left, top, right, bottom, 8, fill=CANVAS_BG, outline="", tags=tags)
+            wrap_points = self._container_wrap_points(card)
+            self.canvas.create_line(
+                *(coordinate for point in wrap_points for coordinate in point),
+                fill=definition.accent,
+                width=3,
+                joinstyle=tk.ROUND,
+                capstyle=tk.ROUND,
+                tags=(*tags, f"container_wrap:{card.card_id}"),
+            )
+            self._rounded_box(left + 10, top - 7, left + 92, top + 10, 5,
+                              fill=header, outline=definition.accent, width=1, tags=tags)
+            self.canvas.create_text(left + 51, top + 1, text="RUN IV / Vg", fill=NODE_TEXT,
+                                    font=("Segoe UI Semibold", self._zoom_font(7)), tags=tags)
+            if not card.params.get("_child"):
+                self.canvas.create_text((left + right) / 2, (top + bottom) / 2,
+                                        text="Drop one Keithley IV card here", fill=NODE_MUTED,
+                                        font=("Segoe UI", self._zoom_font(9)), tags=tags)
 
     def _rounded_box(self, x1, y1, x2, y2, radius, **kwargs):
         r = min(radius, (x2-x1)/2, (y2-y1)/2)
@@ -1024,6 +1079,12 @@ class MeasurementFlowEditor(FlowEditorUX):
     def _inline_params(card):
         definition = autotest_flow_definitions_by_type()[card.type_id]
         keys = INLINE_KEYS.get(card.type_id)
+        if card.type_id == "iv" and card.params.get("_parent"):
+            keys = ("start", "stop", "step")
+        elif card.type_id == "waveform":
+            keys = ("cycles",)
+        elif card.type_id == "it" and card.params.get("_input_profile_source"):
+            keys = tuple(key for key in keys if key not in {"source_value", "duration_s"})
         if keys is None and card.type_id in {"b1500_transfer", "b1500_output", "hp6614c_transfer", "hp6614c_output"}:
             keys = ("sweep_start_v", "sweep_end_v", "sweep_points")
         if keys is None:
@@ -1034,9 +1095,10 @@ class MeasurementFlowEditor(FlowEditorUX):
 
     def _node_outputs(self, card):
         ports = []
-        if is_condition_flow_type(card.type_id):
+        nested = bool(card.params.get("_parent"))
+        if is_condition_flow_type(card.type_id) and not nested:
             ports.extend((("true", "True"), ("false", "False")))
-        elif card.type_id not in LIGHT_ONLY_TYPES | DATA_ONLY_TYPES and card.type_id != "workflow_end":
+        elif not nested and card.type_id not in LIGHT_ONLY_TYPES | DATA_ONLY_TYPES and card.type_id != "workflow_end":
             ports.append(("next", "Flow"))
         if card.type_id in LIGHT_OUTPUT_TYPES:
             ports.append(("waveform@signal", "Waveform"))
@@ -1046,6 +1108,8 @@ class MeasurementFlowEditor(FlowEditorUX):
         return ports
 
     def _node_inputs(self, card):
+        if card.params.get("_parent"):
+            return []
         ports = []
         if card.type_id not in LIGHT_ONLY_TYPES | DATA_ONLY_TYPES and card.type_id != "workflow_start":
             ports.append(("flow", "Flow"))
@@ -1144,13 +1208,98 @@ class MeasurementFlowEditor(FlowEditorUX):
         return "break"
 
     def _draw_node_sparkline(self, card: AutoTestFlowCard, x1: float, y1: float, x2: float, y2: float) -> None:
-        points = parse_waveform_points(card.params)
+        source = self._card(str(card.params.get("_input_profile_source", ""))) if card.type_id == "laser_pulse" else None
+        points = parse_waveform_points(source.params if source is not None and source.type_id == "waveform" else card.params)
         duration = max(0.001, points[-1].time_ms)
         peak = max(0.001, max(point.voltage_v for point in points))
         coordinates: list[float] = []
         for point in points:
             coordinates.extend((x1 + (x2 - x1) * point.time_ms / duration, y2 - (y2 - y1) * point.voltage_v / peak))
         self.canvas.create_line(*coordinates, fill="#fb7185", width=2, tags=("node", f"node:{card.card_id}"))
+
+    def _keithley_profile_points(self, card: AutoTestFlowCard):
+        from .keithley_timing import KeithleyDrivePoint, parse_drive_profile, repeat_drive_profile
+        from .smu_settings import parse_si_value
+
+        source = self._card(str(card.params.get("_input_profile_source", ""))) if card.type_id == "it" else None
+        if source is not None and source.type_id == "waveform":
+            return repeat_drive_profile(
+                parse_drive_profile(source.params.get("profile_points", ""), source_mode=card.params.get("source_mode", "voltage")),
+                source.params.get("cycles", "1"),
+            )
+        if source is not None and source.type_id == "laser_pulse":
+            from .keithley_timing import drive_profile_from_laser_waveform
+            return drive_profile_from_laser_waveform(source.params, source_mode=card.params.get("source_mode", "voltage"))
+        profile_card = source if source is not None and source.type_id == "drive_waveform" else card
+        mode = profile_card.params.get("source_mode", card.params.get("source_mode", "voltage"))
+        if profile_card.type_id in {"waveform", "drive_waveform"} or card.params.get("drive_mode") == "profile":
+            points = parse_drive_profile(profile_card.params.get("profile_points", ""), source_mode=mode)
+            return repeat_drive_profile(points, profile_card.params.get("cycles", "1"))
+        value = parse_si_value(card.params.get("source_value", "0"), "A" if mode == "current" else "V")
+        duration = parse_si_value(card.params.get("duration_s", "1"), "s")
+        return (KeithleyDrivePoint(0.0, value), KeithleyDrivePoint(max(duration, 1e-12), value))
+
+    def _draw_keithley_sparkline(self, card: AutoTestFlowCard, x1: float, y1: float, x2: float, y2: float) -> None:
+        if card.type_id == "waveform":
+            try:
+                cycles = int(float(card.params.get("cycles", "1")))
+            except (TypeError, ValueError):
+                cycles = 1
+            if cycles > 4:
+                self._draw_condensed_waveform_sparkline(card, x1, y1, x2, y2)
+                return
+        try:
+            points = self._keithley_profile_points(card)
+        except (ValueError, TypeError):
+            return
+        duration = max(1e-12, points[-1].time_s)
+        low = min(0.0, *(point.value for point in points))
+        high = max(0.0, *(point.value for point in points))
+        span = max(1e-15, high - low)
+        zero_y = y2 - (y2 - y1) * (0.0 - low) / span
+        tags = ("node", f"node:{card.card_id}", "keithley_sparkline")
+        self.canvas.create_line(x1, zero_y, x2, zero_y, fill="#4b5563", width=1, tags=tags)
+        coordinates: list[float] = []
+        for point in points:
+            px = x1 + (x2 - x1) * point.time_s / duration
+            py = y2 - (y2 - y1) * (point.value - low) / span
+            coordinates.extend((px, py))
+        if len(points) == 1:
+            coordinates.extend((x2, coordinates[-1]))
+        self.canvas.create_line(*coordinates, fill="#facc15", width=2, tags=tags)
+
+    def _draw_condensed_waveform_sparkline(
+        self, card: AutoTestFlowCard, x1: float, y1: float, x2: float, y2: float
+    ) -> None:
+        from .keithley_timing import parse_drive_profile
+
+        try:
+            points = parse_drive_profile(card.params.get("profile_points", ""), source_mode="voltage")
+        except (ValueError, TypeError):
+            return
+        duration = max(1e-12, points[-1].time_s)
+        low = min(0.0, *(point.value for point in points))
+        high = max(0.0, *(point.value for point in points))
+        span = max(1e-15, high - low)
+        middle = (x1 + x2) / 2
+        gap = min(24.0, (x2 - x1) * .16)
+        groups = ((x1, middle - gap / 2), (middle + gap / 2, x2))
+        tags = ("node", f"node:{card.card_id}", "keithley_sparkline")
+        zero_y = y2 - (y2 - y1) * (0.0 - low) / span
+        self.canvas.create_line(x1, zero_y, middle - gap / 2, zero_y, fill="#4b5563", width=1, tags=tags)
+        self.canvas.create_line(middle + gap / 2, zero_y, x2, zero_y, fill="#4b5563", width=1, tags=tags)
+        for group_start, group_end in groups:
+            coordinates: list[float] = []
+            cycle_width = (group_end - group_start) / 2
+            for cycle in range(2):
+                for point in points:
+                    px = group_start + cycle * cycle_width + cycle_width * point.time_s / duration
+                    py = y2 - (y2 - y1) * (point.value - low) / span
+                    coordinates.extend((px, py))
+            self.canvas.create_line(*coordinates, fill="#facc15", width=2, tags=tags)
+        self.canvas.create_text(middle, (y1 + y2) / 2, text="…", fill="#facc15",
+                                font=("Segoe UI Semibold", self._zoom_font(12)),
+                                tags=("node", f"node:{card.card_id}", "waveform_ellipsis"))
 
     def _draw_port(self, card, kind, x, y, label):
         self._draw_socket(card, kind, x, y, label, incoming=False)
@@ -1218,7 +1367,8 @@ class MeasurementFlowEditor(FlowEditorUX):
                 u = 1-t
                 curve.append((u**3*sx + 3*u*u*t*(sx+bend) + 3*u*t*t*(tx-bend) + t**3*tx,
                               u**3*sy + 3*u*u*t*sy + 3*u*t*t*ty + t**3*ty))
-            obstacles = [self._node_bounds(c, -.01 if c is source or c is target else 18) for c in self.cards]
+            obstacles = [self._node_bounds(c, -.01 if c is source or c is target else 18)
+                         for c in self._edge_obstacle_cards(source, target)]
             if not self._route_hits_obstacle(curve, obstacles):
                 return self._simplify_route(curve)
         rounded = self._rounded_route_points(route, 16)
@@ -1297,10 +1447,12 @@ class MeasurementFlowEditor(FlowEditorUX):
         if 0 < tx - sx < 60:
             mid = (sx + tx) / 2
             direct = [(sx, sy), (mid, sy), (mid, ty), (tx, ty)]
-            bodies = [self._node_bounds(c, -.01 if c is source or c is target else 18) for c in self.cards]
+            bodies = [self._node_bounds(c, -.01 if c is source or c is target else 18)
+                      for c in self._edge_obstacle_cards(source, target)]
             if not self._route_hits_obstacle(direct, bodies):
                 return self._simplify_route(direct)
-        obstacles = [self._node_bounds(card, 18) for card in self.cards]
+        obstacle_cards = self._edge_obstacle_cards(source, target)
+        obstacles = [self._node_bounds(card, 18) for card in obstacle_cards]
         lane = sum(ord(character) for character in source.card_id) % 4 * 8
         data_type = kind.split("@", 1)[0]
         target_data_type = target_kind.split("@", 1)[0]
@@ -1310,8 +1462,8 @@ class MeasurementFlowEditor(FlowEditorUX):
         inner_end = (tx - target_lead, ty)
         # Port leads alone may cross their owner's padded border. Shorten them
         # when another card is nearby; the main route must avoid ALL cards.
-        others_source = [self._node_bounds(c, 18) for c in self.cards if c is not source]
-        others_target = [self._node_bounds(c, 18) for c in self.cards if c is not target]
+        others_source = [self._node_bounds(c, 18) for c in obstacle_cards if c is not source]
+        others_target = [self._node_bounds(c, 18) for c in obstacle_cards if c is not target]
         for lead in (source_lead, 26, 20):
             candidate = (sx + lead, sy)
             if not self._route_hits_obstacle([(sx, sy), candidate], others_source):
@@ -1344,6 +1496,21 @@ class MeasurementFlowEditor(FlowEditorUX):
         if getattr(self, "_routing_edges", False):
             self._blocked_routes.append(f"{source.card_id} → {target.card_id}")
         return [(sx, sy), (sx + 8, sy)]
+
+    def _edge_obstacle_cards(
+        self, source: AutoTestFlowCard, target: AutoTestFlowCard
+    ) -> list[AutoTestFlowCard]:
+        """Exclude a nested endpoint's owner so data can leave its open side."""
+        ignored: set[str] = set()
+        for endpoint in (source, target):
+            parent = self._card(str(endpoint.params.get("_parent", "")))
+            if (
+                parent is not None
+                and parent.type_id in CONTROL_CONTAINERS
+                and str(parent.params.get("_child", "")) == endpoint.card_id
+            ):
+                ignored.add(parent.card_id)
+        return [card for card in self.cards if card.card_id not in ignored]
 
     def _incoming_flow_edges(self, target: AutoTestFlowCard) -> list[tuple[AutoTestFlowCard, str]]:
         incoming: list[tuple[AutoTestFlowCard, str]] = []
@@ -1684,7 +1851,13 @@ class MeasurementFlowEditor(FlowEditorUX):
         if card is None:
             return "break"
         x, y = self.canvas.canvasx(event.x) / self.zoom, self.canvas.canvasy(event.y) / self.zoom
+        old_x, old_y = card.x, card.y
         card.x, card.y, guides = self._snap_card_position(card, x - self.drag_offset[0], y - self.drag_offset[1])
+        if card.type_id in CONTROL_CONTAINERS:
+            child = self._card(str(card.params.get("_child", "")))
+            if child is not None:
+                child.x += card.x - old_x
+                child.y += card.y - old_y
         self.redraw()
         self._draw_alignment_guides(guides)
         return "break"
@@ -1706,6 +1879,10 @@ class MeasurementFlowEditor(FlowEditorUX):
             self.canvas.delete("edge_preview")
             self.redraw()
             return "break"
+        dragged = self._card(self.drag_id)
+        if dragged is not None and dragged.type_id in {kind for allowed in CONTROL_CONTAINERS.values() for kind in allowed}:
+            nested = self._nest_card_at(dragged)
+            self.status_var.set("Nested Keithley IV in the 6614C gate loop." if nested else "Keithley IV detached from its container.")
         if self.drag_id is not None:
             self._changed()
         self.drag_id = None
@@ -1859,6 +2036,9 @@ class MeasurementFlowEditor(FlowEditorUX):
         if output_type == "control":
             return "flow" if target.type_id not in (LIGHT_ONLY_TYPES | DATA_ONLY_TYPES) and target.type_id != "workflow_start" else ""
         if output_type == "waveform":
+            for name, data_type in input_ports(target):
+                if data_type == "waveform" and not target.params.get(f"_input_{name}_source"):
+                    return f"waveform@{name}"
             return "waveform@light" if target.type_id in LIGHT_INPUT_TYPES else ""
         for name, data_type in input_ports(target):
             if compatible(output_type, data_type) and not target.params.get(f"_input_{name}_source"):
@@ -1986,7 +2166,8 @@ class MeasurementFlowEditor(FlowEditorUX):
             self.status_var.set("This subplot is hidden by the current layout. Choose a visible input.")
             return False
         output_type = self._port_type(kind)
-        if output_type in {"number", "bool", "calibration", "trace", "curve", "plot"}:
+        shared_laser_profile = source.type_id == "laser_pulse" and target.type_id == "it" and output_type == "waveform"
+        if output_type in {"number", "bool", "calibration", "trace", "curve", "plot", "waveform"} and (source.type_id not in LIGHT_OUTPUT_TYPES or shared_laser_profile):
             if not target_input:
                 target_input = self._default_target_input(target, kind)
             if not compatible(output_type, self._port_type(target_input)) or "@" not in target_input:
@@ -1994,6 +2175,8 @@ class MeasurementFlowEditor(FlowEditorUX):
                 return False
             metric = kind.split("@", 1)[1]
             declared = dict(output_ports(source))
+            if source.type_id == "laser_pulse":
+                declared["signal"] = "waveform"
             declared.update((metric, metric_type(metric)) for metric in RESULT_OUTPUTS.get(source.type_id, ()))
             if declared.get(metric) != output_type:
                 self.status_var.set("This result output is not available on the source node.")
@@ -2006,6 +2189,8 @@ class MeasurementFlowEditor(FlowEditorUX):
             target.params[f"_input_{input_name}_output"] = metric
             target.params[f"_input_{input_name}_type"] = output_type
             target.params[f"_input_{input_name}_unit"] = source.params.get("output_unit", "") if metric == "result" else metric_unit(metric)
+            if target.type_id == "it" and input_name == "profile":
+                target.params["drive_mode"] = "profile"
             if is_condition_flow_type(target.type_id):
                 target.params["_result_source"] = source_id
                 target.params["_result_metric"] = metric
@@ -2013,6 +2198,8 @@ class MeasurementFlowEditor(FlowEditorUX):
             if target.type_id == "condition_metric" and output_type == "number":
                 target.params["metric"] = metric
             self.status_var.set(f"Connected {self._metric_label(metric)} to {target_id}.")
+            if target.type_id == "it" and input_name == "profile" and getattr(self, "_inspected_id", None) == target.card_id:
+                self._show_inspector(target)
             self._changed()
             return True
         if output_type == "waveform":
@@ -2050,6 +2237,8 @@ class MeasurementFlowEditor(FlowEditorUX):
         self._field_widgets.clear()
         self._error_labels.clear()
         self.output_vars.clear()
+        if card.type_id == "it" and self._it_profile_connected(card):
+            card.params["drive_mode"] = "profile"
         row = 0
         available_outputs = RESULT_OUTPUTS.get(card.type_id, ())
         if available_outputs:
@@ -2061,8 +2250,9 @@ class MeasurementFlowEditor(FlowEditorUX):
             self.wave_canvas = tk.Canvas(self.param_body, height=142, bg="#080d13", highlightthickness=1, highlightbackground=self.colors["border"], bd=0)
             self.wave_canvas.grid(row=row, column=0, sticky="ew", pady=(0, 10))
             row += 1
-            ttk.Button(self.param_body, text="Edit Waveform", style="Accent.TButton", command=lambda target=card: self._open_waveform_editor(target)).grid(row=row, column=0, sticky="ew", pady=(0, 10))
-            row += 1
+            if card.type_id == "laser_pulse":
+                ttk.Button(self.param_body, text="Edit local waveform", style="Accent.TButton", command=lambda target=card: self._open_waveform_editor(target)).grid(row=row, column=0, sticky="ew", pady=(0, 10))
+                row += 1
         params_by_key = {param.key: param for param in definition.parameters}
         if card.type_id == "plot_panel":
             self._build_parameter_group(self.param_body, row, "Panel", [params_by_key["layout"]], card)
@@ -2091,10 +2281,23 @@ class MeasurementFlowEditor(FlowEditorUX):
         else:
             for group_title, keys in self._parameter_groups(definition):
                 group_params = [params_by_key[key] for key in keys if key in params_by_key]
+                if card.type_id == "it" and self._it_profile_connected(card):
+                    group_params = [param for param in group_params if param.key not in {"source_value", "duration_s"}]
                 if not group_params:
                     continue
                 self._build_parameter_group(self.param_body, row, group_title, group_params, card)
                 row += 1
+        if card.type_id in {"it", "laser_pulse"}:
+            self._build_source_picker(self.param_body, row, card, "profile", "waveform")
+            row += 1
+        if card.type_id == "waveform":
+            self._build_drive_profile_editor(self.param_body, row, card)
+            row += 1
+        if card.type_id in {"it", "drive_waveform"} and not (
+            card.type_id == "it" and self._it_profile_connected(card)
+        ):
+            self._build_drive_profile_editor(self.param_body, row, card)
+            row += 1
         if card.type_id == "math_formula":
             tk.Label(self.param_body, text="Functions: abs, sqrt, log, log10, exp, sin, cos, min, max, mean, std, peak, integral, slope.\nsegment(curve, start, stop): sample-index slice, stop excluded.\nExample: integral(segment(signal, 0, 100)) / area\nPreview uses constants and synthetic curves; it does not measure.", wraplength=310, justify="left", bg=self.colors["surface_2"], fg=self.colors["muted"]).grid(row=row, column=0, sticky="ew", pady=8)
             row += 1
@@ -2116,6 +2319,8 @@ class MeasurementFlowEditor(FlowEditorUX):
                 row += 1
         if card.type_id == "laser_pulse":
             self._draw_waveform(card)
+        if card.type_id == "it":
+            self._update_it_drive_widgets(card)
         if was_hidden:
             self.window.after_idle(lambda target=card: self._ensure_card_visible(target))
 
@@ -2124,7 +2329,8 @@ class MeasurementFlowEditor(FlowEditorUX):
         for source in self.cards:
             if source is card:
                 continue
-            outputs = (*output_ports(source), *((metric, metric_type(metric)) for metric in RESULT_OUTPUTS.get(source.type_id, ())))
+            shared = (("signal", "waveform"),) if source.type_id == "laser_pulse" else ()
+            outputs = (*output_ports(source), *shared, *((metric, metric_type(metric)) for metric in RESULT_OUTPUTS.get(source.type_id, ())))
             for output, dtype in outputs:
                 if compatible(dtype, expected):
                     choices[f"{source.card_id} → {self._metric_label(output)} [{dtype}]"] = (source, output, dtype)
@@ -2145,6 +2351,8 @@ class MeasurementFlowEditor(FlowEditorUX):
                 self._connect(source.card_id, f"{dtype}@{output}", card.card_id, f"{expected}@{name}")
             else:
                 self._clear_input(card, f"_input_{name}")
+                if card.type_id == "it" and name == "profile":
+                    self._update_it_drive_widgets(card)
                 self._changed()
         picker.bind("<<ComboboxSelected>>", apply)
 
@@ -2227,24 +2435,44 @@ class MeasurementFlowEditor(FlowEditorUX):
         section = tk.Frame(parent, bg=self.colors["surface_2"])
         section.grid(row=row, column=0, sticky="ew", pady=(5, 9))
         section.columnconfigure(0, weight=1)
-        tk.Label(section, text="EXPOSE RESULT OUTPUTS", bg=self.colors["surface_2"], fg="#c084fc",
-                 font=("Segoe UI Semibold", 8), anchor="w").grid(row=0, column=0, sticky="ew", pady=(0, 3))
-        tk.Label(section, text="Check results to expose sockets. Unchecking disconnects their links.\nConnect each result socket to a Plot Slot; Flow controls execution.",
+        expanded = self._result_outputs_expanded.setdefault(card.card_id, card.type_id != "it")
+        header = tk.Button(section, relief="flat", bd=0, highlightthickness=0,
+                           bg=self.colors["surface_2"], activebackground=self.colors["surface_2"],
+                           fg="#c084fc", activeforeground="#c084fc", anchor="w",
+                           font=("Segoe UI Semibold", 8), cursor="hand2")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 3))
+        body = tk.Frame(section, bg=self.colors["surface_2"])
+        body.grid(row=1, column=0, sticky="ew")
+        body.columnconfigure(0, weight=1)
+        tk.Label(body, text="Check results to expose sockets. Unchecking disconnects their links.\nConnect each result socket to a Plot Slot; Flow controls execution.",
                  bg=self.colors["surface_2"], fg=self.colors["muted"], font=("Segoe UI", 8),
-                 anchor="w", justify="left", wraplength=330).grid(row=1, column=0, sticky="ew", pady=(0, 6))
+                 anchor="w", justify="left", wraplength=330).grid(row=0, column=0, sticky="ew", pady=(0, 6))
         selected = set(self._selected_result_outputs(card))
         self.result_output_widgets = {}
         for index, metric in enumerate(outputs):
             variable = tk.BooleanVar(value=metric in selected)
             self.output_vars[metric] = variable
-            field = tk.Frame(section, bg=self.colors["surface_2"])
-            field.grid(row=2+index, column=0, sticky="ew", pady=2)
+            field = tk.Frame(body, bg=self.colors["surface_2"])
+            field.grid(row=1+index, column=0, sticky="ew", pady=2)
             check = ttk.Checkbutton(field, text=self._metric_label(metric), variable=variable,
                                     command=lambda target=card: self._result_outputs_changed(target))
             check.pack(side="left")
             self.result_output_widgets[metric] = check
             tk.Label(field, text=metric_type(metric), bg=self.colors["surface_2"],
                      fg=PORT_COLORS[metric_type(metric)], font=("Segoe UI", 8)).pack(side="right")
+        def toggle() -> None:
+            shown = not self._result_outputs_expanded.get(card.card_id, True)
+            self._result_outputs_expanded[card.card_id] = shown
+            header.configure(text=("▾  " if shown else "▸  ") + "EXPOSE RESULT OUTPUTS")
+            if shown:
+                body.grid()
+            else:
+                body.grid_remove()
+        header.configure(command=toggle, text=("▾  " if expanded else "▸  ") + "EXPOSE RESULT OUTPUTS")
+        if not expanded:
+            body.grid_remove()
+        self.result_outputs_toggle = header
+        self.result_outputs_body = body
 
     def _result_outputs_changed(self, card: AutoTestFlowCard) -> None:
         selected = {metric for metric in RESULT_OUTPUTS.get(card.type_id, ())
@@ -2300,7 +2528,7 @@ class MeasurementFlowEditor(FlowEditorUX):
     def _parameter_groups(definition: AutoTestFlowDefinition) -> tuple[tuple[str, tuple[str, ...]], ...]:
         configured = PARAMETER_GROUPS.get(definition.type_id, ())
         used = {key for _title, keys in configured for key in keys}
-        remaining = tuple(param.key for param in definition.parameters if param.key not in used and param.key != "waveform_points")
+        remaining = tuple(param.key for param in definition.parameters if param.key not in used and param.key not in {"waveform_points", "profile_points"})
         if not configured:
             return (("Parameters", remaining),)
         if remaining:
@@ -2318,7 +2546,7 @@ class MeasurementFlowEditor(FlowEditorUX):
 
     @staticmethod
     def _choices(type_id: str, key: str) -> tuple[str, ...]:
-        if type_id == 'iv' and key in {'measure_range', 'source_range'}:
+        if type_id in {'iv', 'it'} and key in {'measure_range', 'source_range'}:
             return ()
         if key.endswith("scale"):
             return ("linear", "log")
@@ -2341,6 +2569,8 @@ class MeasurementFlowEditor(FlowEditorUX):
             "coordinate_frame": ("xy", "uv"),
             "pattern": ("serpentine", "raster"),
             "sweep_mode": ("voltage", "current"),
+            "source_mode": ("voltage", "current"),
+            "drive_mode": ("constant", "profile"),
             "initial_direction": ("up", "down"),
             "scan_type": ("single", "forward", "reverse", "bidirectional"),
             "mode": ("Z", "Z-XY"),
@@ -2688,6 +2918,201 @@ class MeasurementFlowEditor(FlowEditorUX):
             else:
                 notebook.hide(page)
 
+    @staticmethod
+    def _it_profile_connected(card: AutoTestFlowCard) -> bool:
+        return bool(card.params.get("_input_profile_source"))
+
+    def _update_it_drive_widgets(self, card: AutoTestFlowCard) -> None:
+        if card.type_id != "it":
+            return
+        connected = self._it_profile_connected(card)
+        if connected:
+            card.params["drive_mode"] = "profile"
+        mode_var = self.param_vars.get("drive_mode")
+        if mode_var is not None and mode_var.get() != card.params.get("drive_mode", "constant"):
+            mode_var.set(card.params.get("drive_mode", "constant"))
+        mode_widget = self._field_widgets.get((card.card_id, "drive_mode"))
+        constant_widget = self._field_widgets.get((card.card_id, "source_value"))
+        if mode_widget is not None and mode_widget.winfo_exists():
+            mode_widget.configure(state="disabled" if connected else "readonly")
+        if constant_widget is not None and constant_widget.winfo_exists():
+            constant_widget.configure(state="disabled" if card.params.get("drive_mode") == "profile" else "normal")
+
+    def _build_drive_profile_editor(self, parent: tk.Frame, row: int, card: AutoTestFlowCard) -> None:
+        from .keithley_timing import KeithleyDrivePoint, parse_drive_profile, parse_drive_profile_document, serialize_drive_profile
+        from .smu_settings import parse_si_value
+
+        section = tk.Frame(parent, bg=self.colors["surface_2"])
+        section.grid(row=row, column=0, sticky="ew", pady=(5, 9))
+        section.columnconfigure(0, weight=1)
+        unit = "" if card.type_id == "waveform" else ("V" if card.params.get("source_mode", "voltage") == "voltage" else "A")
+        tk.Label(section, text="DRIVE PROFILE", bg=self.colors["surface_2"], fg=self.colors["accent"],
+                 font=("Segoe UI Semibold", 8), anchor="w").grid(row=0, column=0, sticky="ew", pady=(0, 3))
+        explanation = ("Unitless profile; the connected test card assigns Value semantics and units."
+                       if card.type_id == "waveform" else
+                       f"Time/value steps change only the Keithley {unit} drive; sampling interval is independent.")
+        tk.Label(section, text=explanation,
+                 bg=self.colors["surface_2"], fg=self.colors["muted"], font=("Segoe UI", 8),
+                 anchor="w", justify="left", wraplength=330).grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        table = ttk.Treeview(section, columns=("time", "value"), show="headings", selectmode="browse", height=5)
+        table.heading("time", text="Time (s)")
+        table.heading("value", text="Value" if not unit else f"Drive ({unit})")
+        table.column("time", width=120, anchor="center", stretch=True)
+        table.column("value", width=140, anchor="center", stretch=True)
+        table.grid(row=2, column=0, sticky="ew")
+        try:
+            points = list(parse_drive_profile(card.params.get("profile_points", ""), source_mode=card.params.get("source_mode", "voltage")))
+        except ValueError:
+            points = [KeithleyDrivePoint(0.0, 0.0)]
+
+        status = tk.StringVar()
+        hint = ("Double-click a cell to edit; Ctrl+V pastes a complete Time/Value table."
+                if card.type_id == "waveform" else "Double-click a cell to edit it.")
+        ttk.Label(section, text=hint, wraplength=330).grid(row=3, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(section, textvariable=status, foreground="#ef4444", wraplength=330).grid(row=4, column=0, sticky="ew")
+
+        def commit() -> bool:
+            try:
+                text = serialize_drive_profile(points)
+                parse_drive_profile(text, source_mode=card.params.get("source_mode", "voltage"))
+            except ValueError as exc:
+                status.set(str(exc))
+                return False
+            card.params["profile_points"] = text
+            if card.type_id == "it":
+                card.params["drive_mode"] = "profile"
+                self._update_it_drive_widgets(card)
+            self._changed(redraw=True, group=(card.card_id, "profile_points"))
+            return True
+
+        def refresh(selected: int | None = None) -> None:
+            table.delete(*table.get_children())
+            for index, point in enumerate(points):
+                table.insert("", "end", iid=str(index), values=(f"{point.time_s:g}", f"{point.value:g}"))
+            if selected is not None and 0 <= selected < len(points):
+                table.selection_set(str(selected))
+                table.focus(str(selected))
+
+        def edit_cell(event) -> str:
+            row_id = table.identify_row(event.y)
+            column_id = table.identify_column(event.x)
+            if not row_id or column_id not in {"#1", "#2"}:
+                return "break"
+            bounds = table.bbox(row_id, column_id)
+            if not bounds:
+                return "break"
+            index = int(row_id)
+            original = points[index]
+            variable = tk.StringVar(value=f"{original.time_s:g}" if column_id == "#1" else f"{original.value:g}")
+            entry = ttk.Entry(table, textvariable=variable)
+            entry.place(x=bounds[0], y=bounds[1], width=bounds[2], height=bounds[3])
+
+            def finish(save: bool) -> str:
+                if not entry.winfo_exists():
+                    return "break"
+                if save:
+                    try:
+                        if column_id == "#1":
+                            candidate = KeithleyDrivePoint(parse_si_value(variable.get(), "s"), original.value)
+                        else:
+                            value = parse_drive_profile(
+                                f"0,{variable.get()}", source_mode=card.params.get("source_mode", "voltage")
+                            )[0].value
+                            candidate = KeithleyDrivePoint(original.time_s, value)
+                        revised = list(points)
+                        revised[index] = candidate
+                        revised.sort(key=lambda item: item.time_s)
+                        parse_drive_profile(
+                            serialize_drive_profile(revised), source_mode=card.params.get("source_mode", "voltage")
+                        )
+                    except ValueError as exc:
+                        status.set(str(exc))
+                    else:
+                        points[:] = revised
+                        status.set("")
+                        refresh(points.index(candidate))
+                        commit()
+                entry.destroy()
+                return "break"
+
+            entry.bind("<Return>", lambda _event: finish(True))
+            entry.bind("<Escape>", lambda _event: finish(False))
+            entry.bind("<FocusOut>", lambda _event: finish(True))
+            entry.focus_set()
+            entry.selection_range(0, "end")
+            self.profile_cell_editor = entry
+            return "break"
+
+        def add() -> None:
+            last = points[-1]
+            point = KeithleyDrivePoint(last.time_s + 1.0, last.value)
+            points.append(point)
+            refresh(len(points) - 1)
+            status.set("")
+            commit()
+
+        def delete() -> None:
+            selected = table.selection()
+            if selected and len(points) > 1:
+                points.pop(int(selected[0]))
+                refresh()
+                commit()
+
+        def apply_document(text: str) -> bool:
+            try:
+                imported = parse_drive_profile_document(
+                    text,
+                    source_mode=card.params.get("source_mode", "voltage"),
+                )
+            except ValueError as exc:
+                status.set(str(exc))
+                return False
+            points[:] = imported
+            status.set("")
+            refresh(0)
+            commit()
+            return True
+
+        def paste_profile(_event=None) -> str:
+            try:
+                text = self.window.clipboard_get()
+            except tk.TclError:
+                status.set("Clipboard does not contain text.")
+                return "break"
+            apply_document(text)
+            return "break"
+
+        def import_profile() -> None:
+            path = filedialog.askopenfilename(
+                parent=self.window,
+                title="Import waveform profile",
+                filetypes=(("Profile files", "*.csv *.tsv *.txt *.json"), ("All files", "*.*")),
+            )
+            if not path:
+                return
+            try:
+                text = Path(path).read_text(encoding="utf-8-sig")
+            except OSError as exc:
+                status.set(str(exc))
+                return
+            apply_document(text)
+
+        buttons = ttk.Frame(section)
+        buttons.grid(row=5, column=0, sticky="ew", pady=(0, 4))
+        ttk.Button(buttons, text="Add row", command=add).pack(side="left")
+        ttk.Button(buttons, text="Delete", command=delete).pack(side="left")
+        if card.type_id == "waveform":
+            ttk.Button(buttons, text="Paste", command=paste_profile).pack(side="right", padx=(6, 0))
+            ttk.Button(buttons, text="Import…", command=import_profile).pack(side="right")
+
+        table.bind("<Double-1>", edit_cell)
+        if card.type_id == "waveform":
+            table.bind("<Control-v>", paste_profile)
+            table.bind("<Control-V>", paste_profile)
+            table.bind("<Shift-Insert>", paste_profile)
+        refresh()
+        self.profile_table = table
+
     def _param_changed(self, card: AutoTestFlowCard, key: str, value: str) -> None:
         canonical, error = self._validate_parameter(card, key, value)
         self._field_feedback(card, key, value, error)
@@ -2695,7 +3120,9 @@ class MeasurementFlowEditor(FlowEditorUX):
             return
         value = canonical
         card.params[key] = value
-        if card.type_id == 'iv' and key == 'measure_range':
+        if card.type_id == "it" and key == "drive_mode":
+            self._update_it_drive_widgets(card)
+        if card.type_id in {'iv', 'it'} and key == 'measure_range':
             from .smu_settings import reduce_workflow_limit
             adjustment = reduce_workflow_limit(card.params)
             if adjustment:
@@ -2728,7 +3155,8 @@ class MeasurementFlowEditor(FlowEditorUX):
         canvas.delete("all")
         width = max(canvas.winfo_width(), 280)
         left, right, top, bottom = 24, width - 16, 18, 112
-        points = parse_waveform_points(card.params)
+        source = self._card(str(card.params.get("_input_profile_source", ""))) if card.type_id == "laser_pulse" else None
+        points = parse_waveform_points(source.params if source is not None and source.type_id == "waveform" else card.params)
         period = max(0.001, points[-1].time_ms)
         peak = max(0.01, max(point.voltage_v for point in points))
         canvas.create_line(left, bottom, right, bottom, fill=self.colors["border"])
@@ -2847,12 +3275,77 @@ class MeasurementFlowEditor(FlowEditorUX):
         definition = self.definitions[card.type_id]
         return " | ".join(f"{param.label}: {p.get(param.key, param.default)}" for param in definition.parameters[:2]) or definition.description
 
+    def _base_node_height(self, card: AutoTestFlowCard) -> int:
+        has_sparkline = card.type_id in {"laser_pulse", "waveform", "drive_waveform"} or (
+            card.type_id == "it" and not self._it_profile_connected(card)
+        )
+        sparkline = 54 if has_sparkline else 10
+        return self._parameter_top(card) + len(self._inline_params(card)) * 38 + sparkline
+
     def _node_height(self, card: AutoTestFlowCard) -> int:
-        return self._parameter_top(card) + len(self._inline_params(card)) * 38 + (54 if card.type_id == "laser_pulse" else 10)
+        base = self._base_node_height(card)
+        if card.type_id not in CONTROL_CONTAINERS:
+            return base
+        child = self._card(str(card.params.get("_child", "")))
+        child_height = self._base_node_height(child) if child is not None else 180
+        return base + child_height + 32
 
     @staticmethod
     def _node_width(card: AutoTestFlowCard) -> int:
-        return CAPSULE_WIDTH if card.type_id in BOUNDARY_TYPES else 272 if card.type_id == "plot_panel" else NODE_WIDTH
+        return CAPSULE_WIDTH if card.type_id in BOUNDARY_TYPES else 272 if card.type_id == "plot_panel" else 272 if card.type_id in CONTROL_CONTAINERS else NODE_WIDTH
+
+    def _container_slot_bounds(self, container: AutoTestFlowCard) -> tuple[float, float, float, float]:
+        top = container.y + self._base_node_height(container) + 4
+        return container.x + 14, top, container.x + self._node_width(container) - 10, container.y + self._node_height(container) - 8
+
+    def _container_wrap_points(self, container: AutoTestFlowCard) -> tuple[tuple[float, float], ...]:
+        """Open C path around the nested node; intentionally no right edge."""
+        left, top, right, bottom = self._container_slot_bounds(container)
+        return ((right, top), (left, top), (left, bottom), (right, bottom))
+
+    def _layout_nested_cards(self) -> None:
+        for container in self.cards:
+            if container.type_id not in CONTROL_CONTAINERS:
+                continue
+            child = self._card(str(container.params.get("_child", "")))
+            if child is None:
+                continue
+            left, top, _right, _bottom = self._container_slot_bounds(container)
+            child.x, child.y = left + 8, top + 8
+
+    def _container_for_drop(self, card: AutoTestFlowCard) -> AutoTestFlowCard | None:
+        center = (card.x + self._node_width(card) / 2, card.y + self._node_height(card) / 2)
+        for container in reversed(self.cards):
+            allowed = CONTROL_CONTAINERS.get(container.type_id)
+            if container is card or allowed is None or card.type_id not in allowed:
+                continue
+            occupied = str(container.params.get("_child", "")).strip()
+            if occupied and occupied != card.card_id:
+                continue
+            left, top, right, bottom = self._container_slot_bounds(container)
+            if left <= center[0] <= right and top <= center[1] <= bottom:
+                return container
+        return None
+
+    def _detach_nested_card(self, card: AutoTestFlowCard) -> None:
+        parent = self._card(str(card.params.pop("_parent", "")))
+        if parent is not None and parent.params.get("_child") == card.card_id:
+            parent.params.pop("_child", None)
+
+    def _nest_card_at(self, card: AutoTestFlowCard) -> bool:
+        container = self._container_for_drop(card)
+        if container is None:
+            self._detach_nested_card(card)
+            return False
+        self._detach_nested_card(card)
+        container.params["_child"] = card.card_id
+        card.params["_parent"] = container.card_id
+        card.params.pop("_next", None)
+        card.params.pop("_true", None)
+        card.params.pop("_false", None)
+        left, top, _right, _bottom = self._container_slot_bounds(container)
+        card.x, card.y = left + 8, top + 8
+        return True
 
     def _card(self, card_id: str | None) -> AutoTestFlowCard | None:
         return next((card for card in self.cards if card.card_id == card_id), None)

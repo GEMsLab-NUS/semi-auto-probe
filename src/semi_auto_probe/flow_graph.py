@@ -4,7 +4,7 @@ import operator
 import math
 import json
 from .workflow_ports import LIGHT_OUTPUT_TYPES, LIGHT_INPUT_TYPES
-from .workflow_ports import DATA_ONLY_TYPES, MATH_TYPES, input_ports, output_type, compatible
+from .workflow_ports import CONTROL_CONTAINERS, DATA_ONLY_TYPES, MATH_TYPES, input_ports, output_type, compatible
 from .workflow_formula import InvalidValue, Curve, evaluate_expression, parse_expression
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -12,7 +12,7 @@ from typing import Any
 from .auto_test import AutoTestFlowStep, is_condition_flow_type
 
 
-GRAPH_KEYS = frozenset({"_node_id", "_x", "_y", "_next", "_true", "_false", "_light_source", "_outputs", "_result_source", "_result_metric"})
+GRAPH_KEYS = frozenset({"_node_id", "_x", "_y", "_next", "_true", "_false", "_light_source", "_outputs", "_result_source", "_result_metric", "_child", "_parent"})
 _RESOLVING = object()
 
 
@@ -33,9 +33,63 @@ def validate_flow_graph(steps: Sequence[AutoTestFlowStep]) -> tuple[str, ...]:
     errors: list[str] = []
     if len(ids) != len(set(ids)):
         errors.append("Node IDs must be unique.")
+    known = set(ids)
+    nested_children: set[str] = set()
+    nested_parent: dict[str, str] = {}
+    for node_id, step in zip(ids, steps):
+        allowed = CONTROL_CONTAINERS.get(step.type_id)
+        child_id = str(step.params.get("_child", "")).strip()
+        if allowed is not None:
+            if not child_id:
+                errors.append(f"{node_id}: drop one {'/'.join(allowed)} node inside this container.")
+                continue
+            if child_id not in known:
+                errors.append(f"{node_id}: nested child {child_id!r} does not exist.")
+                continue
+            child = steps[ids.index(child_id)]
+            if child.type_id not in allowed:
+                errors.append(f"{node_id}: nested child must be one of {', '.join(allowed)}.")
+                continue
+            if child_id in nested_parent:
+                errors.append(f"{child_id}: a node can be nested in only one container.")
+                continue
+            nested_parent[child_id] = node_id
+            nested_children.add(child_id)
+            if str(child.params.get("_parent", "")).strip() != node_id:
+                errors.append(f"{child_id}: nested parent link must point to {node_id}.")
+        elif child_id:
+            errors.append(f"{node_id}: this node type cannot contain another node.")
+    for node_id, step in zip(ids, steps):
+        parent_id = str(step.params.get("_parent", "")).strip()
+        if parent_id and nested_parent.get(node_id) != parent_id:
+            errors.append(f"{node_id}: parent {parent_id!r} does not contain this node.")
     for step in steps:
         try:
             input_ports(step)
+            if step.type_id == "waveform":
+                from .keithley_timing import parse_drive_profile, repeat_drive_profile
+                repeat_drive_profile(
+                    parse_drive_profile(step.params.get("profile_points", ""), source_mode="voltage"),
+                    step.params.get("cycles", "1"),
+                )
+            if step.type_id in {"it", "drive_waveform"}:
+                from .keithley_timing import parse_drive_profile
+                from .keithley2450 import normalize_sweep_mode
+                mode = normalize_sweep_mode(step.params.get("source_mode", "voltage"))
+                if (step.type_id == "drive_waveform" or (
+                        step.params.get("drive_mode", "constant") == "profile"
+                        and not step.params.get("_input_profile_source")
+                )):
+                    parse_drive_profile(step.params.get("profile_points", ""), source_mode=mode)
+                if step.type_id == "it":
+                    duration = float(step.params.get("duration_s", "10"))
+                    interval = float(step.params.get("sample_interval_s", ".1"))
+                    if not math.isfinite(duration) or duration <= 0:
+                        raise ValueError("I/V-t duration must be finite and positive")
+                    if not math.isfinite(interval) or interval <= 0:
+                        raise ValueError("I/V-t sample interval must be finite and positive")
+                    if step.params.get("drive_mode", "constant") not in {"constant", "profile"}:
+                        raise ValueError("I/V-t drive mode must be constant or profile")
             if step.type_id == "math_formula":
                 tree = parse_expression(step.params.get("expression", "a + b"), dict(input_ports(step)))
                 constants = json.loads(step.params.get("constants", "{}"))
@@ -67,9 +121,8 @@ def validate_flow_graph(steps: Sequence[AutoTestFlowStep]) -> tuple[str, ...]:
             errors.append(f"{step.params.get('_node_id', step.type_id)}: {exc}")
     if errors:
         return tuple(errors)
-    known = set(ids)
     incoming = {node_id: 0 for node_id in ids}
-    auxiliary_sources: set[str] = set()
+    auxiliary_sources: set[str] = set(nested_children)
     for index, step in enumerate(steps):
         node_id = ids[index]
         edges = ("_true", "_false") if is_condition_flow_type(step.type_id) else ("_next",)
@@ -78,6 +131,8 @@ def validate_flow_graph(steps: Sequence[AutoTestFlowStep]) -> tuple[str, ...]:
             if target and target not in known:
                 errors.append(f"{node_id}: {edge[1:]} target {target!r} does not exist.")
             elif target:
+                if target in nested_children:
+                    errors.append(f"{node_id}: nested node {target!r} cannot receive external control flow.")
                 incoming[target] += 1
         if is_condition_flow_type(step.type_id) and not (step.params.get("_true") or step.params.get("_false")):
             errors.append(f"{node_id}: condition has no True/False connection.")
@@ -112,6 +167,8 @@ def validate_flow_graph(steps: Sequence[AutoTestFlowStep]) -> tuple[str, ...]:
             actual_type = _data_output_type(source_step, output_name)
             if input_type and not compatible(actual_type, input_type):
                 errors.append(f"{node_id}: {input_name} expects {input_type}, but {source_id} outputs {actual_type or 'no data'}.")
+            if step.type_id == "it" and input_name == "profile" and source_step.type_id == "laser_pulse":
+                auxiliary_sources.add(source_id)
     errors.extend(_data_cycle_errors(steps, ids))
     panels = [step for step in steps if step.type_id == "plot_panel"]
     strict = bool(panels) or any(step.params.get("_workflow_version") == "2" for step in steps)
@@ -137,7 +194,7 @@ def validate_flow_graph(steps: Sequence[AutoTestFlowStep]) -> tuple[str, ...]:
         if starts_explicit:
             walk(starts_explicit[0])
         for node_id, step in zip(ids, steps):
-            if step.type_id in {"it", "light_control", "light_pulse", "wavelength"}:
+            if step.type_id in {"light_control", "light_pulse", "wavelength"}:
                 errors.append(f"{node_id}: {step.type_id} has no instrument executor; use an implemented measurement/light card.")
             if step.type_id in DATA_ONLY_TYPES or node_id in auxiliary_sources:
                 continue
@@ -205,6 +262,11 @@ def graph_start_node(steps: Sequence[AutoTestFlowStep]) -> str | None:
         if str(step.params.get("_light_source", "")).strip() in incoming
     }
     auxiliary_sources.update(node_id for node_id, step in zip(ids, steps) if step.type_id in DATA_ONLY_TYPES)
+    auxiliary_sources.update(
+        str(step.params.get("_child", "")).strip()
+        for step in steps
+        if step.type_id in CONTROL_CONTAINERS and str(step.params.get("_child", "")).strip() in incoming
+    )
     for step in steps:
         for key in ("_next", "_true", "_false"):
             target = str(step.params.get(key, "")).strip()

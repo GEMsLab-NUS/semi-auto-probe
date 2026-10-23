@@ -246,7 +246,8 @@ class ManualSettings:
 
 def reduce_workflow_limit(params):
     """Return an explicit UI protection reduction for a newly selected range."""
-    unit = 'A' if params.get('sweep_mode', 'voltage') == 'voltage' else 'V'
+    mode = params.get('source_mode', params.get('sweep_mode', 'voltage'))
+    unit = 'A' if mode == 'voltage' else 'V'
     key = 'current_limit_a' if unit == 'A' else 'voltage_limit_v'
     try:
         selected = parse_si_value(params.get('measure_range', 'auto'), unit)
